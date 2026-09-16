@@ -111,6 +111,41 @@ SEGMENTS = {
     "l_larm":  ("l_larm",  "LeftElbow"),    "r_larm":  ("r_larm",  "RightElbow"),
 }
 
+# Bilateral right->left vectors between paired joint centres, added to the
+# rotation fit. They are not segment orientations, but they are the best
+# HEADING information a standing pose contains, and they come from the same
+# joint centres step 6 already uses.
+#
+# Why they matter: only the HORIZONTAL part of a direction constrains the
+# heading, and in a standing pose the limb long axes are nearly vertical
+# (horizontal component 0.12-0.17 for the legs, 0.58-0.65 for the A-posed
+# arms). A 1 deg error in a thigh axis becomes ~6.7 deg of heading error. A
+# right->left vector is horizontal by construction, so its leverage is 1.00,
+# and a joint-centre offset that is symmetric between sides -- the usual
+# case -- does not rotate it at all. Measured on D05_C1, adding these four
+# cuts the leave-one-out heading spread from 2.34 deg to 0.56 deg while
+# moving the answer itself by only 0.02 deg.
+#
+# No weighting is needed. A plain Kabsch already weights each observation's
+# heading contribution by its squared horizontal component, so the ML axes
+# outvote the long axes ~7:1 for yaw and not at all for tilt, which is
+# exactly right.
+USE_ML_AXES = True
+ML_AXES = [("hip_width", "r_hip", "l_hip"),
+           ("knee_width", "r_knee", "l_knee"),
+           ("shoulder_width", "r_shoulder", "l_shoulder"),
+           ("elbow_width", "r_elbow", "l_elbow")]
+
+# Both systems put z = 0 on the floor, so the true vertical offset between
+# their coordinate systems is zero and t_z is not something to estimate.
+# Fitting it anyway just absorbs the two skeletons' vertical joint-centre
+# disagreement (~30 mm here) into the transform. With this True the fit
+# solves for the horizontal translation only and reports the vertical
+# disagreement separately, where it belongs. CHECK_FLOOR_FROM_MESH verifies
+# the assumption from the mesh rather than taking it on trust.
+ASSUME_SHARED_FLOOR = True
+CHECK_FLOOR_FROM_MESH = True
+
 # Joint centres whose positions drive the translation (step 6). These are the
 # origins of the segments above: hip, knee, shoulder, elbow.
 JOINTS = {
@@ -422,8 +457,12 @@ class Scene:
         hits = sorted(n for n in self.by_name if n.split(":")[-1] == name)
         return self.by_name[hits[0]] if hits else None
 
-    def global_transforms(self):
-        """Every limb node's global 4x4 over every key time -> {name: (T,4,4)}."""
+    def global_transforms(self, all_nodes=False):
+        """Global 4x4 over every key time -> {name: (T,4,4)}.
+
+        Limb nodes only by default; all_nodes=True also returns the mesh
+        nodes, which the floor check needs.
+        """
         order, seen = [], set()
 
         def visit(j):
@@ -435,14 +474,15 @@ class Scene:
             order.append(j)
 
         for j in self.joints.values():
-            if j.type in ("LimbNode", "Root"):
+            if all_nodes or j.type in ("LimbNode", "Root"):
                 visit(j)
 
         out = {}
         for j in order:
             L = j.local_matrices(self.times)
             out[j.uid] = L if j.parent is None else out[j.parent.uid] @ L
-        return {j.name: out[j.uid] for j in order if j.type == "LimbNode"}
+        return {j.name: out[j.uid] for j in order
+                if all_nodes or j.type == "LimbNode"}
 
 
 class _Curve:
@@ -623,6 +663,19 @@ def long_axes(skel, axis):
     return np.array([sign * skel.orientation(s)[:, col] for s in SEGMENTS])
 
 
+def observations(th, m4, ax_t, ax_m):
+    """Every matched direction the rotation is fitted to. -> (U, V, labels)"""
+    U = list(long_axes(th, ax_t))
+    V = list(long_axes(m4, ax_m))
+    labels = [(s, "long axis") for s in SEGMENTS]
+    if USE_ML_AXES:
+        for name, a, b in ML_AXES:
+            U.append(unit(th.position(b) - th.position(a)))
+            V.append(unit(m4.position(b) - m4.position(a)))
+            labels.append((name, "ML"))
+    return np.array(U), np.array(V), labels
+
+
 def solve_rotation(U, V, vertical_only):
     """Rotation R minimising sum ||u_i - R v_i||^2 over the segment axes.
 
@@ -645,9 +698,182 @@ def solve_rotation(U, V, vertical_only):
 #  STEP 6:  TRANSLATION  -- joint positions as close as possible
 # ============================================================================
 
-def solve_translation(A, B, R):
-    """t minimising sum ||a_i - (R b_i + t)||^2, which is just the mean."""
-    return (A - B @ R.T).mean(axis=0)
+def solve_translation(A, B, R, lock_vertical=None):
+    """t minimising sum ||a_i - (R b_i + t)||^2, which is just the mean.
+
+    With lock_vertical, t_z is forced to zero instead of fitted: both systems
+    put z = 0 on the floor, so there is no vertical offset between their
+    coordinate systems to estimate, and anything the fit puts there is the
+    two skeletons disagreeing about joint-centre height, not a calibration
+    difference. The mean vertical difference is returned so it can be
+    reported rather than silently buried in the matrix.
+    """
+    lock = ASSUME_SHARED_FLOOR if lock_vertical is None else lock_vertical
+    t = (A - B @ R.T).mean(axis=0)
+    vertical_disagreement = float(t[2])
+    if lock:
+        t = t.copy()
+        t[2] = 0.0
+    return t, vertical_disagreement
+
+
+# %%==========================================================================
+#  IS THE SUBJECT STANDING ON THE FLOOR?  (verifies ASSUME_SHARED_FLOOR)
+# ============================================================================
+# Both files carry a body SURFACE as well as a skeleton, and the surface is
+# the only thing that can tell you where the floor is: a joint centre is an
+# inference, the sole of a foot is not. MOVE4D ships the real scan (49530
+# vertices, skinned to the rig); Theia ships its body model as rigid meshes
+# parented to the segments.
+
+def body_surface(scene, frame=None):
+    """Posed skin vertices in the file's own raw coordinates. -> (N, 3)
+
+    Handles both cases the two files present: a single mesh bound to the
+    skeleton by skin clusters (MOVE4D), and rigid meshes parented to segment
+    nodes (Theia).
+    """
+    root, _ = fbx_load(scene.path)
+    objs = root.find("Objects")
+    conns = root.find("Connections").children
+    geo = {}
+    for g in objs.find_all("Geometry"):
+        v = g.find("Vertices")
+        if v is not None and len(v.props[0]):
+            geo[g.props[0]] = np.asarray(v.props[0], float).reshape(-1, 3)
+    if not geo:
+        return None
+
+    G = scene.global_transforms(all_nodes=True)
+    frame = len(scene.times) // 2 if frame is None else frame
+    uid_name = {j.uid: j.name for j in scene.joints.values()}
+    clusters = [d for d in objs.find_all("Deformer")
+                if str(d.props[2]) == "Cluster"]
+
+    # ---- skinned mesh (MOVE4D) ---------------------------------------
+    if clusters:
+        # FBX connects Model(bone) -> Cluster, so src is the bone.
+        bone_of = {c.props[2]: uid_name.get(c.props[1]) for c in conns
+                   if c.props[1] in uid_name}
+        V = max(geo.values(), key=len)
+        acc = np.zeros((len(V), 3))
+        wsum = np.zeros(len(V))
+        for d in clusters:
+            bone = bone_of.get(d.props[0])
+            idx, wts = d.find("Indexes"), d.find("Weights")
+            link = d.find("TransformLink")
+            if bone is None or bone not in G or idx is None or link is None:
+                continue
+            # FBX stores matrices row-major for row vectors; transpose for ours
+            TL = np.asarray(link.props[0], float).reshape(4, 4).T
+            I = np.asarray(idx.props[0], int)
+            W = np.asarray(wts.props[0], float)
+            Mx = G[bone][frame] @ np.linalg.inv(TL)
+            acc[I] += W[:, None] * (V[I] @ Mx[:3, :3].T + Mx[:3, 3])
+            wsum[I] += W
+        ok = wsum > 1e-9
+        return acc[ok] / wsum[ok, None]
+
+    # ---- rigid meshes parented to segments (Theia) -------------------
+    pts = []
+    for c in conns:
+        if c.props[1] in geo and c.props[2] in uid_name:
+            name = uid_name[c.props[2]]
+            if name not in G:
+                continue
+            Mx = G[name][frame]
+            pts.append(geo[c.props[1]] @ Mx[:3, :3].T + Mx[:3, 3])
+    return np.vstack(pts) if pts else None
+
+
+def floor_check(skel):
+    """Where does the body surface sit relative to z = 0?
+
+    ASSUME_SHARED_FLOOR rests on both systems putting their origin on the
+    floor. This measures it: if the lowest skin vertices cluster around zero
+    the subject is standing on the floor plane, and the vertical offset
+    between the two coordinate systems really is nothing to fit. If the
+    surface floats, the assumption is wrong for that file.
+    """
+    raw = body_surface(skel.scene)
+    if raw is None:
+        return None
+    P = np.einsum("ij,nj->ni", skel.C, raw * skel.scale)     # common Z-up, m
+    z = P[:, 2]
+    return dict(n_vertices=int(len(P)),
+                lowest_mm=float(z.min() * 1000),
+                p1_mm=float(np.percentile(z, 1) * 1000),
+                highest_mm=float(z.max() * 1000),
+                height_m=float(z.max() - z.min()),
+                within_5mm_of_floor=int((np.abs(z) < 0.005).sum()),
+                within_10mm_of_floor=int((np.abs(z) < 0.010).sum()))
+
+
+# %%==========================================================================
+#  HOW WELL IS THE HEADING ACTUALLY DETERMINED?
+# ============================================================================
+
+def heading_uncertainty(U, V, labels):
+    """Spread of the heading across subsets of the very same data.
+
+    The residual cannot tell you this. Heading is constrained only by the
+    HORIZONTAL component of each direction, so an observation that is nearly
+    vertical amplifies its own error by 1/leverage when it votes on yaw. The
+    honest measure is: refit on independent subsets and see how far apart
+    they land. That spread is the uncertainty, whatever the residual says.
+    """
+    def yaw_of(mask):
+        if mask.sum() < 2:
+            return None
+        return yaw_and_tilt(solve_rotation(U[mask], V[mask], True))[0]
+
+    n = len(U)
+    full = yaw_of(np.ones(n, bool))
+
+    loo = []
+    for i in range(n):
+        m = np.ones(n, bool)
+        m[i] = False
+        y = yaw_of(m)
+        if y is not None:
+            loo.append((labels[i][0], y))
+
+    kinds = np.array([k for _, k in labels])
+    names = np.array([s for s, _ in labels])
+    groups = {
+        "segment long axes": kinds == "long axis",
+        "bilateral ML axes": kinds == "ML",
+        "legs": np.array([n_.startswith(("l_thigh", "r_thigh", "l_shank",
+                                         "r_shank", "hip_", "knee_"))
+                          for n_ in names]),
+        "arms": np.array([n_.startswith(("l_uarm", "r_uarm", "l_larm",
+                                         "r_larm", "shoulder_", "elbow_"))
+                          for n_ in names]),
+        "left side": np.array([n_.startswith("l_") for n_ in names]),
+        "right side": np.array([n_.startswith("r_") for n_ in names]),
+    }
+    subsets = []
+    for name, mask in groups.items():
+        y = yaw_of(mask)
+        if y is None:
+            continue
+        lev = float(np.linalg.norm(V[mask][:, :2], axis=1).mean())
+        subsets.append(dict(subset=name, yaw_deg=y, leverage=lev,
+                            n=int(mask.sum()), informative=lev >= 0.30))
+
+    loo_vals = [y for _, y in loo]
+    good = [s["yaw_deg"] for s in subsets if s["informative"]]
+    return dict(
+        yaw_deg=full,
+        leave_one_out_spread_deg=(float(max(loo_vals) - min(loo_vals))
+                                  if len(loo_vals) > 1 else 0.0),
+        worst_single_observation=max(loo, key=lambda x: abs(x[1] - full))[0]
+        if loo else None,
+        subset_spread_deg=float(max(good) - min(good)) if len(good) > 1 else 0.0,
+        subsets=subsets,
+        leverage=dict(zip(names.tolist(),
+                          np.linalg.norm(V[:, :2], axis=1).round(3).tolist())),
+    )
 
 
 # %%==========================================================================
@@ -671,14 +897,14 @@ def solve(theia_path=None, m4d_path=None, vertical_only=None, verbose=True):
     ax_t, ax_m = detect_bone_axis(th), detect_bone_axis(m4)
 
     # --- step 5 -------------------------------------------------------
-    U, V = long_axes(th, ax_t), long_axes(m4, ax_m)
+    U, V, labels = observations(th, m4, ax_t, ax_m)
     R = solve_rotation(U, V, vertical_only)
 
     # --- step 6 -------------------------------------------------------
     keys = list(JOINTS)
     A = np.array([th.position(k) for k in keys])
     B = np.array([m4.position(k) for k in keys])
-    t = solve_translation(A, B, R)
+    t, vertical_gap = solve_translation(A, B, R)
 
     # --- assemble T in RAW file coordinates ---------------------------
     # p_common = C @ (metres_per_unit * p_raw), so undo both on the Theia side
@@ -688,16 +914,27 @@ def solve(theia_path=None, m4d_path=None, vertical_only=None, verbose=True):
 
     # --- residuals ----------------------------------------------------
     seg_err = angle_between(U, V @ R.T)
-    pos_err = np.linalg.norm(A - (B @ R.T + t), axis=1) * 1000
+    resid = A - (B @ R.T + t)
+    pos_err = np.linalg.norm(resid, axis=1) * 1000
+    # With the vertical locked, the horizontal residual is what the fit
+    # actually minimised; the vertical one is the skeleton disagreement the
+    # transform is deliberately no longer absorbing. Quoting them together
+    # would hide that.
+    horiz_err = np.linalg.norm(resid[:, :2], axis=1) * 1000
+    vert_err = resid[:, 2] * 1000
 
     # the same fit under the other rotation model, for comparison
     R_alt = solve_rotation(U, V, not vertical_only)
-    t_alt = solve_translation(A, B, R_alt)
+    t_alt, _ = solve_translation(A, B, R_alt)
+    resid_alt = A - (B @ R_alt.T + t_alt)
     alt = dict(vertical_only=not vertical_only,
                yaw_deg=yaw_and_tilt(R_alt)[0], tilt_deg=yaw_and_tilt(R_alt)[1],
                segment_rms_deg=float(np.sqrt((angle_between(U, V @ R_alt.T) ** 2).mean())),
+               # horizontal, because that is what the translation fitted once
+               # the vertical is locked; comparing totals would just compare
+               # the same skeleton disagreement twice
                position_rms_mm=float(np.sqrt((np.linalg.norm(
-                   A - (B @ R_alt.T + t_alt), axis=1) ** 2).mean()) * 1000))
+                   resid_alt[:, :2], axis=1) ** 2).mean()) * 1000))
 
     yaw, tilt = yaw_and_tilt(R)
     report = dict(
@@ -710,12 +947,26 @@ def solve(theia_path=None, m4d_path=None, vertical_only=None, verbose=True):
                        worst_dot=ax_t[2]),
             m4d=dict(axis=f"{'+' if ax_m[1] > 0 else '-'}{'XYZ'[ax_m[0]]}",
                      worst_dot=ax_m[2])),
-        segment_residual_deg=dict(
+        direction_residual_deg=dict(
             rms=float(np.sqrt((seg_err ** 2).mean())), max=float(seg_err.max()),
-            per_segment=dict(zip(SEGMENTS, seg_err.round(3).tolist()))),
+            per_direction={lab: dict(residual_deg=float(e), kind=kind)
+                           for (lab, kind), e in zip(labels, seg_err)}),
+        segment_residual_deg=dict(
+            rms=float(np.sqrt((seg_err[:len(SEGMENTS)] ** 2).mean())),
+            per_segment=dict(zip(SEGMENTS,
+                                 seg_err[:len(SEGMENTS)].round(3).tolist()))),
         position_residual_mm=dict(
             rms=float(np.sqrt((pos_err ** 2).mean())), max=float(pos_err.max()),
-            per_joint=dict(zip(keys, pos_err.round(2).tolist()))),
+            horizontal_rms=float(np.sqrt((horiz_err ** 2).mean())),
+            vertical_rms=float(np.sqrt((vert_err ** 2).mean())),
+            per_joint=dict(zip(keys, pos_err.round(2).tolist())),
+            vertical_per_joint=dict(zip(keys, vert_err.round(2).tolist()))),
+        vertical=dict(
+            locked=ASSUME_SHARED_FLOOR,
+            mean_disagreement_mm=vertical_gap * 1000,
+            floor_check=dict(theia=floor_check(th), m4d=floor_check(m4))
+            if CHECK_FLOOR_FROM_MESH else None),
+        heading_uncertainty=heading_uncertainty(U, V, labels),
         alternative_model=alt,
         frame_conventions=frame_conventions(th, m4, R),
         checks=dict(mirror_determinant=mirror_test(U, V),
@@ -821,18 +1072,66 @@ def print_report(r, th, m4):
           f"(consistency {b['theia']['worst_dot']:.4f})")
     print(f"                     M4D   = {b['m4d']['axis']} local "
           f"(consistency {b['m4d']['worst_dot']:.4f})")
-    sr = r["segment_residual_deg"]
-    print(f"\n    segment orientation residual   RMS {sr['rms']:.2f} deg, "
-          f"max {sr['max']:.2f} deg")
-    for s, v in sorted(sr["per_segment"].items(), key=lambda x: -x[1]):
-        print(f"      {s:9s} {v:6.2f} deg")
+    dr = r["direction_residual_deg"]
+    hu = r["heading_uncertainty"]
+    print(f"\n    direction residual   RMS {dr['rms']:.2f} deg, "
+          f"max {dr['max']:.2f} deg"
+          f"   (segments alone: {r['segment_residual_deg']['rms']:.2f} deg)")
+    print(f"      {'direction':16s} {'residual':>9s} {'leverage':>9s}  kind")
+    for k, v in sorted(dr["per_direction"].items(),
+                       key=lambda x: -x[1]["residual_deg"]):
+        print(f"      {k:16s} {v['residual_deg']:6.2f} deg "
+              f"{hu['leverage'].get(k, float('nan')):9.3f}  {v['kind']}")
+    print("      leverage = horizontal component. Only that part constrains the")
+    print("      heading, so a near-vertical axis amplifies its own error.")
 
     print("\n  STEP 6: translation from joint positions")
     pr = r["position_residual_mm"]
-    print(f"    position residual              RMS {pr['rms']:.1f} mm, "
+    vt = r["vertical"]
+    if vt["locked"]:
+        print("    vertical LOCKED: both systems put z = 0 on the floor, so")
+        print(f"    t_z = 0, and the {vt['mean_disagreement_mm']:+.1f} mm the "
+              f"fit would have put there is")
+        print("    reported below as skeleton disagreement instead.")
+    print(f"\n    horizontal residual   RMS {pr['horizontal_rms']:5.1f} mm"
+          "   <- what the fit minimised")
+    print(f"    vertical residual     RMS {pr['vertical_rms']:5.1f} mm   "
+          + ("<- NOT fitted, definition gap" if vt["locked"] else ""))
+    print(f"    total                 RMS {pr['rms']:5.1f} mm, "
           f"max {pr['max']:.1f} mm")
+    print(f"\n      {'joint':11s} {'total':>9s} {'vertical':>9s}")
     for k, v in sorted(pr["per_joint"].items(), key=lambda x: -x[1]):
-        print(f"      {k:11s} {v:6.1f} mm")
+        print(f"      {k:11s} {v:6.1f} mm {pr['vertical_per_joint'][k]:+8.1f}")
+
+    fc = vt.get("floor_check")
+    if fc and (fc["theia"] or fc["m4d"]):
+        print("\n    floor check from the body SURFACE (a joint centre is an")
+        print("    inference; the sole of a foot is not):")
+        for lab, d in (("Theia model", fc["theia"]), ("MOVE4D scan", fc["m4d"])):
+            if not d:
+                continue
+            print(f"      {lab:12s} {d['n_vertices']:6d} verts | lowest "
+                  f"{d['lowest_mm']:+7.1f} mm | top {d['highest_mm']:7.1f} mm"
+                  f" | {d['within_5mm_of_floor']:5d} within 5 mm of z=0")
+        th_fc = fc.get("theia")
+        if th_fc and th_fc["within_5mm_of_floor"] == 0:
+            print("      Theia's meshes are its body MODEL (a 270-vertex "
+                  "primitive per")
+            print("      limb), not a measurement, so their "
+                  f"{th_fc['lowest_mm']:.0f} mm clearance says")
+            print("      nothing about where its floor is. Only the scan can "
+                  "settle that.")
+        m = fc.get("m4d")
+        if m:
+            if abs(m["lowest_mm"]) < 20 and m["within_5mm_of_floor"] > 50:
+                print("      -> the scanned subject is standing ON the floor "
+                      "plane, not")
+                print("         floating: z = 0 really is the floor in the "
+                      "MOVE4D file.")
+            else:
+                print("      -> the scan does NOT reach z = 0. Check the "
+                      "assumption;")
+                print("         ASSUME_SHARED_FLOOR may be wrong for this file.")
 
     print("\n" + "-" * W)
     print("  RESULT     p_theia = T @ [p_m4d, 1]   (raw FBX coords both sides)")
@@ -844,7 +1143,8 @@ def print_report(r, th, m4):
           + ("   (constrained to zero)" if r["vertical_only"] else ""))
     tt = r["translation_m"]
     print(f"    translation      [{tt[0]:+.4f} {tt[1]:+.4f} {tt[2]:+.4f}] m"
-          "   in the common Z-up frame")
+          "   in the common Z-up frame"
+          + ("   (t_z locked to 0)" if r["vertical"]["locked"] else ""))
     print(f"\n    end-to-end check on RAW coordinates: "
           f"{c['raw_check_rms_mm']:.1f} mm RMS"
           f"   (must equal {pr['rms']:.1f})")
@@ -852,14 +1152,56 @@ def print_report(r, th, m4):
         print("    *** MISMATCH: the up-axis / unit bookkeeping behind T is "
               "wrong. Do not use this matrix. ***")
 
+    hu = r["heading_uncertainty"]
+    print("\n" + "-" * W)
+    print("  HOW WELL IS THE HEADING DETERMINED?")
+    print("-" * W)
+    print("    The residual cannot tell you. Refit on independent subsets of")
+    print("    the same data and see how far apart they land -- that spread")
+    print("    IS the uncertainty.")
+    print(f"\n      {'subset':20s} {'yaw':>8s} {'leverage':>9s} {'n':>3s}")
+    for s in hu["subsets"]:
+        mark = "" if s["informative"] else "   (low leverage, ignore)"
+        print(f"      {s['subset']:20s} {s['yaw_deg']:+7.2f}d "
+              f"{s['leverage']:9.3f} {s['n']:3d}{mark}")
+    print(f"\n    spread over informative subsets   "
+          f"{hu['subset_spread_deg']:.2f} deg")
+    print(f"    leave-one-observation-out spread  "
+          f"{hu['leave_one_out_spread_deg']:.2f} deg"
+          f"   (most influential: {hu['worst_single_observation']})")
+    print("\n    The two say different things. Leave-one-out being small "
+          "means no")
+    print("    single observation is driving the answer. The subset spread "
+          "being")
+    print("    larger means independent PARTS OF THE BODY disagree, which "
+          "averaging")
+    print("    cannot remove. Quote the larger one. Note that a subset with "
+          "low")
+    print("    leverage amplifies its own residual by 1/leverage, so some of "
+          "that")
+    print("    spread is noise rather than bias -- which is exactly why more "
+          "than")
+    print("    one standing pose, at different headings, is worth capturing.")
+    quoted = max(hu["subset_spread_deg"], hu["leave_one_out_spread_deg"])
+    err = np.radians(quoted)
+    print(f"\n    taking {quoted:.2f} deg, that displaces a point")
+    print(f"      1 m from the origin by {err * 1000:5.1f} mm")
+    print(f"      3 m from the origin by {err * 3000:5.1f} mm")
+    if not USE_ML_AXES:
+        print("\n      USE_ML_AXES is off. Turning it on typically cuts this")
+        print("      spread several-fold: the segment long axes are nearly")
+        print("      vertical and carry little heading information.")
+
     a = r["alternative_model"]
     other = "vertical-axis only" if a["vertical_only"] else "full 3-DOF"
     print("\n    the other rotation model, for comparison:")
     print(f"      {mode:19s} yaw {r['yaw_deg']:+6.2f}  tilt {r['tilt_deg']:5.2f}"
-          f"  seg {sr['rms']:5.2f} deg  pos {pr['rms']:5.1f} mm   <- used")
+          f"  dir {dr['rms']:5.2f} deg  horiz {pr['horizontal_rms']:5.1f} mm"
+          f"   <- used")
     print(f"      {other:19s} yaw {a['yaw_deg']:+6.2f}  tilt {a['tilt_deg']:5.2f}"
-          f"  seg {a['segment_rms_deg']:5.2f} deg  pos {a['position_rms_mm']:5.1f} mm")
-    if r["vertical_only"] and a["position_rms_mm"] >= pr["rms"] - 0.5:
+          f"  dir {a['segment_rms_deg']:5.2f} deg  horiz "
+          f"{a['position_rms_mm']:5.1f} mm")
+    if r["vertical_only"] and a["position_rms_mm"] >= pr["horizontal_rms"] - 0.5:
         print(f"      -> the {a['tilt_deg']:.2f} deg tilt the 3-DOF fit wants "
               f"does not improve the position")
         print("         fit, so it is absorbing skeleton mismatch rather than "
@@ -883,8 +1225,9 @@ def print_report(r, th, m4):
               f"{fc['max_disagreement_deg']:.1f} deg at worst.")
         print("    So the roll is naming convention, not anatomy. The long "
               "axis --")
-        print(f"    which agrees to {sr['rms']:.1f} deg RMS above -- is the "
-              f"part that means")
+        print(f"    which agrees to "
+              f"{r['segment_residual_deg']['rms']:.1f} deg RMS above -- is "
+              f"the part that means")
         print("    something, and it is what the fit uses.")
     print("=" * W)
 
@@ -963,9 +1306,19 @@ def make_figure(report, th, m4, path=None):
     ax.tick_params(labelsize=8)
 
     ax = fig.add_subplot(gs[1, 1:])
-    d = report["position_residual_mm"]["per_joint"]
+    pr = report["position_residual_mm"]
+    d, dz = pr["per_joint"], pr["vertical_per_joint"]
     ks = sorted(d, key=lambda k: -d[k])
-    ax.bar(ks, [d[k] for k in ks], color="#1f4e79")
+    horiz = [float(np.hypot(d[k], 0) ** 2 - dz[k] ** 2) ** 0.5
+             if d[k] ** 2 > dz[k] ** 2 else 0.0 for k in ks]
+    x = np.arange(len(ks))
+    ax.bar(x - 0.2, horiz, 0.4, color="#1f4e79", label="horizontal (fitted)")
+    ax.bar(x + 0.2, [abs(dz[k]) for k in ks], 0.4, color="#aaaaaa",
+           label="vertical (" + ("not fitted" if report["vertical"]["locked"]
+                                 else "fitted") + ")")
+    ax.set_xticks(x)
+    ax.set_xticklabels(ks)
+    ax.legend(fontsize=8)
     ax.set_ylabel("joint position residual (mm)", fontsize=9)
     ax.tick_params(labelsize=8)
     plt.setp(ax.get_xticklabels(), rotation=35, ha="right")

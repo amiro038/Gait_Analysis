@@ -1,22 +1,22 @@
 {
   "T_m4d_to_theia": [
     [
-      0.9991560937597073,
+      0.9991685026099272,
       0.0,
-      -0.04107432656591146,
-      -0.3865186080201978
+      -0.04077135504537416,
+      -0.3865157102162152
     ],
     [
-      -0.04107432656591146,
+      -0.04077135504537416,
       0.0,
-      -0.9991560937597073,
-      0.2272154074960359
+      -0.9991685026099272,
+      0.22716246719529054
     ],
     [
       0.0,
       1.0,
       0.0,
-      0.0297518113037286
+      0.0
     ],
     [
       0.0,
@@ -27,13 +27,13 @@
   ],
   "rotation": [
     [
-      0.9991560937597073,
-      0.04107432656591146,
+      0.9991685026099272,
+      0.04077135504537416,
       0.0
     ],
     [
-      -0.04107432656591146,
-      0.9991560937597073,
+      -0.04077135504537416,
+      0.9991685026099272,
       0.0
     ],
     [
@@ -43,14 +43,14 @@
     ]
   ],
   "translation_m": [
-    -0.3865186080201978,
-    0.2272154074960359,
-    0.0297518113037286
+    -0.3865157102162152,
+    0.22716246719529054,
+    0.0
   ],
   "vertical_only": true,
-  "yaw_deg": -2.354047794373062,
+  "yaw_deg": -2.3366742512179832,
   "tilt_deg": 0.0,
-  "total_rotation_deg": 2.3540477943730105,
+  "total_rotation_deg": 2.3366742512181315,
   "bone_axis": {
     "theia": {
       "axis": "-Z",
@@ -61,57 +61,210 @@
       "worst_dot": 0.9999999999898923
     }
   },
+  "direction_residual_deg": {
+    "rms": 2.156784273688483,
+    "max": 3.6434608238625943,
+    "per_direction": {
+      "l_thigh": {
+        "residual_deg": 2.1483240525235248,
+        "kind": "long axis"
+      },
+      "r_thigh": {
+        "residual_deg": 3.0530087467732763,
+        "kind": "long axis"
+      },
+      "l_shank": {
+        "residual_deg": 3.2940448873600467,
+        "kind": "long axis"
+      },
+      "r_shank": {
+        "residual_deg": 2.714955106384969,
+        "kind": "long axis"
+      },
+      "l_uarm": {
+        "residual_deg": 3.6434608238625943,
+        "kind": "long axis"
+      },
+      "r_uarm": {
+        "residual_deg": 0.7602035365193814,
+        "kind": "long axis"
+      },
+      "l_larm": {
+        "residual_deg": 2.012399264251213,
+        "kind": "long axis"
+      },
+      "r_larm": {
+        "residual_deg": 1.4043082929288089,
+        "kind": "long axis"
+      },
+      "hip_width": {
+        "residual_deg": 1.2294592992262483,
+        "kind": "ML"
+      },
+      "knee_width": {
+        "residual_deg": 0.6963492334078019,
+        "kind": "ML"
+      },
+      "shoulder_width": {
+        "residual_deg": 0.13393153984646383,
+        "kind": "ML"
+      },
+      "elbow_width": {
+        "residual_deg": 1.331837224893822,
+        "kind": "ML"
+      }
+    }
+  },
   "segment_residual_deg": {
-    "rms": 2.5502936141110237,
-    "max": 3.6534070787578434,
+    "rms": 2.550304402528731,
     "per_segment": {
-      "l_thigh": 2.149,
-      "r_thigh": 3.052,
-      "l_shank": 3.291,
-      "r_shank": 2.717,
-      "l_uarm": 3.653,
-      "r_uarm": 0.753,
-      "l_larm": 2.006,
-      "r_larm": 1.396
+      "l_thigh": 2.148,
+      "r_thigh": 3.053,
+      "l_shank": 3.294,
+      "r_shank": 2.715,
+      "l_uarm": 3.643,
+      "r_uarm": 0.76,
+      "l_larm": 2.012,
+      "r_larm": 1.404
     }
   },
   "position_residual_mm": {
-    "rms": 13.233819145577076,
-    "max": 19.95738535736398,
+    "rms": 32.55739996195336,
+    "max": 46.67370939355365,
+    "horizontal_rms": 10.152562673757526,
+    "vertical_rms": 30.93395809523938,
     "per_joint": {
-      "l_hip": 7.81,
-      "r_hip": 14.08,
-      "l_knee": 17.84,
-      "r_knee": 19.96,
-      "l_shoulder": 9.24,
-      "r_shoulder": 9.87,
-      "l_elbow": 10.58,
-      "r_elbow": 11.43
+      "l_hip": 26.33,
+      "r_hip": 25.83,
+      "l_knee": 44.53,
+      "r_knee": 46.67,
+      "l_shoulder": 29.44,
+      "r_shoulder": 29.49,
+      "l_elbow": 27.61,
+      "r_elbow": 21.45
+    },
+    "vertical_per_joint": {
+      "l_hip": 25.5,
+      "r_hip": 22.75,
+      "l_knee": 42.85,
+      "r_knee": 44.79,
+      "l_shoulder": 27.99,
+      "r_shoulder": 27.87,
+      "l_elbow": 25.84,
+      "r_elbow": 20.43
+    }
+  },
+  "vertical": {
+    "locked": true,
+    "mean_disagreement_mm": 29.7518113037286,
+    "floor_check": {
+      "theia": {
+        "n_vertices": 34054,
+        "lowest_mm": 43.66427112552533,
+        "p1_mm": 48.57186176015681,
+        "highest_mm": 1750.0499119597105,
+        "height_m": 1.706385640834185,
+        "within_5mm_of_floor": 0,
+        "within_10mm_of_floor": 0
+      },
+      "m4d": {
+        "n_vertices": 49530,
+        "lowest_mm": -5.351526891545212,
+        "p1_mm": 3.3002544426006675,
+        "highest_mm": 1769.5558219576476,
+        "height_m": 1.7749073488491927,
+        "within_5mm_of_floor": 757,
+        "within_10mm_of_floor": 1045
+      }
+    }
+  },
+  "heading_uncertainty": {
+    "yaw_deg": -2.3366742512179832,
+    "leave_one_out_spread_deg": 0.5614091358782312,
+    "worst_single_observation": "l_uarm",
+    "subset_spread_deg": 2.1657762483426364,
+    "subsets": [
+      {
+        "subset": "segment long axes",
+        "yaw_deg": -2.354047794373062,
+        "leverage": 0.38250038938332476,
+        "n": 8,
+        "informative": true
+      },
+      {
+        "subset": "bilateral ML axes",
+        "yaw_deg": -2.3298599746728463,
+        "leverage": 0.9995874402064596,
+        "n": 4,
+        "informative": true
+      },
+      {
+        "subset": "legs",
+        "yaw_deg": -3.020794317148426,
+        "leverage": 0.4341849832456346,
+        "n": 6,
+        "informative": true
+      },
+      {
+        "subset": "arms",
+        "yaw_deg": -1.928242327216897,
+        "leverage": 0.7422071627364382,
+        "n": 6,
+        "informative": true
+      },
+      {
+        "subset": "left side",
+        "yaw_deg": -1.2275599918759998,
+        "leverage": 0.3784851257043422,
+        "n": 4,
+        "informative": true
+      },
+      {
+        "subset": "right side",
+        "yaw_deg": -3.3933362402186362,
+        "leverage": 0.3865156530623074,
+        "n": 4,
+        "informative": true
+      }
+    ],
+    "leverage": {
+      "l_thigh": 0.154,
+      "r_thigh": 0.163,
+      "l_shank": 0.166,
+      "r_shank": 0.123,
+      "l_uarm": 0.578,
+      "r_uarm": 0.608,
+      "l_larm": 0.616,
+      "r_larm": 0.652,
+      "hip_width": 1.0,
+      "knee_width": 1.0,
+      "shoulder_width": 0.999,
+      "elbow_width": 1.0
     }
   },
   "alternative_model": {
     "vertical_only": false,
-    "yaw_deg": -2.3389558547008726,
-    "tilt_deg": 0.3023178255978299,
-    "segment_rms_deg": 2.5343526258851896,
-    "position_rms_mm": 13.11095237313478
+    "yaw_deg": -2.3322162829789934,
+    "tilt_deg": 0.3119902709080385,
+    "segment_rms_deg": 2.1401890829115184,
+    "position_rms_mm": 10.084536122438413
   },
   "frame_conventions": {
     "offset_deg": {
-      "l_thigh": 91.35928022302068,
-      "r_thigh": 91.30270789587719,
-      "l_shank": 90.50831998215085,
-      "r_shank": 91.55447912169925,
-      "l_uarm": 86.4535492475148,
-      "r_uarm": 90.41545313478396,
-      "l_larm": 113.23768173949288,
-      "r_larm": 117.24892611971701
+      "l_thigh": 91.35952988621702,
+      "r_thigh": 91.30242540740468,
+      "l_shank": 90.51061002205864,
+      "r_shank": 91.55380436714636,
+      "l_uarm": 86.46299362475457,
+      "r_uarm": 90.40678300718672,
+      "l_larm": 113.25282471260049,
+      "r_larm": 117.23370970076756
     },
-    "max_disagreement_deg": 160.65038906635755,
-    "mean_disagreement_deg": 47.1838045362448
+    "max_disagreement_deg": 160.65117018751812,
+    "mean_disagreement_deg": 47.18326815420771
   },
   "checks": {
-    "mirror_determinant": 0.9999999999999989,
+    "mirror_determinant": 0.9999999999999997,
     "segment_lengths": [
       {
         "segment": "l_thigh",
@@ -151,6 +304,6 @@
       }
     ],
     "median_length_ratio": 1.0153871951814772,
-    "raw_check_rms_mm": 13.233819145577076
+    "raw_check_rms_mm": 32.55739996195336
   }
 }
