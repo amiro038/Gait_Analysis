@@ -1,88 +1,143 @@
 # MOVE4D → Theia3D rigid alignment
 
-Finds the 4×4 transform `T` such that `p_theia = T @ [p_move4d; 1]`, using
-corresponding skeleton joints from FBX exports of the same trial.
+Finds the 4×4 transform `T` such that `p_theia = T @ [p_move4d; 1]`, from a
+static standing (A-pose) trial recorded simultaneously by both systems.
+
+**Start here: `m4d_to_theia_transform.py`.** It is a single self-contained
+script — open it in Spyder, set the two file paths in the CONFIG cell, press
+F5. Only `numpy` is required (`matplotlib` for the optional figure). No
+Autodesk FBX SDK, no Blender.
 
 ## Files
 
 | file | purpose |
 |---|---|
-| `fbx_raw.py` | binary FBX reader (v7100–7700). Node-record tree, zlib arrays. No SDK needed. |
-| `fbx_scene.py` | scene-graph evaluator: hierarchy, animation curves, full Autodesk transform chain, per-frame global joint transforms. |
-| `align_m4d_to_theia.py` | the solver and its diagnostics. |
-| `plot_alignment.py` | visual validation figure. |
-
-Only `numpy` is required (`scipy` unused, `matplotlib` only for `--plot`).
-There is no dependency on the Autodesk FBX SDK or on Blender.
+| **`m4d_to_theia_transform.py`** | **everything: FBX reader, scene evaluator, solver, diagnostics, figure** |
+| `fbx_raw.py`, `fbx_scene.py`, `align_m4d_to_theia.py`, `plot_alignment.py` | the earlier multi-module version, kept for reference. Superseded. |
 
 ## Usage
 
-```bash
-# single trial
-python align_m4d_to_theia.py THEIA.fbx M4D.fbx -o alignment_out --plot
-
-# constrain the rotation to the vertical axis (recommended, see below)
-python align_m4d_to_theia.py THEIA.fbx M4D.fbx -o alignment_out --yaw-only
-
-# pool several synchronised trials into one fit -- strongly preferred
-printf 'D05_C1_apose_Theia.fbx D05_C1_apose_M4D.fbx\n' >  pairs.txt
-printf 'D05_C2_walk_Theia.fbx  D05_C2_walk_M4D.fbx\n'  >> pairs.txt
-python align_m4d_to_theia.py --pairs pairs.txt -o alignment_out
-```
-
-Outputs `T_m4d_to_theia.txt`, `T_m4d_to_theia.npy`, `alignment_report.json`
-and optionally `alignment_check.png`.
-
-Applying it:
-
 ```python
-import numpy as np
-from align_m4d_to_theia import apply_transform
-
-T = np.load("alignment_out/T_m4d_to_theia.npy")
-pts_theia = apply_transform(T, pts_m4d)      # (..., 3) array, raw M4D coords
+# in Spyder: edit the CONFIG cell, then F5. Afterwards:
+RESULT["yaw_deg"]
+pts_theia = apply_transform(T, pts_m4d)          # (..., 3)
+R_theia   = transform_orientation(T, R_m4d)      # (..., 3, 3)
 ```
+
+```bash
+python m4d_to_theia_transform.py THEIA.fbx M4D.fbx        # yaw-only (default)
+python m4d_to_theia_transform.py THEIA.fbx M4D.fbx --full # unconstrained 3-DOF
+```
+
+Writes `T_m4d_to_theia.txt` / `.npy`, `alignment_report.json` and
+`alignment_check.png` into `OUTDIR`.
 
 `T` maps **raw MOVE4D file coordinates** (Y-up, as exported) directly into
-**raw Theia file coordinates** (Z-up). The up-axis conversion is baked in —
-do not pre-convert.
-
-To rotate an orientation (segment frame, not a point) use `T[:3,:3] @ R_m4d`.
+**raw Theia file coordinates** (Z-up). The up-axis conversion and the unit
+scale factors are baked in — do not pre-convert.
 
 ## Method
 
-1. **Parse** both FBX files and evaluate global joint transforms per frame.
-2. **Reject bad frames** in two stages: gross outliers (a bind/rest pose sits
-   tens of cm from the data) and then relative outliers within the survivors
-   (filter edge artifacts sit a few mm away and survive any threshold loose
-   enough to be safe against real motion).
-3. **Check** units via segment-length ratios, and handedness via the signed
-   volume of (medio-lateral, vertical, antero-posterior). A mirrored file
-   cannot be fixed by a rotation, so this must be caught, not fitted.
-4. **Rotation** from *unit direction vectors* between corresponding joint
-   pairs, solved by weighted SVD (Wahba/Kabsch) with Huber IRLS. Direction
-   vectors are translation-invariant, so `R` decouples from `t` and is immune
-   to joint-centre definition offsets to first order. Full segment *frames*
-   are deliberately not used: their axial rotation is pure convention and
-   would reintroduce an unknown constant offset per segment.
-5. **Translation** by robust point matching given `R`, using only true
-   anatomical joint centres.
-6. **Diagnose** — see below.
+The objective is that **segment orientations agree once both systems are in
+the same coordinate frame**. Because the two skeletons are defined
+differently, the fit uses only the **arm and leg segments** — thigh, shank,
+upper arm, forearm. Feet, hands, pelvis, trunk and head are excluded from the
+fit and reported as *validation* landmarks instead.
 
-Static trials are collapsed to their mean pose (frame grids need not
-overlap). Dynamic trials are resampled onto the overlapping part of a common
-time base, which is what handles the differing frame rates.
+Two families of observation, both built from joint-centre positions:
+
+* **segment long axes** — hip→knee, knee→ankle, shoulder→elbow, elbow→wrist.
+  These constrain the out-of-plane part of the rotation.
+* **bilateral medio-lateral axes** — right→left at hip, knee, ankle, shoulder,
+  elbow and wrist. These are horizontal, so they are what actually pins the
+  heading, and they are insensitive to a joint-centre offset that is
+  *symmetric* between sides, which is the usual case.
+
+Everything is a unit direction between two landmarks, so the rotation is
+translation-invariant and decouples from the translation. The translation is
+then fitted by robust point matching on the same joint centres.
+
+Pipeline: parse both FBX files → evaluate the full Autodesk transform chain
+to global joint transforms per frame → canonicalise to Z-up/metres → reject
+bind poses and filter-edge frames → check handedness and units → solve the
+rotation (Wahba/Kabsch with Huber IRLS, or the closed-form constrained yaw)
+→ solve the translation → diagnose.
+
+Static trials collapse to their mean pose (the frame grids need not overlap);
+dynamic trials are resampled onto a common time base, which is what handles
+the differing frame rates.
+
+### Why not fit on the full segment orientation matrices?
+
+Because the two rigs use unrelated local bone-axis conventions, so every
+segment carries its own constant offset:
+
+```
+R_theia,s = G · R_m4d,s · O_s
+```
+
+and from a single posture `G` and the `O_s` are perfectly confounded. The
+script measures the `O_s` and prints them. On `D05_C1` they are **87–118°**
+and differ *between segments* by up to 30°, so even the "shared offset" model
+(all `O_s` equal — which *would* be identifiable) fails: it leaves 8–9° of
+residual and its 3-DOF solution is unstable (tilt wanders to 16–81°).
+
+The **long axis** is the part of a segment frame that both systems define
+anatomically rather than by convention. That is what the fit uses; the axial
+roll is ignored.
+
+> **Caveat.** `T[:3,:3] @ R_m4d` re-expresses a MOVE4D segment frame in
+> Theia's *coordinate system*. It does **not** convert MOVE4D's local bone
+> convention into Theia's anatomical convention — that is a separate,
+> per-segment problem.
+
+### Rotation model
+
+`ROTATION_MODEL = "yaw"` (default) constrains the rotation to the vertical.
+Both systems establish their vertical from the same physical gravity/lab
+calibration, so in principle only the heading and the origin differ. The yaw
+is solved **in closed form** under that constraint:
+
+```
+θ = atan2( Σ w (u_y v_x − u_x v_y),  Σ w (u_x v_x + u_y v_y) )
+```
+
+This is a genuinely different estimator from fitting 3 DOF and reading the
+yaw off the result — in the unconstrained fit the tilt is free to absorb
+skeleton mismatch and it drags the yaw with it. On this trial that difference
+is what makes the anatomical subsets agree to 0.8° instead of 2.7°.
+
+### Observation weighting
+
+Weights are derived, not hand-tuned. Each landmark carries an expected
+between-system definition uncertainty σ (mm, `LANDMARK_SIGMA_MM`); a
+direction between landmarks *a* and *b* then has angular uncertainty
+≈ `sqrt(σa² + σb²) / L`, plus a systematic floor, and is weighted by `1/σ²`.
+So the same 12 mm of landmark ambiguity is 5.6° across a 0.12 m hip width but
+0.7° across a 0.95 m wrist-to-wrist span, and the fit weights them
+accordingly.
+
+Bilateral ML axes get an extra discount (`ML_ASYMMETRY_FRACTION`): their two
+endpoint errors are strongly *correlated*, so only the left–right asymmetric
+part tilts the vector.
 
 ## What the diagnostics mean
 
-**Scale ratios.** Per-segment Theia/MOVE4D length ratio. The median catches a
-unit error instantly (would be 100, 2.54, 1000). The *scatter* around it is a
-free measure of how much the two skeletons disagree, and sets a floor on
-achievable residuals.
+**Length ratios.** Per-segment Theia/MOVE4D length ratio. The median catches
+a unit error instantly (it would be 100, 2.54, 1000). The *scatter* around it
+measures how much the two skeletons disagree, and sets a floor on achievable
+residuals.
 
-**Excluded landmarks.** Segment origins that are a rigging convention rather
-than an anatomical point are reported but not fitted. Their offsets are
-skeleton definition gaps, **not** alignment error — do not quote them as
+**End-to-end check.** `T` is assembled in raw file coordinates from a fit done
+in a canonicalised frame, which involves both files' up-axis matrices and unit
+scale factors. The script pushes the raw MOVE4D landmarks through `T` and
+compares against the raw Theia landmarks. In static mode this **must**
+reproduce the fitted residual exactly; if it does not, the bookkeeping is
+wrong and the matrix is unusable.
+
+**Validation landmarks.** Segment origins that are a rigging convention
+rather than an anatomical point are reported but never fitted. Their offsets
+are skeleton definition gaps, **not** alignment error — do not quote them as
 accuracy.
 
 **Yaw information** = Σ w·|horizontal component|². The Fisher information for
@@ -92,20 +147,22 @@ they are redundant, not degenerate.
 **Azimuthal diversity** = eigenvalue ratio of the horizontal scatter. This
 does *not* affect whether yaw is identifiable. It measures whether
 independent anatomical directions exist to cross-check each other, which is
-what protects against a systematic bias shared by every vector pointing the
-same way. An A-pose is nearly planar, so this is low.
+what protects against a bias shared by every vector pointing the same way. An
+A-pose is nearly planar, so this is low by construction.
 
-**Subset agreement.** Yaw estimated separately from medio-lateral vectors,
-antero-posterior vectors, and limb long axes. If these disagree, the
-disagreement *is* the uncertainty, whatever the residuals say. This is the
-most interpretable number in the report.
+**Subset agreement.** Yaw estimated separately from leg ML axes, arm ML axes,
+leg long axes and arm long axes. If these disagree, the disagreement *is* the
+uncertainty, whatever the residuals say. Subsets below `MIN_YAW_LEVERAGE`
+(mean horizontal component) are shown but excluded from the quoted spread: in
+a standing pose the leg long axes are ~9° off vertical, so a 0.5° error in
+them becomes several degrees of yaw.
 
-**Bootstrap** resamples segment *labels*, not individual observations,
+**Bootstrap** resamples direction *labels*, not individual observations,
 because the dominant error is a systematic per-segment definition mismatch
 rather than independent per-frame noise. The segment is the unit of
 uncertainty.
 
-**Rotation model comparison.** Both the full 3-DOF and yaw-only solutions are
+**Rotation model comparison.** Both the 3-DOF and yaw-only solutions are
 always evaluated. If constraining to yaw does not hurt the point fit, the
 out-of-plane rotation was absorbing skeleton mismatch rather than a real
 calibration tilt.
@@ -114,67 +171,80 @@ calibration tilt.
 
 | | Theia | MOVE4D |
 |---|---|---|
-| frames | 8 @ 40 fps (0.175 s) | 4 @ 60 fps (0.05 s) |
+| frames | 8 @ 40 fps | 4 @ 60 fps |
 | up axis | Z | Y |
 | units | metres | metres |
 
-- **Theia frame 0 is a rest/bind T-pose, not data** (pelvis at exactly
-  (0,0,0.932), hands symmetric at ±0.69). Frame 7 is a filter edge artifact
-  ~44 mm off. Frames 1–6 are stable to <3 mm. Both are auto-rejected.
-- Handedness matches; no mirroring. Scale ratio 1.013, so no unit conversion.
+- **Theia frame 0 is a rest/bind pose, not data** (514 mm from the rest of the
+  trial); frame 7 is a filter edge artifact. Both are auto-rejected, leaving
+  6 frames stable to ~2 mm. All 4 MOVE4D frames are good (1.3 mm of motion).
+- Handedness matches; no mirroring. Median length ratio 0.988 → same units.
 - Skeleton disagreement is real: thigh 0.94–0.95, shank 1.01–1.02, upper arm
-  1.02–1.03, foot 0.86–0.88, trunk 1.16. Theia `thorax` sits at shoulder
-  level while MOVE4D `Chest4` is well below — different landmarks, excluded.
-- Fit uses 10 joint centres: hips, knees, ankles, shoulders, elbows.
+  1.02–1.03, forearm 0.94–0.98, **foot 0.86–0.88, trunk 1.16**. The last two
+  are why feet and trunk are excluded — Theia `thorax` sits at shoulder level
+  while MOVE4D `Chest4` is 152 mm below it.
+- Fit uses 14 directions (8 long axes + 6 ML axes) and 12 joint centres.
 
-**Result (yaw-only, recommended):** yaw −2.00°, translation
-(−0.386, +0.225, +0.032) m, **12.8 mm position RMS**. The unconstrained
-3-DOF fit gives 14.2 mm, i.e. the extra freedom makes the fit *worse* —
-the 0.87° tilt it finds is not a real calibration difference.
+**Result (yaw-only, recommended):**
 
-**Yaw uncertainty is the weak point.** Independent subsets give:
+```
+yaw −1.93°,  translation (−0.386, +0.225, +0.034) m
+```
+
+```
+T = [ 0.999434   0.000000  -0.033643  -0.385874 ]
+    [-0.033643   0.000000  -0.999434   0.224698 ]
+    [ 0.000000   1.000000   0.000000   0.033550 ]
+    [ 0.000000   0.000000   0.000000   1.000000 ]
+```
+
+| | yaw-only | full 3-DOF |
+|---|---|---|
+| segment-orientation residual | **1.71° RMS** | 1.67° |
+| joint-centre residual | **12.6 mm RMS** | 13.3 mm |
+
+The extra 2 DOF buy 0.04° of angular fit and cost 0.7 mm of position fit —
+the 0.60° tilt they find is absorbing skeleton mismatch, not a real
+calibration difference. Keep `"yaw"`.
+
+**Uncertainty.** Independent subsets:
 
 | subset | yaw | leverage |
 |---|---|---|
-| medio-lateral (pelvis + shoulder width) | −2.76° | 1.00 |
-| antero-posterior (feet) | −0.93° | 0.95 |
-| limb long axes | −0.08° | 0.30 |
+| leg ML (hip/knee/ankle width) | −2.12° | 1.00 |
+| arm ML (shoulder/elbow/wrist) | −1.71° | 1.00 |
+| arm long axes | −2.54° | 0.60 |
+| leg long axes | −6.36° | 0.15 — ignore, near-vertical |
 
-Spread 2.68°. Bootstrap: −2.00° ± 0.97°, 95% CI [−3.39, +0.46] — crosses
-zero.
+Spread over the informative subsets: **0.84°**. Bootstrap over segment
+labels: −1.93° ± 0.32°, 95% CI [−2.58, −1.39]. Propagated onto points on the
+subject — the number that matters downstream — **1.5 mm RMS, 3.3 mm at the
+95th percentile**.
 
-Propagating that to actual points on the subject — the number that matters
-downstream — gives a **3.4 mm RMS spread (7.2 mm at the 95th percentile)**
-for the yaw-only model, versus 10.6 mm (20.4 mm) for the unconstrained fit.
-Yaw-only is both the better fit and three times the more stable, which is why
-it is recommended here.
-
-So the overall error budget: ~13 mm of irreducible skeleton-definition
-mismatch, plus ~3 mm of alignment uncertainty. The skeletons, not the
-alignment, are the limiting factor.
-
-This is inherent to a single A-pose, and it is an *azimuthal diversity*
-problem, not a rank problem. The pose is nearly planar: the only strong
-antero-posterior information comes from the feet, whose definitions
-demonstrably differ most (length ratio 0.86). Yaw is identifiable but not
-cross-checkable from within this trial.
+So the error budget is ~13 mm of irreducible skeleton-definition mismatch
+plus ~2 mm of alignment uncertainty. **The skeletons, not the alignment, are
+the limiting factor.**
 
 ## Limitations and how to improve
 
-1. **Pool a dynamic trial.** A walk or a turn from the same session, where
-   the feet and pelvis point in varied horizontal directions, gives real
-   azimuthal diversity and should cut the yaw uncertainty severalfold. Use
-   `--pairs`. This is the single highest-value change.
+1. **Pool a dynamic trial.** Azimuthal diversity is 0.007 — every horizontal
+   direction in an A-pose is medio-lateral, so a systematic bias shared by all
+   of them cannot be detected from within this trial. A walk or a turn from
+   the same session, where the pelvis and limbs point in varied horizontal
+   directions, gives real diversity. Add it to `TRIAL_PAIRS`. This is the
+   single highest-value change.
 2. **Translation carries a residual bias** from joint-centre definition
    differences that a single posture cannot separate from misalignment.
    Bilateral joints are used in pairs so the medio-lateral component largely
-   cancels; the antero-posterior and vertical components do not.
-   Multiple varied postures let the per-joint offsets be solved jointly.
+   cancels; the antero-posterior and vertical components do not. Multiple
+   varied postures let the per-joint offsets be solved jointly.
 3. **Validate on held-out trials.** Fit on one set, evaluate on another, and
-   plot residual against frame. Flat noise means one constant matrix is
-   valid. Drift or oscillation with movement means it is not — which would
-   point at sync error or retargeting artifacts rather than alignment.
-4. The joint correspondence in `JOINT_MAP`, the direction vectors in
-   `DIRECTION_VECTORS` and the fitted joints in `TRANSLATION_JOINTS` are
-   explicit tables at the top of `align_m4d_to_theia.py`. If your MOVE4D
-   rig version names joints differently, edit those and nothing else.
+   plot residual against frame. Flat noise means one constant matrix is valid.
+   Drift or oscillation with movement means it is not — which points at sync
+   error or retargeting artifacts rather than alignment.
+4. `LANDMARKS`, `SEGMENT_AXES`, `ML_AXES`, `TRANSLATION_LANDMARKS` and
+   `LANDMARK_SIGMA_MM` are explicit tables in the CONFIG cells. If your
+   MOVE4D rig version names joints differently, edit those and nothing else.
+   MOVE4D has no single wrist node, so the wrist is taken as the centroid of
+   the carpometacarpal roots hanging off `*Forearm` — the
+   `("children_of", ...)` landmark spec.
