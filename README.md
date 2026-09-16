@@ -64,32 +64,46 @@ No weighting is needed: a plain Kabsch already weights each observation's
 heading contribution by its squared horizontal component, so the ML axes outvote
 the long axes ~7:1 for yaw and not at all for tilt, which is exactly right.
 
-## The vertical is not fitted
+## The vertical offset
 
-Both systems put **z = 0 on the floor**, so there is no vertical offset between
-their coordinate systems to estimate. `ASSUME_SHARED_FLOOR = True` locks
-`t_z = 0`; anything the fit would have put there is the two skeletons
-disagreeing about joint-centre *height*, and it is reported separately instead
-of being buried in the matrix.
+The two coordinate systems **are** offset vertically, so `t_z` is fitted like any
+other component: **+29.8 mm**. Set `ASSUME_SHARED_FLOOR = True` only if you know
+both systems put z = 0 on the same floor plane; it then locks `t_z = 0` and
+reports what the joint centres implied instead of burying it in the matrix.
 
-The script verifies this from the body **surface**, because a joint centre is an
-inference and the sole of a foot is not. MOVE4D ships the real scan (49,530
-vertices, skinned to the rig — the script does the linear blend skinning);
-Theia ships its body model as rigid meshes parented to the segments.
+Know what a fitted `t_z` contains: the true offset between the two calibrations
+**plus** any systematic vertical bias between the two skeletons' joint-centre
+definitions. One static pose cannot separate them.
+
+The script gives you two independent reads on whether the offset is real.
+
+**The floor, from the body surface** — because a joint centre is an inference and
+the sole of a foot is not. MOVE4D ships the real scan (49,530 vertices, skinned
+to the rig; the script does the linear blend skinning). Theia ships its body
+model as rigid meshes parented to the segments.
 
 ```
 Theia model   34054 verts | lowest  +43.7 mm | top 1750.0 mm |   0 within 5 mm of z=0
 MOVE4D scan   49530 verts | lowest   -5.4 mm | top 1769.6 mm | 757 within 5 mm of z=0
 ```
 
-**The scanned subject is standing on the floor plane, not floating.** Theia's
-meshes are a body model (a ~270-vertex primitive per limb), not a measurement,
-so their 44 mm clearance says nothing about where its floor is.
+The scanned subject is standing **on** the floor, not floating, so MOVE4D's
+origin is on the floor. A +29.8 mm offset then puts Theia's floor at z = +29.8 mm
+in Theia coordinates — its origin that far *below* the floor — and Theia's lowest
+model vertex clears that floor by **13.9 mm**, against 43.7 mm if the floors were
+assumed shared. A ~270-vertex foot primitive clearing by 14 mm is far more
+plausible than one clearing by 44 mm, so the mesh independently supports a real
+vertical offset. It is corroboration, not proof: Theia's meshes are a model.
 
-Consequence: the vertical residual (**30.9 mm RMS**, every joint positive —
-Theia's centres sit 20–45 mm above MOVE4D's) is now visible as a skeleton
-property rather than hidden in `t_z`. The horizontal residual, **10.2 mm RMS**,
-is what the fit actually minimises.
+**The residual signs.** Suppress a real offset and every vertical residual comes
+out the same sign; absorb it correctly and they scatter about zero with only
+genuine definition differences left. The report checks this automatically —
+forcing `ASSUME_SHARED_FLOOR = True` on this dataset makes all eight residuals
+positive and the script says so.
+
+With `t_z` fitted, the vertical residuals are −7 to −2 mm at the hips, shoulders
+and elbows and **+13 to +15 mm at the knees** — a real knee joint-centre
+definition difference, no longer masked by an offset.
 
 ## Why not the full 3×3 segment orientation?
 
@@ -160,18 +174,18 @@ orientations usable.
 ## Result for D05_C1_apose
 
 ```
-heading (yaw)  −2.337°     translation  (−0.386, +0.227, 0.000) m
+heading (yaw)  −2.337°     translation  (−0.386, +0.227, +0.030) m
 
 T = [ 0.999169   0.000000  -0.040771  -0.386516 ]
     [-0.040771   0.000000  -0.999169   0.227162 ]
-    [ 0.000000   1.000000   0.000000   0.000000 ]
+    [ 0.000000   1.000000   0.000000   0.029752 ]
     [ 0.000000   0.000000   0.000000   1.000000 ]
 ```
 
-| | direction residual | horizontal position |
-|---|---|---|
-| vertical-axis only | **2.16° RMS** | **10.2 mm RMS** |
-| full 3-DOF | 2.14° | 10.1 mm |
+| | direction residual | horizontal position | vertical | total |
+|---|---|---|---|---|
+| vertical-axis only | **2.16° RMS** | **10.2 mm RMS** | 8.5 mm | 13.2 mm |
+| full 3-DOF | 2.14° | 10.1 mm | | |
 
 The 0.31° tilt the 3-DOF fit wants buys 0.1 mm, so it is absorbing skeleton
 mismatch rather than a real calibration difference.
@@ -199,7 +213,7 @@ rotation, so one file is mirrored and no rigid transform can fix it.
 are both known. Below ~0.99 means that rig does *not* have a consistent bone
 axis and step 5 needs rethinking for your rig version.
 
-**Floor.** As above, from the surface.
+**Floor.** As above, from the surface, plus the residual-sign test.
 
 **End-to-end.** `T` is fitted in a canonicalised frame and rebuilt to act on raw
 FBX coordinates, which drags in both files' up-axis matrices and unit scale
@@ -239,6 +253,10 @@ Ordered by value, and none of it is an algorithm change:
 tables in CONFIG. If your MOVE4D rig version names joints differently, edit those
 and nothing else. `USE_ML_AXES`, `ASSUME_SHARED_FLOOR`, `CHECK_FLOOR_FROM_MESH`
 and `VERTICAL_ONLY` are the switches.
+
+`VERTICAL_ONLY` and `ASSUME_SHARED_FLOOR` are independent and mean different
+things: the first constrains the *rotation* to be about the vertical, the second
+locks the *translation's* vertical component to zero.
 
 `fbx_raw.py`, `fbx_scene.py`, `align_m4d_to_theia.py` and `plot_alignment.py`
 are the original multi-module version, kept for reference. Nothing depends on

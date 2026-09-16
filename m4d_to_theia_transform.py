@@ -136,14 +136,24 @@ ML_AXES = [("hip_width", "r_hip", "l_hip"),
            ("shoulder_width", "r_shoulder", "l_shoulder"),
            ("elbow_width", "r_elbow", "l_elbow")]
 
-# Both systems put z = 0 on the floor, so the true vertical offset between
-# their coordinate systems is zero and t_z is not something to estimate.
-# Fitting it anyway just absorbs the two skeletons' vertical joint-centre
-# disagreement (~30 mm here) into the transform. With this True the fit
-# solves for the horizontal translation only and reports the vertical
-# disagreement separately, where it belongs. CHECK_FLOOR_FROM_MESH verifies
-# the assumption from the mesh rather than taking it on trust.
-ASSUME_SHARED_FLOOR = True
+# The two coordinate systems ARE offset vertically, so t_z is fitted like
+# any other component. Set ASSUME_SHARED_FLOOR = True only if you know both
+# systems put z = 0 on the same floor plane; it then locks t_z to zero and
+# reports what the joint centres implied instead of burying it in the matrix.
+#
+# Be aware of what a fitted t_z contains. It is the TRUE vertical offset
+# between the two calibrations PLUS any systematic vertical bias between the
+# two skeletons' joint-centre definitions, and one static pose cannot
+# separate them. The floor check below is the closest thing to an
+# independent read on it: the MOVE4D scan locates its own floor plane
+# directly, so the fitted t_z can be turned into an implied Theia floor
+# height and sanity-checked against where Theia's feet sit.
+#
+# The residual signs are the tell. Suppress a real offset and every vertical
+# residual comes out the same sign; absorb it correctly and they scatter
+# about zero with only genuine definition differences left standing. The
+# report checks this for you.
+ASSUME_SHARED_FLOOR = False
 CHECK_FLOOR_FROM_MESH = True
 
 # Joint centres whose positions drive the translation (step 6). These are the
@@ -701,20 +711,20 @@ def solve_rotation(U, V, vertical_only):
 def solve_translation(A, B, R, lock_vertical=None):
     """t minimising sum ||a_i - (R b_i + t)||^2, which is just the mean.
 
-    With lock_vertical, t_z is forced to zero instead of fitted: both systems
-    put z = 0 on the floor, so there is no vertical offset between their
-    coordinate systems to estimate, and anything the fit puts there is the
-    two skeletons disagreeing about joint-centre height, not a calibration
-    difference. The mean vertical difference is returned so it can be
-    reported rather than silently buried in the matrix.
+    With lock_vertical, t_z is forced to zero instead of fitted -- for the
+    case where both systems put z = 0 on the same floor plane and there is
+    therefore no vertical offset to estimate. Either way the vertical offset
+    the joint centres imply is returned separately, so it can be reported
+    and cross-checked against the floor rather than only living inside the
+    matrix.
     """
     lock = ASSUME_SHARED_FLOOR if lock_vertical is None else lock_vertical
     t = (A - B @ R.T).mean(axis=0)
-    vertical_disagreement = float(t[2])
+    implied_vertical = float(t[2])
     if lock:
         t = t.copy()
         t[2] = 0.0
-    return t, vertical_disagreement
+    return t, implied_vertical
 
 
 # %%==========================================================================
@@ -963,7 +973,9 @@ def solve(theia_path=None, m4d_path=None, vertical_only=None, verbose=True):
             vertical_per_joint=dict(zip(keys, vert_err.round(2).tolist()))),
         vertical=dict(
             locked=ASSUME_SHARED_FLOOR,
-            mean_disagreement_mm=vertical_gap * 1000,
+            implied_offset_mm=vertical_gap * 1000,
+            residual_signs_agree=bool(np.all(vert_err > 0)
+                                      or np.all(vert_err < 0)),
             floor_check=dict(theia=floor_check(th), m4d=floor_check(m4))
             if CHECK_FLOOR_FROM_MESH else None),
         heading_uncertainty=heading_uncertainty(U, V, labels),
@@ -1089,14 +1101,23 @@ def print_report(r, th, m4):
     pr = r["position_residual_mm"]
     vt = r["vertical"]
     if vt["locked"]:
-        print("    vertical LOCKED: both systems put z = 0 on the floor, so")
-        print(f"    t_z = 0, and the {vt['mean_disagreement_mm']:+.1f} mm the "
-              f"fit would have put there is")
-        print("    reported below as skeleton disagreement instead.")
+        print("    vertical LOCKED (ASSUME_SHARED_FLOOR): t_z = 0, and the")
+        print(f"    {vt['implied_offset_mm']:+.1f} mm the joint centres imply "
+              f"is reported below instead")
+        print("    of being absorbed into the matrix.")
+    else:
+        print(f"    vertical FITTED: t_z = {vt['implied_offset_mm']:+.1f} mm. "
+              f"That figure is the true")
+        print("    calibration offset PLUS any systematic vertical bias "
+              "between the")
+        print("    two skeletons' joint-centre definitions; one static pose "
+              "cannot")
+        print("    separate them. See the floor check below.")
     print(f"\n    horizontal residual   RMS {pr['horizontal_rms']:5.1f} mm"
           "   <- what the fit minimised")
-    print(f"    vertical residual     RMS {pr['vertical_rms']:5.1f} mm   "
-          + ("<- NOT fitted, definition gap" if vt["locked"] else ""))
+    print(f"    vertical residual     RMS {pr['vertical_rms']:5.1f} mm"
+          + ("   <- NOT fitted, definition gap" if vt["locked"]
+             else "   <- what is left after fitting t_z"))
     print(f"    total                 RMS {pr['rms']:5.1f} mm, "
           f"max {pr['max']:.1f} mm")
     print(f"\n      {'joint':11s} {'total':>9s} {'vertical':>9s}")
@@ -1113,25 +1134,61 @@ def print_report(r, th, m4):
             print(f"      {lab:12s} {d['n_vertices']:6d} verts | lowest "
                   f"{d['lowest_mm']:+7.1f} mm | top {d['highest_mm']:7.1f} mm"
                   f" | {d['within_5mm_of_floor']:5d} within 5 mm of z=0")
-        th_fc = fc.get("theia")
-        if th_fc and th_fc["within_5mm_of_floor"] == 0:
-            print("      Theia's meshes are its body MODEL (a 270-vertex "
-                  "primitive per")
-            print("      limb), not a measurement, so their "
-                  f"{th_fc['lowest_mm']:.0f} mm clearance says")
-            print("      nothing about where its floor is. Only the scan can "
-                  "settle that.")
-        m = fc.get("m4d")
+        m, th_fc = fc.get("m4d"), fc.get("theia")
         if m:
-            if abs(m["lowest_mm"]) < 20 and m["within_5mm_of_floor"] > 50:
-                print("      -> the scanned subject is standing ON the floor "
-                      "plane, not")
-                print("         floating: z = 0 really is the floor in the "
-                      "MOVE4D file.")
+            on_floor = abs(m["lowest_mm"]) < 20 and m["within_5mm_of_floor"] > 50
+            if on_floor:
+                print("      -> the scanned subject stands ON the floor, so "
+                      "MOVE4D's floor plane")
+                print(f"         is z = {m['lowest_mm']:+.1f} mm: its origin "
+                      f"is on the floor.")
             else:
-                print("      -> the scan does NOT reach z = 0. Check the "
-                      "assumption;")
-                print("         ASSUME_SHARED_FLOOR may be wrong for this file.")
+                print("      -> the scan does not reach z = 0, so MOVE4D's "
+                      "floor cannot be")
+                print("         located this way. Treat the rest of this "
+                      "block with caution.")
+            tz = vt["implied_offset_mm"]
+            if on_floor and th_fc:
+                # the MOVE4D floor (z=0) maps to z = t_z in Theia coordinates
+                clear_fit = th_fc["lowest_mm"] - tz
+                print(f"\n      A vertical offset of {tz:+.1f} mm puts Theia's "
+                      f"floor at z = {tz:+.1f} mm in")
+                print("      Theia coordinates, i.e. its origin that far "
+                      "BELOW the floor. Theia's")
+                print(f"      lowest model vertex then clears the floor by "
+                      f"{clear_fit:+.1f} mm, against")
+                print(f"      {th_fc['lowest_mm']:+.1f} mm if the two floors "
+                      f"were assumed shared.")
+                print("      Theia's meshes are a body MODEL (a ~270-vertex "
+                      "primitive per limb),")
+                print("      not a measurement, so neither figure is proof -- "
+                      "but a simplified")
+                if abs(clear_fit) < abs(th_fc["lowest_mm"]):
+                    print("      foot primitive sitting the SMALLER distance "
+                          "off the floor is the")
+                    print("      more plausible of the two, which independently "
+                          "supports a real")
+                    print("      vertical offset rather than a shared floor.")
+                else:
+                    print("      foot primitive would have to sit FURTHER off "
+                          "the floor for the")
+                    print("      fitted offset to hold, which argues the other "
+                          "way. Worth a look.")
+
+        # the residual signs are the other tell
+        if vt["residual_signs_agree"]:
+            print("\n      !! every vertical residual has the same sign. That "
+                  "is the signature of")
+            print("      a real vertical offset being SUPPRESSED, not a "
+                  "definition gap."
+                  + ("\n      Set ASSUME_SHARED_FLOOR = False."
+                     if vt["locked"] else ""))
+        else:
+            print("\n      vertical residuals scatter about zero, which is "
+                  "what you want:")
+            print("      the offset has been absorbed and only genuine "
+                  "definition")
+            print("      differences are left standing.")
 
     print("\n" + "-" * W)
     print("  RESULT     p_theia = T @ [p_m4d, 1]   (raw FBX coords both sides)")

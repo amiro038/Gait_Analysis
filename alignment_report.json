@@ -16,7 +16,7 @@
       0.0,
       1.0,
       0.0,
-      0.0
+      0.0297518113037286
     ],
     [
       0.0,
@@ -45,7 +45,7 @@
   "translation_m": [
     -0.3865157102162152,
     0.22716246719529054,
-    0.0
+    0.0297518113037286
   ],
   "vertical_only": true,
   "yaw_deg": -2.3366742512179832,
@@ -129,34 +129,35 @@
     }
   },
   "position_residual_mm": {
-    "rms": 32.55739996195336,
-    "max": 46.67370939355365,
+    "rms": 13.221725168446335,
+    "max": 19.957934122357376,
     "horizontal_rms": 10.152562673757526,
-    "vertical_rms": 30.93395809523938,
+    "vertical_rms": 8.469916622101582,
     "per_joint": {
-      "l_hip": 26.33,
-      "r_hip": 25.83,
-      "l_knee": 44.53,
-      "r_knee": 46.67,
-      "l_shoulder": 29.44,
-      "r_shoulder": 29.49,
-      "l_elbow": 27.61,
-      "r_elbow": 21.45
+      "l_hip": 7.79,
+      "r_hip": 14.1,
+      "l_knee": 17.84,
+      "r_knee": 19.96,
+      "l_shoulder": 9.29,
+      "r_shoulder": 9.83,
+      "l_elbow": 10.48,
+      "r_elbow": 11.39
     },
     "vertical_per_joint": {
-      "l_hip": 25.5,
-      "r_hip": 22.75,
-      "l_knee": 42.85,
-      "r_knee": 44.79,
-      "l_shoulder": 27.99,
-      "r_shoulder": 27.87,
-      "l_elbow": 25.84,
-      "r_elbow": 20.43
+      "l_hip": -4.25,
+      "r_hip": -7.01,
+      "l_knee": 13.1,
+      "r_knee": 15.04,
+      "l_shoulder": -1.76,
+      "r_shoulder": -1.89,
+      "l_elbow": -3.92,
+      "r_elbow": -9.32
     }
   },
   "vertical": {
-    "locked": true,
-    "mean_disagreement_mm": 29.7518113037286,
+    "locked": false,
+    "implied_offset_mm": 29.7518113037286,
+    "residual_signs_agree": false,
     "floor_check": {
       "theia": {
         "n_vertices": 34054,
@@ -304,6 +305,6 @@
       }
     ],
     "median_length_ratio": 1.0153871951814772,
-    "raw_check_rms_mm": 32.55739996195336
+    "raw_check_rms_mm": 13.221725168446335
   }
 }
