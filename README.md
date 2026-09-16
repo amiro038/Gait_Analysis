@@ -247,6 +247,40 @@ Ordered by value, and none of it is an algorithm change:
    residual against frame. Flat noise → one constant matrix is valid. Drift →
    sync error or a position-dependent calibration difference.
 
+## Applying the transform to meshes
+
+`transform_obj_to_theia.py` takes Wavefront `.obj` files in raw MOVE4D
+coordinates — parts segmented out of the scan, for instance — and writes them
+in Theia coordinates.
+
+```bash
+python transform_obj_to_theia.py                    # the files listed in CONFIG
+python transform_obj_to_theia.py left_feet.obj      # or named on the command line
+```
+
+Vertices get `T`; vertex normals get the inverse-transpose of its linear block,
+renormalised. Faces, groups, comments and material references pass through byte
+for byte, so topology survives.
+
+**The output is Z-up.** MOVE4D files are Y-up and Theia files are Z-up, and that
+conversion is part of `T`. Open the result in a Y-up viewer and the mesh will
+appear to lie on its side — that is what "in Theia's coordinate system" means.
+
+Two checks run every time:
+
+- **Input frame.** The mesh must sit inside the MOVE4D scan's own bounding box.
+  Re-centring, a switch to millimetres or an axis flip are all caught here rather
+  than producing a plausible-looking wrong answer.
+- **Floor.** MOVE4D's floor is z = 0 in its own file, so it lands at `T[2,3]` in
+  Theia coordinates, and a foot's sole should be right there. On the supplied
+  feet the soles land at **+28.2 mm against an expected +29.8 mm**.
+
+It also writes `obj_transform_check.png`: the transformed mesh against Theia's
+own body model and joint centres, clipped to the region of interest. On the
+supplied feet, Theia's ankle joint centres fall **inside** the transformed scan
+surface, ~41 mm from the nearest skin vertex, and the toe joints ~26 mm inside —
+which is where joint centres belong.
+
 ## Adapting it
 
 `SEGMENTS`, `JOINTS`, `ML_AXES` and `SEGMENT_ENDS` / `M4D_ENDS` are explicit
