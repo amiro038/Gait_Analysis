@@ -427,6 +427,14 @@ lds_n_boot        = 200     # bootstrap resamples for the CI, 0 = off
 lds_seed          = 0
 lds_plot_strides  = 20      # strides drawn in the attractor figure
 
+# Sweep a fixed length window across the whole trial. The bootstrap above
+# resamples reference points INSIDE one window, so it only measures ensemble
+# noise. This asks the different question of how much lambda depends on WHICH
+# strides you analysed, and whether it drifts over the trial. Primary state
+# space only, it costs roughly a second per window.
+lds_sweep         = True
+lds_window_step   = 25      # strides between consecutive sweep windows
+
 # fit windows in strides. S is the primary, the others are sensitivity checks
 lds_fit_windows = {
     'S':      (0.0, 0.5),    # [Bruijn2009a]
@@ -491,15 +499,20 @@ lds_hs_all = (gait_event_data.loc[gait_event_data['support_limb'] == lds_limb,
 #skip the acclimatisation period, treadmill gait is not steady state at the start
 lds_start = int(np.searchsorted(lds_hs_all, lds_hs_all[0] + lds_warmup_s * lds_fs))
 
+lds_hs_avail = lds_hs_all[lds_start:]
+
 lds_short = False
-if len(lds_hs_all) < lds_start + lds_n_strides + 1:
+if len(lds_hs_avail) < lds_n_strides + 1:
     lds_short = True
-    lds_n_strides = len(lds_hs_all) - lds_start - 1
+    lds_n_strides = len(lds_hs_avail) - 1
     print(f" Only {lds_n_strides} strides after the warm up. lambda depends on "
           f"the amount of data, so this trial is NOT comparable to trials run "
           f"at the full stride count")
 
-lds_hs = lds_hs_all[lds_start: lds_start + lds_n_strides + 1]
+#how much of the record to condition. The reported result always uses the first
+#lds_n_strides strides; with the sweep on we also need everything after them
+lds_n_span = (len(lds_hs_avail) - 1) if lds_sweep else lds_n_strides
+lds_hs = lds_hs_avail[: lds_n_span + 1]
 
 #map event frames onto row positions in the kinematic data
 lds_frame = pd.to_numeric(kinematic_data['Unnamed: 0'], errors='coerce').to_numpy()
@@ -515,7 +528,7 @@ if pd.Series(lds_frame).duplicated().any():
 if np.any(np.diff(lds_frame[lds_i0:lds_i1 + 1]) != 1):
     raise ValueError(" Kinematic frames are not contiguous inside the LDS window")
 
-lds_stride_samples = np.diff(lds_hs)
+lds_stride_samples = np.diff(lds_hs[: lds_n_strides + 1])
 lds_stride_time = np.mean(lds_stride_samples) / lds_fs
 lds_stride_cv = np.std(lds_stride_samples, ddof=1) / np.mean(lds_stride_samples) * 100
 
@@ -526,7 +539,7 @@ print("=" * 76)
 print(f" Local dynamic stability")
 print(f" Limb          : {lds_limb}")
 print(f" Strides       : {lds_n_strides} starting at stride {lds_start} "
-      f"(frames {lds_hs[0]} to {lds_hs[-1]})")
+      f"(of {lds_n_span} available after the warm up)")
 print(f" Mean stride   : {lds_stride_time:.3f} s  (CV {lds_stride_cv:.2f}%)")
 print(f" Embedding     : tau = {lds_tau}, dE = {lds_dE}  (fixed, not fitted here)")
 print(f" Time normalise: {lds_normalise}")
@@ -603,8 +616,10 @@ if lds_normalise:
             lds_pieces.append(np.interp(lds_grid, np.arange(len(lds_seg)), lds_seg))
         lds_signals[lds_spec] = np.concatenate(lds_pieces)
     lds_spstride = float(lds_samples_per_stride)
+    lds_stride_start = np.arange(lds_n_span + 1) * int(lds_spstride)
 else:
     lds_spstride = float(np.mean(np.diff(lds_hs_rows)))
+    lds_stride_start = lds_hs_rows
     print(" Time normalisation is off, so samples per stride varies with cadence")
 
 lds_theiler = int(round(lds_theiler_strides * lds_spstride))
@@ -627,8 +642,11 @@ for lds_name in lds_state_spaces:
         continue
     print(f"  {lds_name} ...")
 
-    #gather the channels and scale them
-    lds_chans = [lds_signals[lds_s].copy() for lds_s in lds_ss['signals']]
+    #gather the channels and scale them. Only the reported window, the sweep
+    #further down walks the same channels across the rest of the trial
+    lds_chans = [lds_signals[lds_s][lds_stride_start[0]:
+                                    lds_stride_start[lds_n_strides]].copy()
+                 for lds_s in lds_ss['signals']]
     if lds_ss['scale'] == 'zscore':
         for lds_c in range(len(lds_chans)):
             lds_chans[lds_c] = lds_chans[lds_c] / np.std(lds_chans[lds_c])
@@ -751,6 +769,7 @@ for lds_name in lds_state_spaces:
             lds_bs = np.polyfit(lds_t, lds_boot[:, lds_j0: lds_j1 + 1].T, 1)[0]
             lds_row[f'lambda_{lds_tag}_lo'] = np.percentile(lds_bs, 2.5)
             lds_row[f'lambda_{lds_tag}_hi'] = np.percentile(lds_bs, 97.5)
+            lds_row[f'lambda_{lds_tag}_sd'] = np.std(lds_bs, ddof=1)
 
     #per second only means something on real time data. Converting a per stride
     #exponent from normalised data back to per second just puts the cadence
@@ -828,6 +847,148 @@ for lds_name in lds_curves:
 lds_curve_path = lds_out_path.with_name(lds_out_path.stem + '_curves.csv')
 lds_curve_table.to_csv(lds_curve_path, index=False)
 print(f" Divergence curves -> {lds_curve_path}")
+
+# -----------------------------------------------------------------------------
+# %% sweep a fixed length window across the trial
+# -----------------------------------------------------------------------------
+# The bootstrap in the main loop resamples reference points INSIDE one window,
+# so it only measures how precisely the ensemble average is pinned down. It
+# cannot tell you whether a different 150 strides would have given a different
+# answer. This walks the same window across the whole trial and asks exactly
+# that, and at the same time shows whether lambda drifts as the trial goes on.
+#
+# The window LENGTH is held fixed, because lambda depends on the amount of data
+# [Bruijn2009a]. Only the starting stride moves.
+#
+# This repeats the neighbour and curve code from the main loop in a shorter
+# form. If you change the recipe up there, change it here too.
+
+lds_sweep_results = []
+
+if lds_sweep and lds_primary in lds_curves:
+    lds_ss = lds_state_spaces[lds_primary]
+    lds_sw_chans = [lds_signals[lds_s].copy() for lds_s in lds_ss['signals']]
+    if lds_ss['scale'] == 'zscore':
+        for lds_c in range(len(lds_sw_chans)):
+            lds_sw_chans[lds_c] = lds_sw_chans[lds_c] / np.std(lds_sw_chans[lds_c])
+
+    lds_sw_starts = np.arange(0, lds_n_span - lds_n_strides + 1, lds_window_step)
+    print(f"\n Sweeping a {lds_n_strides} stride window across {lds_primary}: "
+          f"{len(lds_sw_starts)} positions, step {lds_window_step} strides")
+
+    for lds_w0 in lds_sw_starts:
+        lds_wc = [lds_c[lds_stride_start[lds_w0]:
+                        lds_stride_start[lds_w0 + lds_n_strides]]
+                  for lds_c in lds_sw_chans]
+
+        if lds_ss['embed'] == 'delay':
+            lds_de = int(lds_ss['dE'])
+            lds_M = len(lds_wc[0]) - (lds_de - 1) * lds_tau
+            lds_Y = np.column_stack([lds_c[lds_k * lds_tau: lds_k * lds_tau + lds_M]
+                                     for lds_c in lds_wc
+                                     for lds_k in range(lds_de)])
+        else:
+            lds_Y = np.column_stack(lds_wc)
+            lds_M = lds_Y.shape[0]
+
+        lds_last = lds_M - 1 - lds_n_lags
+        lds_self = np.arange(lds_last + 1)
+        lds_idx = cKDTree(lds_Y).query(lds_Y[:lds_last + 1], k=lds_k)[1]
+
+        lds_nn = np.full(lds_last + 1, -1)
+        for lds_col in range(1, lds_k):
+            lds_cand = lds_idx[:, lds_col]
+            lds_take = ((lds_nn < 0) & (lds_cand <= lds_last) &
+                        (np.abs(lds_cand - lds_self) > lds_theiler))
+            lds_nn[lds_take] = lds_cand[lds_take]
+
+        lds_ref = np.flatnonzero(lds_nn >= 0)
+        if lds_max_ref is not None and len(lds_ref) > lds_max_ref:
+            lds_ref = np.sort(lds_rng.choice(lds_ref, lds_max_ref, replace=False))
+
+        lds_curve = np.empty(lds_n_lags + 1)
+        for lds_i in range(lds_n_lags + 1):
+            lds_dd = np.linalg.norm(lds_Y[lds_ref + lds_i] -
+                                    lds_Y[lds_nn[lds_ref] + lds_i], axis=1)
+            lds_curve[lds_i] = np.mean(np.log(np.maximum(lds_dd, 1e-300)))
+
+        lds_sw_row = {'trial': lds_results['trial'][0],
+                      'state_space': lds_primary,
+                      'window_index': int(lds_w0),
+                      'start_stride': int(lds_start + lds_w0),
+                      'n_strides': lds_n_strides}
+        for lds_tag in ('S', 'L'):
+            lds_win = lds_fit_windows[lds_tag]
+            lds_j0 = int(round(lds_win[0] * lds_spstride))
+            lds_j1 = min(int(round(lds_win[1] * lds_spstride)), lds_n_lags)
+            lds_t = np.arange(lds_j0, lds_j1 + 1) / lds_spstride
+            lds_seg = lds_curve[lds_j0: lds_j1 + 1]
+            lds_sw_row[f'lambda_{lds_tag}'] = np.polyfit(lds_t, lds_seg, 1)[0]
+            lds_sw_row[f'R2_{lds_tag}'] = np.corrcoef(lds_t, lds_seg)[0, 1] ** 2
+        lds_sweep_results.append(lds_sw_row)
+
+    lds_sweep_results = pd.DataFrame(lds_sweep_results)
+    lds_sw_lam = lds_sweep_results['lambda_S'].to_numpy()
+
+    #windows that share no strides with each other are the only independent ones
+    lds_indep = lds_sweep_results[
+        lds_sweep_results['window_index'] % lds_n_strides == 0]
+    lds_win_sd = lds_indep['lambda_S'].std(ddof=1)
+    lds_boot_sd = lds_results.loc[lds_results['is_primary'], 'lambda_S_sd'].iloc[0]
+
+    print(f"   lambda_S over windows  : median {np.median(lds_sw_lam):.4f}, "
+          f"IQR {np.percentile(lds_sw_lam, 25):.4f} to "
+          f"{np.percentile(lds_sw_lam, 75):.4f}, "
+          f"full range {lds_sw_lam.min():.4f} to {lds_sw_lam.max():.4f}")
+    print(f"   non overlapping windows: {len(lds_indep)}, mean "
+          f"{lds_indep['lambda_S'].mean():.4f}, SD {lds_win_sd:.4f}")
+
+    #Drift in units you can read. Deliberately no p value: consecutive windows
+    #share up to 149 of their 150 strides, so they are nowhere near independent
+    #and any test on them would be far too optimistic. Carry the slope to the
+    #group analysis and test it there, across participants.
+    lds_trend = np.polyfit(lds_sweep_results['start_stride'], lds_sw_lam, 1)[0]
+    print(f"   drift across the trial : {100 * lds_trend:+.4f} per 100 strides "
+          f"(descriptive, no test, the windows overlap)")
+
+    #the comparison this whole section exists for
+    print(f"   reference point bootstrap SD {lds_boot_sd:.4f}  vs  window to "
+          f"window SD {lds_win_sd:.4f}  ({lds_win_sd / lds_boot_sd:.1f}x)")
+    if len(lds_indep) < 5:
+        print(f"      (that SD is from only {len(lds_indep)} independent windows, "
+              f"so it is itself rough.\n       Pool it across trials before "
+              f"leaning on it)")
+    if lds_win_sd > 2 * lds_boot_sd:
+        print("   -> which strides you analyse matters more than the ensemble "
+              "averaging does.\n      Quote the window to window spread, not "
+              "the bootstrap CI, as this trial's uncertainty")
+
+    lds_sweep_path = lds_out_path.with_name(lds_out_path.stem + '_sweep.csv')
+    lds_sweep_results.to_csv(lds_sweep_path, index=False)
+    print(f" Window sweep -> {lds_sweep_path}")
+
+    # --- figure: does lambda depend on where you start? ----------------------
+    plt.figure(figsize=(9.0, 4.2))
+    lds_p = lds_results[lds_results['is_primary']].iloc[0]
+
+    plt.axhspan(lds_p['lambda_S_lo'], lds_p['lambda_S_hi'], color='#2a78d6',
+                alpha=0.15, linewidth=0,
+                label='95% CI of the reported window (reference points only)')
+    plt.plot(lds_sweep_results['start_stride'], lds_sw_lam, '-o', color='#2a78d6',
+             linewidth=1.8, markersize=4, label='lambda_S of each window')
+    plt.plot(lds_indep['start_stride'], lds_indep['lambda_S'], 'o',
+             color='#eb6834', markersize=9, fillstyle='none', markeredgewidth=1.8,
+             label='non overlapping windows')
+    plt.axhline(np.median(lds_sw_lam), color='#8a8a85', ls=':', linewidth=1.5,
+                label=f'median {np.median(lds_sw_lam):.3f}')
+
+    plt.xlabel('first stride of the window')
+    plt.ylabel('lambda_S (per stride)')
+    plt.title(f'{lds_primary}: a {lds_n_strides} stride window moved across the '
+              f'trial', fontsize=10)
+    plt.legend(fontsize=8, frameon=False)
+    plt.grid(alpha=0.15)
+    plt.tight_layout()
 
 # -----------------------------------------------------------------------------
 # %% one figure per state space, four panels showing how it is built
