@@ -425,6 +425,7 @@ lds_k             = 200     # neighbours requested per point
 lds_max_ref       = 6000    # reference points used, None = all
 lds_n_boot        = 200     # bootstrap resamples for the CI, 0 = off
 lds_seed          = 0
+lds_plot_strides  = 20      # strides drawn in the attractor figure
 
 # fit windows in strides. S is the primary, the others are sensitivity checks
 lds_fit_windows = {
@@ -670,7 +671,18 @@ for lds_name in lds_state_spaces:
     if lds_max_ref is not None and len(lds_ref) > lds_max_ref:
         lds_ref = np.sort(lds_rng.choice(lds_ref, lds_max_ref, replace=False))
 
-    #mean log divergence curve
+    #mean log divergence curve.
+    #
+    #Expect a ripple at exactly one cycle per stride on top of the rise. It is
+    #not noise and it is not a bug. The nearest neighbour of a point is almost
+    #always at the SAME phase of the gait cycle a few strides away (measured:
+    #~83% of pairs are within 2 normalised samples of the same phase), so the
+    #pair travels round the loop together. The loop is not equally thick all the
+    #way round, because stride to stride variability depends on where you are in
+    #the cycle, so their separation breathes once per stride. Most of it cancels
+    #when averaging over reference points at all phases; what survives is about
+    #1% of the rise across the lambda_S window. It only looks large on the
+    #plateau, where the y axis is expanded. See the attractor figure at the end.
     lds_lnd = np.empty((len(lds_ref), lds_n_lags + 1))
     for lds_i in range(lds_n_lags + 1):
         lds_dd = np.linalg.norm(lds_Y[lds_ref + lds_i] -
@@ -754,9 +766,17 @@ for lds_name in lds_state_spaces:
         print("    ! the curve is flat across the lambda_L window, so lambda_L "
               "is fitting a plateau, not a divergence rate")
 
+    #keep the first few strides of the state space for the attractor figure
+    if lds_ss['embed'] == 'delay':
+        lds_labels = [f'{lds_ss["signals"][0][0]} {lds_ss["signals"][0][1]} (t)',
+                      '(t + Td)', '(t + 2Td)']
+    else:
+        lds_labels = [f'{lds_s[1]} {lds_s[2]}' for lds_s in lds_ss['signals'][:3]]
+
     lds_results.append(lds_row)
     lds_curves[lds_name] = {'curve': lds_curve, 'attractor': lds_attractor,
-                            'boot': lds_boot}
+                            'boot': lds_boot, 'labels': lds_labels,
+                            'Y': lds_Y[:int(lds_plot_strides * lds_spstride), :3]}
 
 lds_results = pd.DataFrame(lds_results)
 
@@ -839,3 +859,59 @@ for lds_name in lds_curves:
     lds_panel += 1
 
 plt.tight_layout()
+
+# -----------------------------------------------------------------------------
+# %% attractor figure, the reconstructed state space itself
+# -----------------------------------------------------------------------------
+# For a delay embedded space the axes are x(t), x(t + Td), x(t + 2Td), which is
+# the usual way these are drawn [Takens1981]. For a space built from measured
+# states the axes are the first three channels. Only the first lds_plot_strides
+# strides are drawn, otherwise 150 loops on top of each other is a solid blob.
+#
+# Colour is the stride number, light to dark, so you can see whether successive
+# strides sit on top of each other (a tight limit cycle) or wander.
+#
+# This is also the picture that explains the ripple in the divergence curve: the
+# loop is not equally thick all the way round, so as a neighbour pair travels
+# round it together their separation breathes once per stride.
+
+lds_plot_n = int(lds_plot_strides * lds_spstride)
+lds_ncol = min(3, len(lds_curves))
+lds_nrow = int(np.ceil(len(lds_curves) / float(lds_ncol)))
+lds_colours = plt.cm.Blues(np.linspace(0.40, 1.0, lds_plot_strides))
+
+plt.figure(figsize=(4.4 * lds_ncol, 3.9 * lds_nrow))
+
+lds_panel = 1
+for lds_name in lds_curves:
+    lds_Yp = lds_curves[lds_name]['Y']
+    lds_axis3d = plt.subplot(lds_nrow, lds_ncol, lds_panel, projection='3d')
+
+    if lds_Yp.shape[1] < 3:
+        lds_axis3d.set_title(f'{lds_name}\n(needs 3 dimensions to draw)', fontsize=9)
+        lds_panel += 1
+        continue
+
+    #one line per stride, drawn to the first sample of the next stride so the
+    #loops join up
+    for lds_s in range(min(lds_plot_strides, len(lds_Yp) // int(lds_spstride))):
+        lds_a = int(lds_s * lds_spstride)
+        lds_b = min(int((lds_s + 1) * lds_spstride) + 1, len(lds_Yp))
+        lds_axis3d.plot(lds_Yp[lds_a:lds_b, 0], lds_Yp[lds_a:lds_b, 1],
+                        lds_Yp[lds_a:lds_b, 2],
+                        color=lds_colours[lds_s], linewidth=0.8)
+
+    lds_lab = lds_curves[lds_name]['labels']
+    lds_axis3d.set_xlabel(lds_lab[0], fontsize=7, labelpad=-4)
+    lds_axis3d.set_ylabel(lds_lab[1], fontsize=7, labelpad=-4)
+    lds_axis3d.set_zlabel(lds_lab[2], fontsize=7, labelpad=-4)
+    lds_axis3d.tick_params(labelsize=6, pad=-2)
+    lds_axis3d.set_title(lds_name + ('  [PRIMARY]' if lds_name == lds_primary else ''),
+                         fontsize=9)
+    lds_panel += 1
+
+lds_bar = plt.colorbar(plt.cm.ScalarMappable(
+    norm=plt.Normalize(1, lds_plot_strides), cmap='Blues'),
+    ax=plt.gcf().get_axes(), shrink=0.55, pad=0.02)
+lds_bar.set_label('stride number', fontsize=8)
+lds_bar.ax.tick_params(labelsize=7)
