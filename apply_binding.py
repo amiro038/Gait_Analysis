@@ -8,6 +8,9 @@ Reads the .npz written by bind_mesh_to_bones.py and a Visual3D metrics export
 of any trial, and reconstructs where every mesh vertex was, frame by frame.
 
     python apply_binding.py TRIAL_metrics.csv
+    python apply_binding.py TRIAL_metrics.csv --plot            # 3D viewer
+    python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120,240
+    python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120 --feet
     python apply_binding.py TRIAL_metrics.csv --vertices --obj
 
 HOW IT WORKS
@@ -63,6 +66,71 @@ OUT_SUFFIX = "_posed"
 VERBOSE = True
 
 SHAPE_TOLERANCE_MM = 5.0
+
+# --- 3D check figure --------------------------------------------------------
+# Draws the whole body from the export -- every joint and segment position,
+# the skeleton linking them -- with the posed mesh on top and each driven
+# segment's own axes as arrows. If the mesh sits on the skeleton's feet and
+# its axes follow the ankle, the binding is right. This is the check to
+# trust: it reads the same arrays the rest of the script works with, so
+# nothing can be lost in a file format on the way out.
+MESH_POINT_STRIDE = 6        # plot every Nth mesh vertex (10208 is a lot)
+AXIS_ARROW_M = 0.12          # length of the segment-axis arrows
+PLOT_ELEV, PLOT_AZIM = 18, -62
+# "body" frames the whole person; "feet" crops to the bound meshes, which is
+# where you can actually judge whether the binding sits right.
+PLOT_ZOOM = "body"
+
+# Joint centres (blue) and segment origins (green), exactly as Visual3D names
+# them. Anything missing from the export is skipped silently.
+SKELETON_JOINTS = [
+    "Head_Position", "Trunk_Position", "Low_Back_Position", "Pelvis_Position",
+    "Left_Shoulder_Position", "Left_Elbow_Position", "Left_Wrist_Position",
+    "Right_Shoulder_Position", "Right_Elbow_Position", "Right_Wrist_Position",
+    "Left_Hip_Position", "Left_Knee_Position", "Left_Ankle_Position",
+    "Left_Toes_Position", "Left_Heel_Position",
+    "Right_Hip_Position", "Right_Knee_Position", "Right_Ankle_Position",
+    "Right_Toes_Position", "Right_Heel_Position",
+]
+SKELETON_SEGMENTS = [
+    "Left_Upper_Arm_Position", "Left_Forearm_Position", "Left_Hand_Position",
+    "Right_Upper_Arm_Position", "Right_Forearm_Position", "Right_Hand_Position",
+    "Left_Thigh_Position", "Left_Shank_Position", "Left_Foot_Position",
+    "Right_Thigh_Position", "Right_Shank_Position", "Right_Foot_Position",
+]
+SKELETON_LINKS = [
+    ("Head_Position", "Trunk_Position"),
+    ("Trunk_Position", "Low_Back_Position"),
+    ("Low_Back_Position", "Pelvis_Position"),
+    ("Trunk_Position", "Left_Shoulder_Position"),
+    ("Trunk_Position", "Right_Shoulder_Position"),
+    ("Right_Shoulder_Position", "Right_Upper_Arm_Position"),
+    ("Right_Upper_Arm_Position", "Right_Elbow_Position"),
+    ("Right_Elbow_Position", "Right_Forearm_Position"),
+    ("Right_Forearm_Position", "Right_Wrist_Position"),
+    ("Right_Wrist_Position", "Right_Hand_Position"),
+    ("Left_Shoulder_Position", "Left_Upper_Arm_Position"),
+    ("Left_Upper_Arm_Position", "Left_Elbow_Position"),
+    ("Left_Elbow_Position", "Left_Forearm_Position"),
+    ("Left_Forearm_Position", "Left_Wrist_Position"),
+    ("Left_Wrist_Position", "Left_Hand_Position"),
+    ("Pelvis_Position", "Right_Hip_Position"),
+    ("Right_Hip_Position", "Right_Thigh_Position"),
+    ("Right_Thigh_Position", "Right_Knee_Position"),
+    ("Right_Knee_Position", "Right_Shank_Position"),
+    ("Right_Shank_Position", "Right_Ankle_Position"),
+    ("Right_Ankle_Position", "Right_Foot_Position"),
+    ("Right_Foot_Position", "Right_Toes_Position"),
+    ("Right_Ankle_Position", "Right_Heel_Position"),
+    ("Pelvis_Position", "Left_Hip_Position"),
+    ("Left_Hip_Position", "Left_Thigh_Position"),
+    ("Left_Thigh_Position", "Left_Knee_Position"),
+    ("Left_Knee_Position", "Left_Shank_Position"),
+    ("Left_Shank_Position", "Left_Ankle_Position"),
+    ("Left_Ankle_Position", "Left_Foot_Position"),
+    ("Left_Foot_Position", "Left_Toes_Position"),
+    ("Left_Ankle_Position", "Left_Heel_Position"),
+]
 
 
 # %%==========================================================================
@@ -144,6 +212,183 @@ def rotation_gap_deg(A, B):
     """Angle between two stacks of rotations, in degrees."""
     tr = np.trace(np.einsum("fij,fkj->fik", A, B), axis1=1, axis2=2)
     return np.degrees(np.arccos(np.clip((tr - 1) / 2, -1, 1)))
+
+
+# %%==========================================================================
+#  3D CHECK FIGURE
+# ============================================================================
+
+def _mesh_points(z, poses, frame, stride=None):
+    """Posed mesh vertices for one frame, subsampled. -> (M,3) or None."""
+    stride = MESH_POINT_STRIDE if stride is None else stride
+    v_local, seg_of = z["vertices_local"], z["vertex_segment"]
+    idx = np.arange(0, len(v_local), max(1, stride))
+    out = np.full((len(idx), 3), np.nan)
+    for k in range(poses.shape[1]):
+        P = poses[frame, k]
+        if not np.isfinite(P).all():
+            continue
+        m = seg_of[idx] == k
+        if m.any():
+            out[m] = v_local[idx][m] @ P[:3, :3].T + P[:3, 3]
+    return out
+
+
+def _frame_extent(vectors, z, poses, zoom=None):
+    """One fixed set of axis limits for the whole trial, so nothing jumps."""
+    zoom = PLOT_ZOOM if zoom is None else zoom
+    pts = []
+    if zoom != "feet":
+        for n in SKELETON_JOINTS + SKELETON_SEGMENTS:
+            if n in vectors:
+                pts.append(vectors[n])
+    else:
+        # _Position only. Matching on the substring alone would also pull in
+        # Ankle_Joint_Acc and Foot_Seg_Angle, whose values run to thousands
+        # and blow the axis limits to nonsense.
+        for n in SKELETON_JOINTS + SKELETON_SEGMENTS:
+            if n in vectors and any(k in n for k in
+                                    ("Ankle", "Toes", "Heel", "Foot")):
+                pts.append(vectors[n])
+    for f in range(0, len(poses), max(1, len(poses) // 25)):
+        mp = _mesh_points(z, poses, f, stride=40)
+        if mp is not None:
+            pts.append(mp)
+    P = np.vstack(pts)
+    P = P[np.isfinite(P).all(axis=1)]
+    lo, hi = P.min(0), P.max(0)
+    ctr = (lo + hi) / 2
+    r = float((hi - lo).max()) / 2 * 1.08
+    return ctr, max(r, 0.2)
+
+
+def draw_3d_frame(ax, vectors, z, poses, frame, meta, ctr=None, r=None,
+                  title=None):
+    """One frame: skeleton, segment origins, posed mesh, segment axes."""
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+    ax.clear()
+    pos = {n: vectors[n][frame] for n in vectors
+           if frame < len(vectors[n]) and np.isfinite(vectors[n][frame]).all()}
+
+    links = [[pos[a], pos[b]] for a, b in SKELETON_LINKS
+             if a in pos and b in pos]
+    if links:
+        ax.add_collection3d(Line3DCollection(links, colors="0.35", linewidths=1.4))
+
+    J = np.array([pos[n] for n in SKELETON_JOINTS if n in pos])
+    S = np.array([pos[n] for n in SKELETON_SEGMENTS if n in pos])
+    if len(J):
+        ax.scatter(J[:, 0], J[:, 1], J[:, 2], c="#1f4e79", s=26, depthshade=False)
+    if len(S):
+        ax.scatter(S[:, 0], S[:, 1], S[:, 2], c="#2e8b57", s=26, depthshade=False)
+
+    MP = _mesh_points(z, poses, frame)
+    if MP is not None:
+        ok = np.isfinite(MP).all(axis=1)
+        if ok.any():
+            ax.scatter(MP[ok, 0], MP[ok, 1], MP[ok, 2], c="#c0392b", s=1.2,
+                       alpha=0.5, depthshade=False)
+
+    # each driven segment's own axes -- this is the orientation the mesh rides
+    for k, seg in enumerate(meta["segments"]):
+        P = poses[frame, k]
+        if not np.isfinite(P).all():
+            continue
+        o = P[:3, 3]
+        for axis, colour in zip(range(3), ("#e74c3c", "#27ae60", "#2980b9")):
+            d = P[:3, axis] * AXIS_ARROW_M
+            ax.plot([o[0], o[0] + d[0]], [o[1], o[1] + d[1]],
+                    [o[2], o[2] + d[2]], color=colour, lw=2)
+
+    if ctr is not None:
+        ax.set_xlim(ctr[0] - r, ctr[0] + r)
+        ax.set_ylim(ctr[1] - r, ctr[1] + r)
+        ax.set_zlim(ctr[2] - r, ctr[2] + r)
+        ax.set_box_aspect((1, 1, 1))
+    ax.set_xlabel("X (m)", fontsize=8)
+    ax.set_ylabel("Y (m)", fontsize=8)
+    ax.set_zlabel("Z (m)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.view_init(elev=PLOT_ELEV, azim=PLOT_AZIM)
+    ax.set_title(title or f"frame {frame}", fontsize=10)
+
+
+def _legend(fig):
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[
+        Line2D([], [], color="#1f4e79", marker="o", ls="none", label="joint centre"),
+        Line2D([], [], color="#2e8b57", marker="o", ls="none", label="segment origin"),
+        Line2D([], [], color="#c0392b", marker="o", ls="none", ms=4,
+               label="posed mesh"),
+        Line2D([], [], color="#e74c3c", label="segment X"),
+        Line2D([], [], color="#27ae60", label="segment Y"),
+        Line2D([], [], color="#2980b9", label="segment Z"),
+    ], loc="lower center", ncol=6, fontsize=8, frameon=False)
+
+
+def save_3d_figure(result, frames=None, path=None, zoom=None, verbose=True):
+    """A static grid of frames. Works headless; good for a report."""
+    import matplotlib.pyplot as plt
+
+    vectors, z, poses, meta = (result["vectors"], result["binding_npz"],
+                               result["poses"], result["meta"])
+    n = len(poses)
+    if not frames:
+        frames = [int(round(x)) for x in np.linspace(0, n - 1, 6)]
+    frames = [f for f in frames if 0 <= f < n]
+    ctr, r = _frame_extent(vectors, z, poses, zoom)
+
+    cols = min(3, len(frames))
+    rows = int(np.ceil(len(frames) / cols))
+    fig = plt.figure(figsize=(5.2 * cols, 4.6 * rows))
+    for i, f in enumerate(frames):
+        ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        draw_3d_frame(ax, vectors, z, poses, f, meta, ctr, r)
+    _legend(fig)
+    fig.suptitle(f"{result['trial']}   mesh on the Theia skeleton"
+                 + ("   [feet]" if (zoom or PLOT_ZOOM) == "feet" else ""),
+                 fontsize=12)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+    path = path or (os.path.splitext(result["out"])[0]
+                    + ("_feet" if (zoom or PLOT_ZOOM) == "feet" else "")
+                    + "_check.png")
+    fig.savefig(path, dpi=130)
+    if verbose:
+        print(f"  wrote {path}")
+    return fig, path
+
+
+def show_3d(result, frame=0, zoom=None):
+    """Interactive viewer with a frame slider. Needs a GUI backend.
+
+    In Spyder: Preferences > IPython console > Graphics > Backend: Automatic.
+    With the inline backend there is no slider, so use save_3d_figure instead.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Slider
+
+    vectors, z, poses, meta = (result["vectors"], result["binding_npz"],
+                               result["poses"], result["meta"])
+    ctr, r = _frame_extent(vectors, z, poses, zoom)
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_axes((0.02, 0.12, 0.96, 0.84), projection="3d")
+    sax = fig.add_axes((0.12, 0.04, 0.76, 0.03))
+    slider = Slider(sax, "frame", 0, len(poses) - 1, valinit=frame, valstep=1)
+
+    def redraw(val):
+        draw_3d_frame(ax, vectors, z, poses, int(slider.val), meta, ctr, r,
+                      title=f"{result['trial']}   frame {int(slider.val)} "
+                            f"of {len(poses) - 1}")
+        fig.canvas.draw_idle()
+
+    slider.on_changed(redraw)
+    redraw(frame)
+    _legend(fig)
+    fig._binding_slider = slider          # keep a reference alive
+    plt.show()
+    return fig, slider
 
 
 # %%==========================================================================
@@ -294,7 +539,9 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
             print(f"  wrote {n_obj} .obj files to {OBJ_DIR}/")
         print("-" * 74)
     return dict(poses=poses, vertices=verts, normals=norms, stats=stats,
-                frames=items, out=out_npz)
+                frames=items, out=out_npz, vectors=vectors, matrices=matrices,
+                binding_npz=z, meta=meta,
+                trial=os.path.basename(trial_csv))
 
 
 def vertices_at_frame(z, poses, frame):
@@ -337,9 +584,25 @@ def write_obj_sequence(meta, verts, norms, stem):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     files = [a for a in argv if not a.startswith("--")]
-    return apply_binding(files[0] if files else None,
-                         save_vertices="--vertices" in argv,
-                         write_obj="--obj" in argv)
+    res = apply_binding(files[0] if files else None,
+                        save_vertices="--vertices" in argv,
+                        write_obj="--obj" in argv)
+
+    frames = None
+    for a in argv:
+        if a.startswith("--plot-frames"):
+            spec = a.split("=", 1)[1] if "=" in a else ""
+            if not spec:
+                i = argv.index(a)
+                spec = argv[i + 1] if i + 1 < len(argv) else ""
+            frames = [int(x) for x in spec.replace(",", " ").split() if
+                      x.lstrip("-").isdigit()]
+    zoom = "feet" if "--feet" in argv else None
+    if frames is not None:
+        save_3d_figure(res, frames, zoom=zoom)
+    elif "--plot" in argv:
+        show_3d(res, zoom=zoom)
+    return res
 
 
 if __name__ == "__main__":
