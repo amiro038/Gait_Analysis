@@ -1,15 +1,43 @@
-# MOVE4D → Theia3D rigid alignment
+# MOVE4D scan meshes on the Theia3D skeleton
 
-Finds the 4×4 transform `T` such that `p_theia = T @ [p_move4d; 1]`, by aligning
-the **global orientations of the thigh, shank, upper-arm and forearm segments**
-(the hip, knee, shoulder and elbow segments) from a static standing trial
-recorded simultaneously by both systems.
+Two scripts. The first turns segmented MOVE4D foot meshes into a binding
+against the Theia foot segments; the second replays that binding over any
+trial to get vertex positions.
 
-Everything is in **`m4d_to_theia_transform.py`** — one self-contained script.
-Open it in Spyder, set the two paths in CONFIG, press F5. Only `numpy` is
-required (`matplotlib` for the check figure).
+```bash
+python build_foot_binding.py                       # -> foot_mesh_binding.npz
+python apply_binding.py TRIAL_metrics.csv --plot   # -> TRIAL_posed.npz + 3D check
+```
 
-## The six steps
+| file | what it does |
+|---|---|
+| **`build_foot_binding.py`** | steps 1–3: solve the MOVE4D→Theia transform, put the meshes in Theia coordinates, bind them to the foot segments |
+| **`apply_binding.py`** | replays a binding over any trial; shares no imports with the builder, so the two can live apart |
+| `export_posed_fbx.py` | optional: animated FBX for Maya/Blender. Needs `pip install bpy` |
+| `archive/` | the earlier multi-module versions, superseded and folded into the two above |
+
+Only `numpy` is required. `matplotlib` for the check figures. No FBX SDK.
+
+## `build_foot_binding.py` — the three steps
+
+1. **Solve the MOVE4D → Theia3D transform** from a static A-pose recorded by
+   both systems, by aligning the global orientations of the thigh, shank,
+   upper-arm and forearm segments.
+2. **Put the segmented `.obj` meshes into Theia coordinates.**
+3. **Bind them to the Theia foot segments** using a Visual3D metrics export of
+   that same static pose.
+
+**Step 1 is a per-session calibration.** The two lab frames do not move between
+trials, so it is solved once, cached in `T_m4d_to_theia.npy` and reused. Pass
+`--resolve` to redo it, or drop a known matrix in `T_MATRIX` to skip it
+entirely.
+
+Everything editable — paths, flags and every landmark table — is in the one
+CONFIG cell at the top.
+
+## Step 1, in detail
+
+Internally it runs six stages:
 
 1. **load** both FBX files
 2. **read** the kinematic data for every segment
@@ -19,14 +47,9 @@ required (`matplotlib` for the check figure).
 6. **translation** — joint positions as close as possible
 
 ```python
-# after F5, the namespace holds T, RESULT, THEIA, M4D
+# the helpers are there if you want T on its own
 pts_theia = apply_transform(T, pts_m4d)          # (..., 3)
 R_theia   = transform_orientation(T, R_m4d)      # (..., 3, 3)
-```
-
-```bash
-python m4d_to_theia_transform.py THEIA.fbx M4D.fbx          # vertical-axis only
-python m4d_to_theia_transform.py THEIA.fbx M4D.fbx --full   # all 3 DOF
 ```
 
 `T` maps **raw MOVE4D file coordinates** (Y-up) directly into **raw Theia file
@@ -249,14 +272,8 @@ Ordered by value, and none of it is an algorithm change:
 
 ## Applying the transform to meshes
 
-`transform_obj_to_theia.py` takes Wavefront `.obj` files in raw MOVE4D
-coordinates — parts segmented out of the scan, for instance — and writes them
+Step 2 takes Wavefront `.obj` files in raw MOVE4D coordinates — parts segmented out of the scan, for instance — and writes them
 in Theia coordinates.
-
-```bash
-python transform_obj_to_theia.py                    # the files listed in CONFIG
-python transform_obj_to_theia.py left_feet.obj      # or named on the command line
-```
 
 Vertices get `T`; vertex normals get the inverse-transpose of its linear block,
 renormalised. Faces, groups, comments and material references pass through byte
@@ -287,7 +304,7 @@ Two scripts, run in order. The first builds the mesh-to-bone relationship
 once; the second replays it over any trial.
 
 ```bash
-python bind_mesh_to_bones.py                       # -> foot_mesh_binding.npz
+python build_foot_binding.py                       # -> foot_mesh_binding.npz
 python apply_binding.py TRIAL_metrics.csv          # -> TRIAL_posed.npz
 python apply_binding.py TRIAL_metrics.csv --vertices --obj
 ```
@@ -432,8 +449,8 @@ toes segment — the landmark lists are one line of config.
 
 ## Adapting it
 
-`SEGMENTS`, `JOINTS`, `ML_AXES` and `SEGMENT_ENDS` / `M4D_ENDS` are explicit
-tables in CONFIG. If your MOVE4D rig version names joints differently, edit those
+`ALIGN_SEGMENTS`, `ALIGN_JOINTS`, `ALIGN_ML_AXES` and `ALIGN_SEGMENT_ENDS` /
+`ALIGN_M4D_ENDS` are explicit tables in `build_foot_binding.py`'s CONFIG. If your MOVE4D rig version names joints differently, edit those
 and nothing else. `USE_ML_AXES`, `ASSUME_SHARED_FLOOR`, `CHECK_FLOOR_FROM_MESH`
 and `VERTICAL_ONLY` are the switches.
 
@@ -441,6 +458,8 @@ and `VERTICAL_ONLY` are the switches.
 things: the first constrains the *rotation* to be about the vertical, the second
 locks the *translation's* vertical component to zero.
 
-`fbx_raw.py`, `fbx_scene.py`, `align_m4d_to_theia.py` and `plot_alignment.py`
-are the original multi-module version, kept for reference. Nothing depends on
-them.
+`archive/` holds the earlier multi-module versions — `m4d_to_theia_transform.py`,
+`transform_obj_to_theia.py`, `bind_mesh_to_bones.py` and the original four-file
+pipeline before them. They are superseded, nothing depends on them, and
+`build_foot_binding.py` reproduces their output bit for bit. Kept only so the
+history is inspectable without digging through git.

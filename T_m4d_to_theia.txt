@@ -1,4 +1,4 @@
-# 4x4 homogeneous: p_theia = T @ [p_m4d; 1]  (raw FBX file coordinates, both sides)
+# 4x4: p_theia = T @ [p_m4d; 1]  (raw FBX coords both sides)
 0.999168503 0.000000000 -0.040771355 -0.386515710
 -0.040771355 0.000000000 -0.999168503 0.227162467
 0.000000000 1.000000000 0.000000000 0.029751811
