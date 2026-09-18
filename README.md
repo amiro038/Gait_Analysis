@@ -294,19 +294,34 @@ python apply_binding.py TRIAL_metrics.csv --vertices --obj
 
 ### What drives it
 
-Three Visual3D signals per foot — `*_Ankle_Position`, `*_Foot_Position`,
-`*_Toes_Position` — form a rigid triangle that tracks the foot segment. They
-are all derived from the same segment pose, so on D05_C01:
+**`<Side>_Foot_Global_4x4`**, when the export carries it. That is the segment
+pose itself: a row-major 4×4 whose translation is the ankle joint centre and
+whose rotation block is the foot segment's global orientation. It is used
+directly — nothing fitted, nothing reconstructed. Verified on D05_C01:
 
-- their pairwise distances hold to **±0.01 mm** across every frame;
-- the rotation recovered from them matches the segment orientation in Theia's
-  own FBX to **0.01° mean, 0.03° max**.
+- its translation equals `<Side>_Ankle_Position` to **0.000 mm**;
+- its rotation block matches the segment orientation in Theia's own FBX to
+  **0.01° mean, 0.03° max**;
+- every other foot landmark sits at a **fixed** position in its frame to
+  **±0.01 mm** across all 484 frames of a movement trial.
 
-Crucially `Foot_Position` is **not** on the ankle→toes line — it sits **25.15 mm
-off it, constant to 0.02 mm**. That off-axis lever arm is what fixes
-inversion/eversion. Three collinear points would fix only 5 of the 6 degrees of
-freedom. The binding script measures this and refuses to proceed silently if
-your landmarks turn out collinear.
+Without it, the script falls back to fitting a pose from three landmarks
+(ankle, foot COM, heel) by Kabsch. That works — three non-collinear points
+determine a rigid pose — but it is an estimate, and 1 mm of landmark error
+becomes about 2.3° of inversion/eversion. `Foot_Position` sits 25.15 mm off the
+ankle→toes line, and that off-axis lever arm is what makes the fallback
+possible at all; the script refuses to proceed silently if the landmarks you
+give it turn out collinear.
+
+**Do not put the toes in the fallback set.** `<Side>_Toes_Position` is the toes
+segment's origin and is *not* rigid to the foot: between the A-pose and the SKS
+trial it moves 29 mm in the foot's own frame on the left side. It would drag
+the fitted foot pose with it. Use the heel instead — it holds to 0.1 mm across
+both trials.
+
+When both a 4×4 and landmarks are present, `apply_binding.py` fits the
+landmarks anyway and reports the disagreement. On the SKS trial the two
+independent routes agree to **0.006° and 0.003 mm**.
 
 ### The relationship that gets stored
 
@@ -326,13 +341,36 @@ and is the whole result — vertices are one matrix multiply away. `--vertices`
 stores the (frames, vertices, 3) array and `--obj` writes one .obj per frame;
 both get large fast.
 
+### Watching it move
+
+`export_posed_fbx.py` writes an animated FBX: each foot mesh as a rigid object
+driven by its segment pose, plus small cubes at the lower-limb joint centres
+for context. It needs `pip install bpy` (~1 GB); the binding and replay scripts
+do not.
+
+```bash
+python export_posed_fbx.py TRIAL_metrics.csv     # -> TRIAL_posed.fbx
+```
+
+**Key from frame 0, not frame 1.** Blender's FBX exporter writes keyframe times
+relative to time zero and its importer maps FBX time 0 back onto frame 1, so
+keying from frame 1 lands every key one frame late. On this trial that was a
+silent **12.8 mm** error that looked entirely plausible on screen. Keying from
+frame 0 round-trips to **0.00005 mm**.
+
+A mesh spanning more than one segment (`both_feet.obj`) is skipped — it cannot
+be one rigid object, and `left_feet` + `right_feet` already cover it.
+
 ### Verified
 
 - Round trip is **exactly 0.00 mm** when replayed at the reference frame.
-- Replaying at neighbouring static frames gives 2–7 mm, which is genuine
-  frame-to-frame segment motion, and 20/40 mm at frames 0 and 6 — the same two
-  filter edge transients the FBX analysis flagged independently. The binding
-  script drops those from the reference pose automatically.
+- The exported FBX, re-imported and evaluated vertex by vertex against the
+  computed positions, agrees to **0.00018 mm** over 42 checks spanning the
+  whole trial.
+- Replaying at neighbouring static frames gives 2–7 mm of genuine
+  frame-to-frame segment motion, and 20/40 mm at the two filter edge
+  transients the FBX analysis flagged independently. The binding script drops
+  those from the reference pose automatically.
 
 ### What it cannot do
 
