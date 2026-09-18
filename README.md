@@ -6,7 +6,7 @@ trial to get vertex positions.
 
 ```bash
 python build_foot_binding.py                       # -> foot_mesh_binding.npz
-python apply_binding.py TRIAL_metrics.csv --plot   # -> TRIAL_posed.npz + 3D check
+python apply_binding.py TRIAL_metrics.csv         # -> TRIAL_posed.npz + PNG + movie
 ```
 
 | file | what it does |
@@ -415,6 +415,40 @@ script says so instead of opening a slider that cannot move. `--plot-frames`
 writes a PNG and works headless. `--feet` crops to the bound meshes, which is
 where you can actually judge the fit — at that zoom the ankle, toe and heel
 centres should sit *inside* the mesh surface.
+
+#### The movie
+
+A still only says the binding was right *in that pose*. A mesh that swims
+against the foot, lags the skeleton, or flips at midstance looks fine frame by
+frame and obvious in motion, so the run also writes a video of the whole trial
+by default:
+
+```python
+SAVE_3D_VIDEO = True
+VIDEO_STRIDE  = 2        # render every Nth frame
+VIDEO_FPS     = 25
+VIDEO_FORMAT  = "auto"   # mp4 if ffmpeg is there, else gif
+VIDEO_ZOOM    = None     # None follows PLOT_ZOOM; "feet" crops to the mesh
+VIDEO_FOLLOW  = False    # re-centre on the mesh each frame (overground trials)
+VIDEO_SPIN_DEG = 0.0     # total camera rotation across the clip
+```
+
+```bash
+python apply_binding.py TRIAL_metrics.csv --video          # movie only
+python apply_binding.py TRIAL_metrics.csv --video --feet
+python apply_binding.py TRIAL_metrics.csv --no-video
+```
+
+**mp4 needs ffmpeg**, which most Windows Python installs do not have. `pip
+install imageio-ffmpeg` is the easiest fix — the script finds that binary on
+its own, no system install and no PATH editing. Without it the writer falls
+back to **gif** via Pillow, which always works but makes much larger files for
+the same clip. `VIDEO_FORMAT = "mp4"` turns the fallback off and raises
+instead, if you would rather know.
+
+A 484-frame trial at `VIDEO_STRIDE = 2` renders in about 25 s and gives a 10 s
+clip. Raise the stride for a quicker look; `VIDEO_FOLLOW = True` keeps the feet
+in shot on a trial where the subject travels, which a fixed box cannot do.
 
 **This is the check to trust.** It reads the same arrays the rest of the
 script works with, so nothing can be lost in a file format on the way out —

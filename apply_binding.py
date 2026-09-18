@@ -8,13 +8,17 @@ Reads the .npz written by build_foot_binding.py and a Visual3D metrics export
 of any trial, and reconstructs where every mesh vertex was, frame by frame.
 
 Press Run in Spyder (or F5) and it uses the CONFIG block below -- no
-arguments needed, and SHOW_3D_VIEWER / SAVE_3D_FIGURE there decide whether
-you get a figure. From a terminal you can override with flags instead:
+arguments needed. SHOW_3D_VIEWER / SAVE_3D_FIGURE / SAVE_3D_VIDEO there
+decide what you get to look at: a slider window, a PNG grid of frames, and a
+movie of the whole trial. From a terminal you can override with flags:
 
     python apply_binding.py TRIAL_metrics.csv
     python apply_binding.py TRIAL_metrics.csv --plot            # 3D viewer
     python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120,240
     python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120 --feet
+    python apply_binding.py TRIAL_metrics.csv --video          # movie only
+    python apply_binding.py TRIAL_metrics.csv --video --feet
+    python apply_binding.py TRIAL_metrics.csv --no-video
     python apply_binding.py TRIAL_metrics.csv --no-plot
     python apply_binding.py TRIAL_metrics.csv --vertices --obj
 
@@ -63,6 +67,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -99,6 +104,19 @@ SHOW_3D_VIEWER = True        # open the interactive frame-slider window
 SAVE_3D_FIGURE = True        # also write a PNG grid next to the output .npz
 PLOT_FRAMES = None           # frames for the PNG; None = 6 across the trial
 VIEWER_START_FRAME = 0
+
+# A movie of the whole trial -- the mesh moving with the skeleton, which is
+# the check a still cannot give you: a binding can look right in one frame
+# and swim, lag or flip halfway through a stride. Costs about a minute for a
+# 500-frame trial, so raise VIDEO_STRIDE if you just want a quick look.
+SAVE_3D_VIDEO = True
+VIDEO_STRIDE = 2             # render every Nth frame
+VIDEO_FPS = 25
+VIDEO_DPI = 110
+VIDEO_FORMAT = "auto"        # "auto" -> mp4 if ffmpeg is there, else gif
+VIDEO_ZOOM = None            # None follows PLOT_ZOOM; "feet" crops to the mesh
+VIDEO_FOLLOW = False         # re-centre on the mesh each frame (overground)
+VIDEO_SPIN_DEG = 0.0         # total camera rotation across the clip
 
 MESH_POINT_STRIDE = 6        # plot every Nth mesh vertex (10208 is a lot)
 AXIS_ARROW_M = 0.12          # length of the segment-axis arrows
@@ -383,6 +401,98 @@ def save_3d_figure(result, frames=None, path=None, zoom=None, verbose=True):
     if verbose:
         print(f"  wrote {path}")
     return fig, path
+
+
+def _video_writer(fmt, fps):
+    """Pick a writer. mp4 needs ffmpeg; gif only needs Pillow, so it always
+    works. Returns (writer, extension, how it was found)."""
+    from matplotlib import animation, rcParams
+
+    if fmt in ("auto", "mp4"):
+        exe = rcParams.get("animation.ffmpeg_path", "ffmpeg")
+        how = "ffmpeg on PATH"
+        if not (exe and (os.path.isfile(exe) or shutil.which(exe))):
+            exe = None
+            try:                       # pip install imageio-ffmpeg
+                import imageio_ffmpeg
+                exe = imageio_ffmpeg.get_ffmpeg_exe()
+                how = "imageio-ffmpeg"
+            except Exception:          # noqa: BLE001
+                pass
+        if exe:
+            rcParams["animation.ffmpeg_path"] = exe
+            return animation.FFMpegWriter(fps=fps, bitrate=2400), ".mp4", how
+        if fmt == "mp4":
+            raise RuntimeError(
+                "no ffmpeg found -- pip install imageio-ffmpeg, or set "
+                "VIDEO_FORMAT = 'gif'")
+
+    return animation.PillowWriter(fps=fps), ".gif", "Pillow"
+
+
+def save_3d_video(result, path=None, stride=None, fps=None, zoom=None,
+                  follow=None, spin_deg=None, verbose=True):
+    """The trial as a movie: mesh and skeleton together, frame by frame.
+
+    A still says the binding is right in that pose. Only the movie says it
+    stays right -- a mesh that swims against the foot, lags the skeleton, or
+    flips at midstance shows up here and nowhere else.
+
+    Writes .mp4 when ffmpeg is available and .gif otherwise; `pip install
+    imageio-ffmpeg` is the easiest way to get mp4 with no system install.
+    """
+    import matplotlib.pyplot as plt
+
+    stride = VIDEO_STRIDE if stride is None else stride
+    fps = VIDEO_FPS if fps is None else fps
+    follow = VIDEO_FOLLOW if follow is None else follow
+    spin_deg = VIDEO_SPIN_DEG if spin_deg is None else spin_deg
+    zoom = (VIDEO_ZOOM or PLOT_ZOOM) if zoom is None else zoom
+
+    vectors, z, poses, meta = (result["vectors"], result["binding_npz"],
+                               result["poses"], result["meta"])
+    frames = list(range(0, len(poses), max(1, stride)))
+    if not frames:
+        raise ValueError("no frames to render")
+    ctr, r = _frame_extent(vectors, z, poses, zoom)
+
+    writer, ext, how = _video_writer(VIDEO_FORMAT, fps)
+    path = path or (os.path.splitext(result["out"])[0]
+                    + ("_feet" if zoom == "feet" else "") + ext)
+
+    fig = plt.figure(figsize=(9, 7.2))
+    ax = fig.add_axes((0.02, 0.06, 0.96, 0.90), projection="3d")
+    _legend(fig)
+    azim0 = PLOT_AZIM
+
+    if verbose:
+        print(f"  rendering {len(frames)} frames -> {path}  [{how}]")
+    try:
+        with writer.saving(fig, path, VIDEO_DPI):
+            for n, f in enumerate(frames):
+                c = ctr
+                if follow:
+                    mp = _mesh_points(z, poses, f, stride=40)
+                    if mp is not None:
+                        mp = mp[np.isfinite(mp).all(axis=1)]
+                        if len(mp):
+                            c = (mp.min(0) + mp.max(0)) / 2
+                draw_3d_frame(ax, vectors, z, poses, f, meta, c, r,
+                              title=f"{result['trial']}   frame {f} "
+                                    f"of {len(poses) - 1}")
+                if spin_deg:
+                    ax.view_init(elev=PLOT_ELEV,
+                                 azim=azim0 + spin_deg * n / len(frames))
+                writer.grab_frame()
+                if verbose and len(frames) > 40 and n % (len(frames) // 8) == 0:
+                    print(f"    {100 * n // len(frames):3d}%", flush=True)
+    finally:
+        plt.close(fig)
+
+    if verbose:
+        print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
+              f"{len(frames) / fps:.1f} s)")
+    return path
 
 
 def show_3d(result, frame=0, zoom=None):
@@ -710,20 +820,29 @@ def main(argv=None):
     frames = cli_frames if cli_frames is not None else PLOT_FRAMES
     save_png = SAVE_3D_FIGURE or cli_frames is not None
     viewer = SHOW_3D_VIEWER or "--plot" in argv
+    video = SAVE_3D_VIDEO or "--video" in argv
     if "--no-plot" in argv:
-        save_png = viewer = False
+        save_png = viewer = video = False
     elif cli_frames is not None and "--plot" not in argv:
         viewer = False            # --plot-frames on its own means the PNG
+    if "--no-video" in argv:
+        video = False
+    if "--video" in argv:         # asking for the movie means only the movie
+        save_png = viewer = False
     zoom = "feet" if "--feet" in argv else None
 
-    if save_png or viewer:
+    for want, fn, what in ((save_png, lambda: save_3d_figure(res, frames,
+                                                            zoom=zoom), "PNG"),
+                           (video, lambda: save_3d_video(res, zoom=zoom),
+                            "video"),
+                           (viewer, lambda: show_3d(res, VIEWER_START_FRAME,
+                                                    zoom), "viewer")):
+        if not want:
+            continue
         try:
-            if save_png:
-                save_3d_figure(res, frames, zoom=zoom)
-            if viewer:
-                show_3d(res, frame=VIEWER_START_FRAME, zoom=zoom)
+            fn()
         except Exception as exc:                        # noqa: BLE001
-            print(f"  [3D figure skipped: {type(exc).__name__}: {exc}]")
+            print(f"  [3D {what} skipped: {type(exc).__name__}: {exc}]")
     return res
 
 
