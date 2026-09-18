@@ -18,8 +18,27 @@ this is a visualisation step only. Everything it exports comes from the same
 A mesh that spans more than one segment (both_feet.obj) is skipped: it cannot
 be one rigid object, and left_feet + right_feet already cover it.
 
-The scene is metres and Z-up, matching Theia, and the FBX is written Z-up so
-it drops straight into the same viewer as Theia's own export.
+MATCHING THEIA'S AXIS SYSTEM
+---------------------------
+An FBX header declares not just the up axis but the FRONT and RIGHT axes, and
+a reader that honours them (Maya does) rotates a file's contents to reconcile
+its declared system with the scene. Theia writes Up=+Z, Front=+Y, Coord=-X.
+Blender's native system is Up=+Z, Front=-Y, Coord=+X -- the same up axis but
+the opposite horizontal orientation, which is a 180 degree rotation about the
+vertical.
+
+Export naively and you get a file whose numbers are right but whose header
+says they mean something rotated 180 degrees from what Theia's header says.
+Maya then reconciles each file separately and the meshes land 180 degrees
+apart from the skeleton. Blender's own importer applies the inverse of its own
+convention, so a Blender round trip looks perfect and hides this completely.
+
+The fix, verified against Theia's header byte for byte: rotate the scene 180
+degrees about Z on the way in and ask for axis_forward='-Y', so Blender's
+export-time conversion cancels the pre-rotation. The result declares Theia's
+axis system AND stores Theia's coordinates unchanged. FBX_SCALE_UNITS then
+writes UnitScaleFactor=100 (metres), matching Theia rather than Blender's
+default centimetres.
 """
 
 from __future__ import annotations
@@ -176,12 +195,15 @@ def export(trial_csv=None, binding_file=None, out_fbx=None, verbose=True):
     n_out = len(list(frames))
     scene.frame_start, scene.frame_end = 0, max(0, n_out - 1)
 
+    # 180 degrees about Z, cancelled by Blender's export conversion below.
+    PRE = np.diag([-1.0, -1.0, 1.0, 1.0])
+
     def animate(obj, mats):
         obj.rotation_mode = "XYZ"
         for f, M in enumerate(mats):
             if not np.isfinite(M).all():
                 continue
-            obj.matrix_world = Matrix([list(row) for row in M])
+            obj.matrix_world = Matrix([list(row) for row in (PRE @ M)])
             obj.keyframe_insert("location", frame=f)
             obj.keyframe_insert("rotation_euler", frame=f)
             obj.keyframe_insert("scale", frame=f)
@@ -233,8 +255,11 @@ def export(trial_csv=None, binding_file=None, out_fbx=None, verbose=True):
 
     bpy.ops.export_scene.fbx(
         filepath=os.path.abspath(out_fbx),
-        use_selection=False, apply_unit_scale=True, global_scale=1.0,
-        axis_forward="Y", axis_up="Z",              # keep Theia's Z-up
+        use_selection=False, global_scale=1.0,
+        # Theia's axis system exactly: Up=+Z, Front=+Y, Coord=-X, metres.
+        # '-Y' plus the 180 degree pre-rotation above is what produces it.
+        axis_forward="-Y", axis_up="Z",
+        apply_unit_scale=True, apply_scale_options="FBX_SCALE_UNITS",
         bake_anim=True, bake_anim_use_all_bones=False,
         bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
         bake_anim_step=1.0, bake_anim_simplify_factor=0.0,
@@ -253,8 +278,10 @@ def export(trial_csv=None, binding_file=None, out_fbx=None, verbose=True):
         print(f"    {n_ctx} joint-centre cubes for context")
         print(f"\n  wrote {out_fbx}  "
               f"({os.path.getsize(out_fbx) / 1e6:.1f} MB)  "
-              f"{scene.frame_end + 1} frames @ {scene.render.fps} fps, "
-              f"Z-up, metres")
+              f"{scene.frame_end + 1} frames @ {scene.render.fps} fps")
+        print("  axis system Up=+Z Front=+Y Coord=-X, metres -- identical to "
+              "Theia's export,")
+        print("  so both files reconcile the same way on import.")
         print("  data frame i is at FBX frame i (the first key is at time 0).")
     return out_fbx
 

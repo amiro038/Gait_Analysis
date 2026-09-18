@@ -352,11 +352,31 @@ do not.
 python export_posed_fbx.py TRIAL_metrics.csv     # -> TRIAL_posed.fbx
 ```
 
+Two FBX traps, both of which produce plausible-looking wrong output:
+
+**Match Theia's axis system, not just its up axis.** An FBX header declares the
+front and right axes as well as up, and a reader that honours them (Maya does)
+rotates each file's contents to reconcile its declared system with the scene.
+Theia writes `Up=+Z, Front=+Y, Coord=−X`. Blender's native system is
+`Up=+Z, Front=−Y, Coord=+X` — same up axis, **opposite horizontal orientation,
+which is a 180° rotation about the vertical**. Export naively and the numbers
+are right but the header says they mean something spun around, so Maya lands
+the meshes 180° from the skeleton. The fix is to rotate the scene 180° about Z
+on the way in and ask for `axis_forward='-Y'`, so Blender's export-time
+conversion cancels the pre-rotation: the file then declares Theia's system
+*and* stores Theia's coordinates unchanged. `FBX_SCALE_UNITS` also makes it
+write metres (`UnitScaleFactor=100`) like Theia, rather than Blender's default
+centimetres.
+
 **Key from frame 0, not frame 1.** Blender's FBX exporter writes keyframe times
 relative to time zero and its importer maps FBX time 0 back onto frame 1, so
 keying from frame 1 lands every key one frame late. On this trial that was a
-silent **12.8 mm** error that looked entirely plausible on screen. Keying from
-frame 0 round-trips to **0.00005 mm**.
+silent **12.8 mm** error. Keying from frame 0 round-trips to **0.00005 mm**.
+
+A Blender round trip cannot catch the axis problem, because Blender's importer
+applies the inverse of its own convention and the error cancels. Verify by
+reading the raw FBX with a reader that does not convert, and by loading your
+file and Theia's into one scene and comparing.
 
 A mesh spanning more than one segment (`both_feet.obj`) is skipped — it cannot
 be one rigid object, and `left_feet` + `right_feet` already cover it.
@@ -364,9 +384,14 @@ be one rigid object, and `left_feet` + `right_feet` already cover it.
 ### Verified
 
 - Round trip is **exactly 0.00 mm** when replayed at the reference frame.
-- The exported FBX, re-imported and evaluated vertex by vertex against the
-  computed positions, agrees to **0.00018 mm** over 42 checks spanning the
-  whole trial.
+- The exported FBX, read back with our own non-converting FBX reader and
+  evaluated vertex by vertex against the computed positions, agrees to
+  **0.000 mm** across the trial (a 180°-rotated version would be ~300 mm off).
+- Its header matches Theia's exactly: `Up=+Z Front=+Y Coord=−X Unit=100`.
+- Loaded into the same scene as Theia's own FBX, the exported joint cubes sit
+  **0.6–2.6 mm** from the matching Theia bones — that residual being the known
+  2–3 mm difference between Visual3D's exported positions and Theia's FBX
+  joints. A 180° error would show as 578 mm.
 - Replaying at neighbouring static frames gives 2–7 mm of genuine
   frame-to-frame segment motion, and 20/40 mm at the two filter edge
   transients the FBX analysis flagged independently. The binding script drops
