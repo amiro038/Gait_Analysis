@@ -382,6 +382,32 @@ axis still lines up with the export row for row.
 Sizing, for a 484-frame trial: all 10208 vertices is 50 MB, one foot 12 MB, a
 single vertex 12 kB. The `poses`-only npz that produces all of them is 0.7 MB.
 
+#### Vertex positions as CSV
+
+`export_vertex_csv()` writes a selection out as text:
+
+```python
+ab.export_vertex_csv("TRIAL_posed.npz", vertices=[0, 1500, 9000])
+ab.export_vertex_csv(res, mesh="left", layout="long")
+```
+
+| layout | shape | use |
+|---|---|---|
+| `"wide"` | a row per frame, columns `frame, V00000_X, V00000_Y, …` | opens in Excel, lines up with the export row for row |
+| `"long"` | `frame, vertex, x, y, z` | what pandas and R want; no column ceiling |
+
+**Why the whole mesh is not written to CSV by default.** For one 484-frame
+trial: 14.8M numbers, ~138 MB of text, against 0.7 MB for the npz that
+reproduces it exactly. In wide layout it needs 30,624 columns — Excel stops at
+16,384, so the file cannot be opened in the tool most people would reach for.
+A selection that wide raises rather than writing it; `layout="long"` has no
+such limit, and `force=True` overrides.
+
+The npz stays the archive: it is two orders of magnitude smaller, exact rather
+than rounded to 6 decimals, and carries the binding provenance and per-segment
+stats alongside the numbers. CSV is the right format once you have picked the
+handful of vertices an analysis actually needs.
+
 ### Checking it worked
 
 `apply_binding.py --plot` draws the whole thing in 3D: every joint centre and

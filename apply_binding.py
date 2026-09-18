@@ -21,6 +21,7 @@ movie of the whole trial. From a terminal you can override with flags:
     python apply_binding.py TRIAL_metrics.csv --no-video
     python apply_binding.py TRIAL_metrics.csv --no-plot
     python apply_binding.py TRIAL_metrics.csv --vertices --obj
+    python apply_binding.py TRIAL_metrics.csv --csv
 
 HOW IT WORKS
 ------------
@@ -83,12 +84,20 @@ TRIAL_METRICS_CSV = "D05_C01_SKS_metrics.csv"
 
 SAVE_VERTICES = False
 WRITE_OBJ_SEQUENCE = False
+
+# Vertex positions as CSV. Only sensible for a selection -- the full mesh is
+# 30624 columns, which is past Excel's 16384 limit and ~138 MB per trial.
+SAVE_VERTEX_CSV = False
+CSV_VERTICES = None          # explicit global indices, e.g. [0, 1500, 9000]
+CSV_MESH = None              # or a whole mesh: "left", "right", "both"
+CSV_LAYOUT = "wide"          # "wide": a row per frame; "long": tidy rows
 OBJ_DIR = "posed_frames"
 OBJ_STRIDE = 1
 OUT_SUFFIX = "_posed"
 VERBOSE = True
 
 SHAPE_TOLERANCE_MM = 5.0
+EXCEL_MAX_COLS = 16384
 
 # --- 3D check figure --------------------------------------------------------
 # Draws the whole body from the export -- every joint and segment position,
@@ -827,6 +836,73 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
     return out, idx
 
 
+def export_vertex_csv(source=None, vertices=None, mesh=None, path=None,
+                      layout=None, binding=None, force=False, verbose=True):
+    """Write selected vertex positions to CSV, in Theia world metres.
+
+        ab.export_vertex_csv("TRIAL_posed.npz", vertices=[0, 1500, 9000])
+        ab.export_vertex_csv(res, mesh="left", layout="long")
+
+    Selection is the same as vertex_tracks(). Two layouts:
+
+      "wide"  one row per frame, columns frame, V00000_X, V00000_Y, ...
+              Opens in Excel and lines up with the export row for row.
+      "long"  one row per frame per vertex: frame, vertex, x, y, z.
+              What pandas and R want, and it has no column ceiling.
+
+    The whole mesh is 30624 wide columns against Excel's 16384 limit, so a
+    selection that large raises unless force=True. Use "long", or the .npz,
+    when you really do want all of them.
+    """
+    layout = CSV_LAYOUT if layout is None else layout
+    if layout not in ("wide", "long"):
+        raise ValueError(f"layout must be 'wide' or 'long', not {layout!r}")
+
+    V, idx = vertex_tracks(source, vertices=vertices, mesh=mesh,
+                           binding=binding)
+    n_f, n_v = V.shape[0], V.shape[1]
+
+    if layout == "wide" and n_v * 3 > EXCEL_MAX_COLS and not force:
+        raise ValueError(
+            f"{n_v} vertices is {n_v * 3} columns, past Excel's "
+            f"{EXCEL_MAX_COLS}. Select fewer, use layout='long', or pass "
+            f"force=True.")
+
+    if path is None:
+        if isinstance(source, dict):
+            stem = os.path.splitext(source["out"])[0]
+        else:
+            stem = os.path.splitext(source or (
+                os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
+                + OUT_SUFFIX + ".npz"))[0]
+        tag = mesh if mesh else (f"{n_v}v" if vertices is not None else "all")
+        path = f"{stem}_vertices_{tag}.csv"
+
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        if layout == "wide":
+            head = ["frame"] + [f"V{v:05d}_{a}" for v in idx for a in "XYZ"]
+            fh.write(",".join(head) + "\n")
+            flat = V.reshape(n_f, -1)
+            for i in range(n_f):
+                fh.write(str(i) + "," + ",".join(
+                    "" if not np.isfinite(x) else f"{x:.6f}"
+                    for x in flat[i]) + "\n")
+        else:
+            fh.write("frame,vertex,x,y,z\n")
+            for i in range(n_f):
+                for j in range(n_v):
+                    x, y, zc = V[i, j]
+                    if not np.isfinite(x):
+                        fh.write(f"{i},{idx[j]},,,\n")
+                    else:
+                        fh.write(f"{i},{idx[j]},{x:.6f},{y:.6f},{zc:.6f}\n")
+
+    if verbose:
+        print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
+              f"{n_f} frames x {n_v} vertices, {layout})")
+    return path
+
+
 def write_obj_sequence(meta, verts, norms, stem):
     """One .obj per frame, reusing each mesh's original faces and comments."""
     os.makedirs(OBJ_DIR, exist_ok=True)
@@ -878,6 +954,12 @@ def main(argv=None):
     res = apply_binding(files[0] if files else None,
                         save_vertices="--vertices" in argv,
                         write_obj="--obj" in argv)
+
+    if SAVE_VERTEX_CSV or "--csv" in argv:
+        try:
+            export_vertex_csv(res, vertices=CSV_VERTICES, mesh=CSV_MESH)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  [vertex CSV skipped: {type(exc).__name__}: {exc}]")
 
     # CONFIG decides by default; flags override it. Running the file from
     # Spyder hands us an empty argv, which is exactly the case where the
