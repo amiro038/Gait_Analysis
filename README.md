@@ -365,17 +365,32 @@ segment origin from the export, the skeleton linking them, the posed mesh on
 top, and each driven segment's own axes as arrows. If the mesh sits on the
 skeleton's feet and its axes follow the ankle, the binding is right.
 
+Pressing **Run** in Spyder passes no command-line arguments, so the flags
+below never fire that way. The CONFIG block is what decides in that case, and
+out of the box both switches are on — run the file and you get a figure:
+
+```python
+SHOW_3D_VIEWER = True        # open the interactive frame-slider window
+SAVE_3D_FIGURE = True        # also write a PNG grid next to the output .npz
+PLOT_FRAMES = None           # frames for the PNG; None = 6 across the trial
+PLOT_ZOOM = "body"           # or "feet"
+```
+
+From a terminal the flags override CONFIG:
+
 ```bash
 python apply_binding.py TRIAL_metrics.csv --plot                  # slider viewer
 python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120,240 # static PNG
 python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120 --feet
+python apply_binding.py TRIAL_metrics.csv --no-plot               # neither
 ```
 
 `--plot` needs an interactive backend (in Spyder: *Preferences → IPython
-console → Graphics → Backend: Automatic*). `--plot-frames` writes a PNG and
-works headless. `--feet` crops to the bound meshes, which is where you can
-actually judge the fit — at that zoom the ankle, toe and heel centres should
-sit *inside* the mesh surface.
+console → Graphics → Backend: Automatic*); on the inline or Agg backend the
+script says so instead of opening a slider that cannot move. `--plot-frames`
+writes a PNG and works headless. `--feet` crops to the bound meshes, which is
+where you can actually judge the fit — at that zoom the ankle, toe and heel
+centres should sit *inside* the mesh surface.
 
 **This is the check to trust.** It reads the same arrays the rest of the
 script works with, so nothing can be lost in a file format on the way out —

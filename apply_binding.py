@@ -4,13 +4,18 @@
  STEP 2 of 2 -- replay a binding over a trial to get mesh vertex positions
 =============================================================================
 
-Reads the .npz written by bind_mesh_to_bones.py and a Visual3D metrics export
+Reads the .npz written by build_foot_binding.py and a Visual3D metrics export
 of any trial, and reconstructs where every mesh vertex was, frame by frame.
+
+Press Run in Spyder (or F5) and it uses the CONFIG block below -- no
+arguments needed, and SHOW_3D_VIEWER / SAVE_3D_FIGURE there decide whether
+you get a figure. From a terminal you can override with flags instead:
 
     python apply_binding.py TRIAL_metrics.csv
     python apply_binding.py TRIAL_metrics.csv --plot            # 3D viewer
     python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120,240
     python apply_binding.py TRIAL_metrics.csv --plot-frames 0,120 --feet
+    python apply_binding.py TRIAL_metrics.csv --no-plot
     python apply_binding.py TRIAL_metrics.csv --vertices --obj
 
 HOW IT WORKS
@@ -38,7 +43,7 @@ Frames where the pose is missing come back as NaN rather than stopping the
 run, and interior gaps keep their frame numbering.
 
 This script is deliberately standalone -- it shares no imports with
-bind_mesh_to_bones.py, so you can hand it and the .npz to someone else. The
+build_foot_binding.py, so you can hand it and the .npz to someone else. The
 metrics reader below is a copy of the one there; fix bugs in both.
 """
 
@@ -74,6 +79,15 @@ SHAPE_TOLERANCE_MM = 5.0
 # its axes follow the ankle, the binding is right. This is the check to
 # trust: it reads the same arrays the rest of the script works with, so
 # nothing can be lost in a file format on the way out.
+#
+# Spyder's Run button (and %runfile) passes no command-line arguments, so the
+# --plot flags never fire that way. These switches are what decide whether a
+# figure appears when you just run the file.
+SHOW_3D_VIEWER = True        # open the interactive frame-slider window
+SAVE_3D_FIGURE = True        # also write a PNG grid next to the output .npz
+PLOT_FRAMES = None           # frames for the PNG; None = 6 across the trial
+VIEWER_START_FRAME = 0
+
 MESH_POINT_STRIDE = 6        # plot every Nth mesh vertex (10208 is a lot)
 AXIS_ARROW_M = 0.12          # length of the segment-axis arrows
 PLOT_ELEV, PLOT_AZIM = 18, -62
@@ -134,7 +148,7 @@ SKELETON_LINKS = [
 
 
 # %%==========================================================================
-#  VISUAL3D METRICS READER  (copy of the one in bind_mesh_to_bones.py)
+#  VISUAL3D METRICS READER  (copy of the one in build_foot_binding.py)
 # ============================================================================
 
 def read_metrics(path):
@@ -365,8 +379,15 @@ def show_3d(result, frame=0, zoom=None):
     In Spyder: Preferences > IPython console > Graphics > Backend: Automatic.
     With the inline backend there is no slider, so use save_3d_figure instead.
     """
+    import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.widgets import Slider
+
+    backend = matplotlib.get_backend()
+    if "inline" in backend.lower() or backend.lower() == "agg":
+        print(f"  [backend is {backend}: the frame slider will not respond."
+              f" Spyder: Preferences > IPython console > Graphics >"
+              f" Backend: Automatic, then restart the kernel]")
 
     vectors, z, poses, meta = (result["vectors"], result["binding_npz"],
                                result["poses"], result["meta"])
@@ -398,7 +419,7 @@ def show_3d(result, frame=0, zoom=None):
 def load_binding(path=None):
     path = BINDING_FILE if path is None else path
     if not os.path.exists(path):
-        raise FileNotFoundError(f"{path} not found -- run bind_mesh_to_bones.py")
+        raise FileNotFoundError(f"{path} not found -- run build_foot_binding.py")
     z = np.load(path, allow_pickle=False)
     return json.loads(str(z["meta"])), z
 
@@ -581,27 +602,53 @@ def write_obj_sequence(meta, verts, norms, stem):
     return n
 
 
+def _plot_frames_arg(argv):
+    """--plot-frames 0,120,240  or  --plot-frames=0,120,240
+
+    Returns (frames, consumed) where `consumed` is the index of the value
+    argument, if the value was passed separately. That index has to come out
+    of the positional list, or `0,120,240` gets taken for the trial file.
+    """
+    for i, a in enumerate(argv):
+        if not a.startswith("--plot-frames"):
+            continue
+        spec, consumed = (a.split("=", 1)[1] if "=" in a else ""), None
+        if not spec and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            spec, consumed = argv[i + 1], i + 1
+        return [int(x) for x in spec.replace(",", " ").split()
+                if x.lstrip("-").isdigit()], consumed
+    return None, None
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    files = [a for a in argv if not a.startswith("--")]
+    cli_frames, consumed = _plot_frames_arg(argv)
+    files = [a for i, a in enumerate(argv)
+             if not a.startswith("--") and i != consumed]
     res = apply_binding(files[0] if files else None,
                         save_vertices="--vertices" in argv,
                         write_obj="--obj" in argv)
 
-    frames = None
-    for a in argv:
-        if a.startswith("--plot-frames"):
-            spec = a.split("=", 1)[1] if "=" in a else ""
-            if not spec:
-                i = argv.index(a)
-                spec = argv[i + 1] if i + 1 < len(argv) else ""
-            frames = [int(x) for x in spec.replace(",", " ").split() if
-                      x.lstrip("-").isdigit()]
+    # CONFIG decides by default; flags override it. Running the file from
+    # Spyder hands us an empty argv, which is exactly the case where the
+    # CONFIG switches have to be the ones in charge.
+    frames = cli_frames if cli_frames is not None else PLOT_FRAMES
+    save_png = SAVE_3D_FIGURE or cli_frames is not None
+    viewer = SHOW_3D_VIEWER or "--plot" in argv
+    if "--no-plot" in argv:
+        save_png = viewer = False
+    elif cli_frames is not None and "--plot" not in argv:
+        viewer = False            # --plot-frames on its own means the PNG
     zoom = "feet" if "--feet" in argv else None
-    if frames is not None:
-        save_3d_figure(res, frames, zoom=zoom)
-    elif "--plot" in argv:
-        show_3d(res, zoom=zoom)
+
+    if save_png or viewer:
+        try:
+            if save_png:
+                save_3d_figure(res, frames, zoom=zoom)
+            if viewer:
+                show_3d(res, frame=VIEWER_START_FRAME, zoom=zoom)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  [3D figure skipped: {type(exc).__name__}: {exc}]")
     return res
 
 
