@@ -69,6 +69,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 import numpy as np
 
@@ -113,6 +114,9 @@ SAVE_3D_VIDEO = True
 VIDEO_STRIDE = 2             # render every Nth frame
 VIDEO_FPS = 25
 VIDEO_DPI = 110
+FIG_W_IN, FIG_H_IN = 9.0, 7.2
+VIDEO_PROGRESS_SEC = 5       # seconds between progress lines
+GIF_MEMORY_CAP_MB = 700      # gif only: thin the clip to stay under this
 VIDEO_FORMAT = "auto"        # "auto" -> mp4 if ffmpeg is there, else gif
 VIDEO_ZOOM = None            # None follows PLOT_ZOOM; "feet" crops to the mesh
 VIDEO_FOLLOW = False         # re-centre on the mesh each frame (overground)
@@ -403,6 +407,18 @@ def save_3d_figure(result, frames=None, path=None, zoom=None, verbose=True):
     return fig, path
 
 
+def _ffmpeg_works(exe, timeout=10):
+    """True if the binary answers `-version`. Guards against a broken or
+    hung ffmpeg, which otherwise stalls the first grab_frame() silently."""
+    import subprocess
+    try:
+        r = subprocess.run([exe, "-version"], capture_output=True,
+                           timeout=timeout)
+        return r.returncode == 0
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 def _video_writer(fmt, fps):
     """Pick a writer. mp4 needs ffmpeg; gif only needs Pillow, so it always
     works. Returns (writer, extension, how it was found)."""
@@ -419,6 +435,12 @@ def _video_writer(fmt, fps):
                 how = "imageio-ffmpeg"
             except Exception:          # noqa: BLE001
                 pass
+        if exe and not _ffmpeg_works(exe):
+            # A binary that is present but broken blocks on the first frame
+            # rather than raising, which looks exactly like a slow render.
+            # Better to find out now, in one second, than at 0% forever.
+            print(f"  [{exe} did not answer --version; ignoring it]")
+            exe = None
         if exe:
             rcParams["animation.ffmpeg_path"] = exe
             return animation.FFMpegWriter(fps=fps, bitrate=2400), ".mp4", how
@@ -440,8 +462,14 @@ def save_3d_video(result, path=None, stride=None, fps=None, zoom=None,
 
     Writes .mp4 when ffmpeg is available and .gif otherwise; `pip install
     imageio-ffmpeg` is the easiest way to get mp4 with no system install.
+
+    Rendering goes through a bare Agg figure, never pyplot. A pyplot figure
+    under a GUI backend puts a real window behind every frame and each draw
+    then pays the GUI's costs; this way the interactive backend you need for
+    show_3d does not slow the movie down.
     """
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
     stride = VIDEO_STRIDE if stride is None else stride
     fps = VIDEO_FPS if fps is None else fps
@@ -451,8 +479,8 @@ def save_3d_video(result, path=None, stride=None, fps=None, zoom=None,
 
     vectors, z, poses, meta = (result["vectors"], result["binding_npz"],
                                result["poses"], result["meta"])
-    frames = list(range(0, len(poses), max(1, stride)))
-    if not frames:
+    stride = max(1, int(stride))
+    if not len(poses):
         raise ValueError("no frames to render")
     ctr, r = _frame_extent(vectors, z, poses, zoom)
 
@@ -460,38 +488,75 @@ def save_3d_video(result, path=None, stride=None, fps=None, zoom=None,
     path = path or (os.path.splitext(result["out"])[0]
                     + ("_feet" if zoom == "feet" else "") + ext)
 
-    fig = plt.figure(figsize=(9, 7.2))
+    # Pillow's gif writer keeps every rendered frame in memory and only
+    # encodes at the end, so a long trial can ask for gigabytes and spend the
+    # whole time swapping. Thin the clip until it fits instead of wedging.
+    asked = stride
+    if ext == ".gif":
+        mb = FIG_W_IN * VIDEO_DPI * FIG_H_IN * VIDEO_DPI * 4 / 1e6   # per frame
+        while (len(range(0, len(poses), stride)) * mb > GIF_MEMORY_CAP_MB
+               and stride < len(poses)):
+            stride += 1
+
+    frames = list(range(0, len(poses), stride))
+    if ext == ".gif" and verbose:
+        print(f"  gif writer: ffmpeg was not found, and Pillow holds every "
+              f"frame in memory")
+        print(f"       until the end -- ~{len(frames) * mb:.0f} MB for this "
+              f"clip at stride {stride}.")
+        if stride != asked:
+            print(f"       Raised the stride from {asked} to {stride} to stay "
+                  f"under {GIF_MEMORY_CAP_MB:.0f} MB.")
+        print(f"       `pip install imageio-ffmpeg` gets you mp4 instead: "
+              f"faster, smaller, no ceiling.")
+
+    fig = Figure(figsize=(FIG_W_IN, FIG_H_IN))
+    FigureCanvasAgg(fig)
     ax = fig.add_axes((0.02, 0.06, 0.96, 0.90), projection="3d")
     _legend(fig)
     azim0 = PLOT_AZIM
 
     if verbose:
-        print(f"  rendering {len(frames)} frames -> {path}  [{how}]")
-    try:
-        with writer.saving(fig, path, VIDEO_DPI):
-            for n, f in enumerate(frames):
-                c = ctr
-                if follow:
-                    mp = _mesh_points(z, poses, f, stride=40)
-                    if mp is not None:
-                        mp = mp[np.isfinite(mp).all(axis=1)]
-                        if len(mp):
-                            c = (mp.min(0) + mp.max(0)) / 2
-                draw_3d_frame(ax, vectors, z, poses, f, meta, c, r,
-                              title=f"{result['trial']}   frame {f} "
-                                    f"of {len(poses) - 1}")
-                if spin_deg:
-                    ax.view_init(elev=PLOT_ELEV,
-                                 azim=azim0 + spin_deg * n / len(frames))
-                writer.grab_frame()
-                if verbose and len(frames) > 40 and n % (len(frames) // 8) == 0:
-                    print(f"    {100 * n // len(frames):3d}%", flush=True)
-    finally:
-        plt.close(fig)
+        print(f"  rendering {len(frames)} frames -> {os.path.basename(path)}"
+              f"  [{how}]", flush=True)
+
+    t0 = time.perf_counter()
+    last = [t0]
+    with writer.saving(fig, path, VIDEO_DPI):
+        for n, f in enumerate(frames):
+            c = ctr
+            if follow:
+                mp = _mesh_points(z, poses, f, stride=40)
+                if mp is not None:
+                    mp = mp[np.isfinite(mp).all(axis=1)]
+                    if len(mp):
+                        c = (mp.min(0) + mp.max(0)) / 2
+            draw_3d_frame(ax, vectors, z, poses, f, meta, c, r,
+                          title=f"{result['trial']}   frame {f} "
+                                f"of {len(poses) - 1}")
+            if spin_deg:
+                ax.view_init(elev=PLOT_ELEV,
+                             azim=azim0 + spin_deg * n / len(frames))
+            writer.grab_frame()
+
+            # Progress on a clock, not on a frame count: the first frame tells
+            # you the rate, then a line every few seconds tells you it is still
+            # moving. A percentage that only updates 8 times looks identical to
+            # a hang when each step takes minutes.
+            now = time.perf_counter()
+            if verbose and (n == 0 or now - last[0] >= VIDEO_PROGRESS_SEC
+                            or n == len(frames) - 1):
+                per = (now - t0) / (n + 1)
+                eta = per * (len(frames) - n - 1)
+                print(f"    {n + 1:5d}/{len(frames)}  "
+                      f"{100 * (n + 1) // len(frames):3d}%  "
+                      f"{per:.2f} s/frame  eta {eta:4.0f} s", flush=True)
+                last[0] = now
 
     if verbose:
         print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
-              f"{len(frames) / fps:.1f} s)")
+              f"{len(frames) / fps:.1f} s clip, "
+              f"{time.perf_counter() - t0:.0f} s to render)")
     return path
 
 
