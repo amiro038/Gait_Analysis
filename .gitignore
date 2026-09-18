@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+posed_frames/
+*_posed.npz

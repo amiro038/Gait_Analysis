@@ -281,6 +281,68 @@ supplied feet, Theia's ankle joint centres fall **inside** the transformed scan
 surface, ~41 mm from the nearest skin vertex, and the toe joints ~26 mm inside —
 which is where joint centres belong.
 
+## Driving the meshes from a trial
+
+Two scripts, run in order. The first builds the mesh-to-bone relationship
+once; the second replays it over any trial.
+
+```bash
+python bind_mesh_to_bones.py                       # -> foot_mesh_binding.npz
+python apply_binding.py TRIAL_metrics.csv          # -> TRIAL_posed.npz
+python apply_binding.py TRIAL_metrics.csv --vertices --obj
+```
+
+### What drives it
+
+Three Visual3D signals per foot — `*_Ankle_Position`, `*_Foot_Position`,
+`*_Toes_Position` — form a rigid triangle that tracks the foot segment. They
+are all derived from the same segment pose, so on D05_C01:
+
+- their pairwise distances hold to **±0.01 mm** across every frame;
+- the rotation recovered from them matches the segment orientation in Theia's
+  own FBX to **0.01° mean, 0.03° max**.
+
+Crucially `Foot_Position` is **not** on the ankle→toes line — it sits **25.15 mm
+off it, constant to 0.02 mm**. That off-axis lever arm is what fixes
+inversion/eversion. Three collinear points would fix only 5 of the 6 degrees of
+freedom. The binding script measures this and refuses to proceed silently if
+your landmarks turn out collinear.
+
+### The relationship that gets stored
+
+`foot_mesh_binding.npz` holds every vertex, and each segment's landmarks, in
+that segment's local frame. Replaying is a Kabsch fit of the stored landmarks
+onto the trial's landmarks, once per frame — least squares over all of them, so
+extra landmarks improve the result rather than being ignored.
+
+Segment assignment is **per vertex**, not per file, by proximity to each
+segment's landmarks. That is what makes `both_feet.obj` work: its two halves
+bind to different segments and move independently. Verified at 10208/10208
+vertices correct, including the 4 vertices where `both_feet`'s internal
+ordering crosses sides.
+
+`apply_binding.py` always writes `poses` (frames, segments, 4, 4), which is tiny
+and is the whole result — vertices are one matrix multiply away. `--vertices`
+stores the (frames, vertices, 3) array and `--obj` writes one .obj per frame;
+both get large fast.
+
+### Verified
+
+- Round trip is **exactly 0.00 mm** when replayed at the reference frame.
+- Replaying at neighbouring static frames gives 2–7 mm, which is genuine
+  frame-to-frame segment motion, and 20/40 mm at frames 0 and 6 — the same two
+  filter edge transients the FBX analysis flagged independently. The binding
+  script drops those from the reference pose automatically.
+
+### What it cannot do
+
+Each region is rigid. The arch does not flatten and the toes do not flex,
+because Theia exports no toe orientation to drive them with. **27% of the left
+mesh and 22% of the right sit distal to the MTP joint** and are held rigid
+relative to the rest. Fine for skin position in the lab frame; not fine for toe
+kinematics. If you need that, export more landmarks from Visual3D and add a
+toes segment — the landmark lists are one line of config.
+
 ## Adapting it
 
 `SEGMENTS`, `JOINTS`, `ML_AXES` and `SEGMENT_ENDS` / `M4D_ENDS` are explicit
