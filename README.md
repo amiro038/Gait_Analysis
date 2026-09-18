@@ -358,6 +358,30 @@ and is the whole result — vertices are one matrix multiply away. `--vertices`
 stores the (frames, vertices, 3) array and `--obj` writes one .obj per frame;
 both get large fast.
 
+#### Getting vertex positions for analysis
+
+The vertices are **not** in the `_posed.npz` by default. Reconstruct the ones
+you need with `vertex_tracks()` rather than storing all of them:
+
+```python
+import apply_binding as ab
+
+V, idx = ab.vertex_tracks("TRIAL_posed.npz")                 # all 10208
+V, idx = ab.vertex_tracks("TRIAL_posed.npz", mesh="left")    # one foot
+V, idx = ab.vertex_tracks(res, vertices=[0, 1500, 9000])     # three vertices
+```
+
+`V` is `(frames, len(idx), 3)` in **Theia world metres** — the same frame and
+units as the joint positions in the export, so it drops straight into an
+analysis that already works on those. `idx` carries the global vertex index of
+each column, so a selection means the same thing across trials. Frames whose
+pose was missing come back as `NaN` rather than being dropped, so the frame
+axis still lines up with the export row for row.
+
+`source` is either a `_posed.npz` path or the dict `apply_binding()` returned.
+Sizing, for a 484-frame trial: all 10208 vertices is 50 MB, one foot 12 MB, a
+single vertex 12 kB. The `poses`-only npz that produces all of them is 0.7 MB.
+
 ### Checking it worked
 
 `apply_binding.py --plot` draws the whole thing in 3D: every joint centre and

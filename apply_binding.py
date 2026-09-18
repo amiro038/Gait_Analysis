@@ -37,7 +37,19 @@ WHAT COMES OUT
 `poses` (frames, segments, 4, 4) is always written and is tiny -- it is the
 whole result, since vertices are one matrix multiply away. `--vertices` also
 stores the (frames, vertices, 3) array and `--obj` writes one .obj per frame.
-Both get large fast: 10000 vertices over 500 frames is 60 MB as float32.
+Both get large fast: 10000 vertices over 500 frames is 50 MB as float32.
+
+To get vertex positions for analysis, do not turn `--vertices` on and load a
+50 MB array -- call `vertex_tracks()` on the small .npz and ask for the
+vertices you need:
+
+    import apply_binding as ab
+    V, idx = ab.vertex_tracks("TRIAL_posed.npz", mesh="left")
+
+`V` is (frames, len(idx), 3) in Theia world metres, `idx` the global vertex
+index of each column. Units are metres and the frame is Theia's, the same one
+the skeleton is in, so the array drops straight into any analysis that already
+works on the export's joint positions.
 
 Frames where the pose is missing come back as NaN rather than stopping the
 run, and interior gaps keep their frame numbering.
@@ -553,9 +565,10 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
         if save_vertices:
             print("    vertices       (frames, vertices, 3)     float32")
         else:
-            print("    vertices       not stored -- pass --vertices, or "
-                  "rebuild with")
-            print("                   vertices_at_frame() below (one matmul)")
+            print("    vertices       not stored -- rebuild the ones you "
+                  "need with")
+            print(f"                   ab.vertex_tracks({out_npz!r}"
+                  ", mesh='left')")
         if n_obj:
             print(f"  wrote {n_obj} .obj files to {OBJ_DIR}/")
         print("-" * 74)
@@ -575,6 +588,68 @@ def vertices_at_frame(z, poses, frame):
             m = seg_of == k
             out[m] = v_local[m] @ P[:3, :3].T + P[:3, 3]
     return out
+
+
+def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
+    """Vertex positions over a whole trial, in Theia world metres.
+
+    This is the entry point for analysis. The full array is (frames, 10208, 3)
+    -- 50 MB for a 500-frame trial -- so select what you actually need and it
+    stays small: one vertex over 484 frames is 12 kB.
+
+        import apply_binding as ab
+        V, idx = ab.vertex_tracks("D05_C01_SKS_metrics_posed.npz")
+        V, idx = ab.vertex_tracks(res, mesh="left")          # one foot
+        V, idx = ab.vertex_tracks(res, vertices=[0, 1500])   # two vertices
+
+    `source` is either the dict apply_binding() returned or the path to a
+    _posed.npz (default: TRIAL_METRICS_CSV's). `mesh` matches a name from the
+    binding -- "left", "right", "both", or the full .obj filename. `vertices`
+    is explicit global indices and wins over `mesh`.
+
+    Returns (V, idx): V is (frames, len(idx), 3) float64, NaN on frames whose
+    pose was missing; idx is the global vertex index of each column, so you
+    can carry a selection between trials and know what you are looking at.
+    """
+    if isinstance(source, dict):                       # apply_binding() result
+        poses, z = source["poses"], source["binding_npz"]
+    else:
+        if source is None:
+            source = (os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
+                      + OUT_SUFFIX + ".npz")
+        posed = np.load(source, allow_pickle=False)
+        poses = posed["poses"]
+        _, z = load_binding(binding)
+
+    v_local, seg_of = z["vertices_local"], z["vertex_segment"]
+    meta = json.loads(str(z["meta"]))
+
+    if vertices is not None:
+        idx = np.asarray(vertices, dtype=np.intp).ravel()
+    elif mesh is not None:
+        hits = [m for m in meta["meshes"]
+                if mesh == m["name"] or mesh.lower() in m["name"].lower()]
+        if len(hits) != 1:
+            raise ValueError(
+                f"mesh={mesh!r} matched {[m['name'] for m in hits]}; "
+                f"available: {[m['name'] for m in meta['meshes']]}")
+        idx = np.arange(hits[0]["start"], hits[0]["start"] + hits[0]["count"])
+    else:
+        idx = np.arange(len(v_local))
+
+    if idx.size and (idx.min() < 0 or idx.max() >= len(v_local)):
+        raise IndexError(f"vertex index out of range 0..{len(v_local) - 1}")
+
+    Vl, seg = v_local[idx], seg_of[idx]
+    out = np.full((len(poses), len(idx), 3), np.nan)
+    for k in range(poses.shape[1]):
+        m = seg == k
+        if not m.any():
+            continue
+        for i, P in enumerate(poses[:, k]):
+            if np.isfinite(P).all():
+                out[i, m] = Vl[m] @ P[:3, :3].T + P[:3, 3]
+    return out, idx
 
 
 def write_obj_sequence(meta, verts, norms, stem):
