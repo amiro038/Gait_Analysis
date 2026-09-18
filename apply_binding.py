@@ -22,6 +22,7 @@ movie of the whole trial. From a terminal you can override with flags:
     python apply_binding.py TRIAL_metrics.csv --no-plot
     python apply_binding.py TRIAL_metrics.csv --vertices --obj
     python apply_binding.py TRIAL_metrics.csv --csv
+    python apply_binding.py TRIAL_metrics.csv --pickle
 
 HOW IT WORKS
 ------------
@@ -91,6 +92,14 @@ SAVE_VERTEX_CSV = False
 CSV_VERTICES = None          # explicit global indices, e.g. [0, 1500, 9000]
 CSV_MESH = None              # or a whole mesh: "left", "right", "both"
 CSV_LAYOUT = "wide"          # "wide": a row per frame; "long": tidy rows
+
+# Every vertex position as a pandas DataFrame pickle, written NEXT TO THE
+# TRIAL CSV so an analysis script can find it from the trial path alone.
+# Columns are a MultiIndex (segment, vertex, axis), index is the frame, so
+# df["left_foot"] is that foot and df.attrs carries units and provenance.
+SAVE_MESH_PICKLE = True
+PICKLE_SUFFIX = "_mesh.pkl"
+PICKLE_DTYPE = "float32"     # float64 doubles the file for sub-micron gains
 OBJ_DIR = "posed_frames"
 OBJ_STRIDE = 1
 OUT_SUFFIX = "_posed"
@@ -759,7 +768,8 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
     return dict(poses=poses, vertices=verts, normals=norms, stats=stats,
                 frames=items, out=out_npz, vectors=vectors, matrices=matrices,
                 binding_npz=z, meta=meta,
-                trial=os.path.basename(trial_csv))
+                trial=os.path.basename(trial_csv),
+                trial_path=os.path.abspath(trial_csv))
 
 
 def vertices_at_frame(z, poses, frame):
@@ -834,6 +844,92 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
             if np.isfinite(P).all():
                 out[i, m] = Vl[m] @ P[:3, :3].T + P[:3, 3]
     return out, idx
+
+
+def mesh_dataframe(source=None, binding=None, dtype=None):
+    """Every vertex position as a DataFrame: index = frame, columns a
+    MultiIndex of (segment, vertex, axis).
+
+        df = ab.mesh_dataframe("TRIAL_posed.npz")
+        left  = df["left_foot"]                  # (frames, vertices*3)
+        v9000 = df[("right_foot", 9000)]         # x, y, z of one vertex
+        xs    = df.xs("X", axis=1, level="axis")
+
+    Positions are Theia world metres. `df.attrs` carries the trial name, the
+    units, the coordinate system and the binding's provenance, so the file
+    says what it is without the script that wrote it.
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:                          # noqa: BLE001
+        raise ImportError(
+            "mesh_dataframe needs pandas -- pip install pandas, or use "
+            "vertex_tracks() which is numpy only") from exc
+
+    dtype = PICKLE_DTYPE if dtype is None else dtype
+    V, idx = vertex_tracks(source, binding=binding)
+
+    if isinstance(source, dict):
+        z, trial = source["binding_npz"], source["trial"]
+    else:
+        _, z = load_binding(binding)
+        trial = os.path.basename(str(source)) if source else TRIAL_METRICS_CSV
+    meta = json.loads(str(z["meta"]))
+    seg_of, seg_names = z["vertex_segment"], meta["segments"]
+
+    cols = pd.MultiIndex.from_tuples(
+        [(seg_names[seg_of[v]], int(v), a) for v in idx for a in "XYZ"],
+        names=["segment", "vertex", "axis"])
+    df = pd.DataFrame(V.reshape(len(V), -1).astype(dtype), columns=cols)
+    # Sort the columns so the MultiIndex is lexsorted: the global vertex
+    # numbering interleaves the two feet, and without this every
+    # df[("right_foot", 9000)] lookup warns and scans.
+    df = df.sort_index(axis=1)
+    df.index.name = "frame"
+    df.attrs = {"trial": trial, "units": "m",
+                "coordinate_system": meta.get("coordinate_system", "theia"),
+                "segments": list(seg_names),
+                "static_metrics_csv": meta.get("static_metrics_csv"),
+                "pose_signal": meta.get("pose_signal"),
+                "created_by": "apply_binding.py"}
+    return df
+
+
+def save_mesh_pickle(result, trial_csv=None, path=None, verbose=True):
+    """Pickle mesh_dataframe() beside the trial CSV.
+
+    Beside the CSV rather than in the working directory on purpose: an
+    analysis script that already knows the trial path can then find the mesh
+    without being told where the run happened to be started from.
+    """
+    df = mesh_dataframe(result)
+    if path is None:
+        src = trial_csv or result.get("trial_path") or TRIAL_METRICS_CSV
+        d = os.path.dirname(os.path.abspath(src))
+        stem = os.path.splitext(os.path.basename(src))[0]
+        path = os.path.join(d, stem + PICKLE_SUFFIX)
+    df.to_pickle(path)
+    if verbose:
+        print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
+              f"{df.shape[0]} frames x {df.shape[1] // 3} vertices)")
+    return path
+
+
+def load_mesh_pickle(trial_csv):
+    """The other half: hand it the trial CSV path, get the DataFrame back.
+
+        df = ab.load_mesh_pickle("D05_C01_SKS_metrics.csv")
+    """
+    import pandas as pd
+
+    d = os.path.dirname(os.path.abspath(trial_csv))
+    stem = os.path.splitext(os.path.basename(trial_csv))[0]
+    path = os.path.join(d, stem + PICKLE_SUFFIX)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found -- run apply_binding on {os.path.basename(trial_csv)} "
+            f"with SAVE_MESH_PICKLE = True")
+    return pd.read_pickle(path)
 
 
 def export_vertex_csv(source=None, vertices=None, mesh=None, path=None,
@@ -954,6 +1050,12 @@ def main(argv=None):
     res = apply_binding(files[0] if files else None,
                         save_vertices="--vertices" in argv,
                         write_obj="--obj" in argv)
+
+    if SAVE_MESH_PICKLE or "--pickle" in argv:
+        try:
+            save_mesh_pickle(res)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  [mesh pickle skipped: {type(exc).__name__}: {exc}]")
 
     if SAVE_VERTEX_CSV or "--csv" in argv:
         try:

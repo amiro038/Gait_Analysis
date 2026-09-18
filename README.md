@@ -382,6 +382,37 @@ axis still lines up with the export row for row.
 Sizing, for a 484-frame trial: all 10208 vertices is 50 MB, one foot 12 MB, a
 single vertex 12 kB. The `poses`-only npz that produces all of them is 0.7 MB.
 
+#### The mesh as a DataFrame pickle
+
+Every run writes `<TRIAL>_mesh.pkl` **next to the trial CSV** — not in the
+working directory, so an analysis script that knows the trial path can find
+the mesh without being told where the run was started from:
+
+```python
+import apply_binding as ab
+
+df = ab.load_mesh_pickle("D05_C01_SKS_metrics.csv")   # or pd.read_pickle(path)
+
+left  = df["left_foot"]                 # (frames, vertices x 3)
+v9000 = df[("right_foot", 9000)]        # x, y, z of one vertex
+xs    = df.xs("X", axis=1, level="axis")  # every vertex's X, all frames
+```
+
+Index is the frame; columns are a MultiIndex of `(segment, vertex, axis)`,
+lexsorted so lookups are fast. `df.attrs` carries the trial name, units,
+coordinate system, the static trial the binding came from and the pose signal
+used, so the file explains itself without the script that wrote it.
+
+Stored as float32: 59 MB for a 484-frame trial, and it round-trips against
+`vertex_tracks()` to 3e-8 m. `PICKLE_DTYPE = "float64"` doubles the file for
+sub-micron gains that the binding's own accuracy does not justify.
+`SAVE_MESH_PICKLE = False` turns it off; the `_posed.npz` (0.7 MB) still
+reproduces the same numbers exactly.
+
+One caveat on pickles: they are a pandas-version-coupled format, fine for your
+own reuse but not for handing to someone on a different pandas. Say the word
+and I will add a `.parquet` option, which is portable and about the same size.
+
 #### Vertex positions as CSV
 
 `export_vertex_csv()` writes a selection out as text:
