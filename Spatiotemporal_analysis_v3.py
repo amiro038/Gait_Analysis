@@ -2253,3 +2253,277 @@ if len(trip_risk):
         print(f"    against treating MFC as one fixed point on the shoe.")
 else:
     print("  ! no swings produced a trip risk value")
+
+# =============================================================================
+# %% Kinetic metrics: impulses, GRF descriptors, centre of pressure
+# =============================================================================
+# The metric family that only exists because the treadmill is instrumented.
+# Everything here is per limb, which the split belts give directly with no
+# plate-hit problem to solve.
+#
+# CONVENTIONS, ESTABLISHED FROM THE DATA RATHER THAN ASSUMED
+# The moment columns are in N*m about each plate's own origin, and the CoP
+# columns are already in a shared lab frame offset from those origins. That is
+# not documented anywhere in the export, so it is derived below: regressing the
+# reported CoP against -My/Fz and Mx/Fz recovers the offsets with r = 1.0000
+# and reconstructs the CoP to 0.0000 mm. On this hardware the belt centres come
+# out 559 mm apart, which is the geometry you would expect.
+#
+# Getting this wrong matters. The free moment is the vertical torque that is
+# NOT explained by the horizontal forces acting at the CoP, so it needs the CoP
+# expressed relative to the moment origin. Use the lab-frame CoP by mistake and
+# the free moment picks up a spurious term of tens of N*m, against a real
+# signal of about 5.
+#
+# WHAT EACH MEASURE IS FOR
+#   braking / propulsive impulse   the AP force integrated over the part of
+#                                  stance where it opposes / drives travel.
+#                                  Reduced propulsion is one of the better
+#                                  established ageing markers, and impulse
+#                                  symmetry is a far better asymmetry measure
+#                                  than any kinematic one.
+#   F1, trough, F2                 weight acceptance peak, mid-stance unloading
+#                                  and push-off peak of the vertical GRF.
+#   loading rate                   how fast load is accepted, 20-80% of F1.
+#   CoP path                       how the point of application travels. The ML
+#                                  excursion is clean; the AP excursion on a
+#                                  treadmill also contains belt travel, because
+#                                  the foot rides the belt while the CoP
+#                                  progresses along the foot, so it is reported
+#                                  with that caveat attached.
+#   free moment                    transverse-plane torque against the ground,
+#                                  related to rotational control and to
+#                                  tibial loading.
+# =============================================================================
+
+from scipy.signal import butter, filtfilt   # repeated so the cell runs alone
+
+# -----------------------------------------------------------------------------
+# %% kinetic metric settings
+# -----------------------------------------------------------------------------
+
+kmx_loading_band    = (0.20, 0.80)   # fraction of F1 used for the loading rate
+kmx_peak_search     = (0.05, 0.95)   # fraction of stance searched for F1 / F2
+kmx_loaded_n        = 200.0          # N, "solidly loaded" for the CoP calibration
+kmx_min_stance_frames = 50           # at 1000 Hz
+
+# The CoP must be filtered before anything is derived from it. At 1000 Hz the
+# sample-to-sample CoP step on this hardware is about 2.5 mm of noise, so a
+# path length accumulates roughly 1800 mm over a stance in which the CoP
+# actually moved 3 mm -- the raw path length is 99.8% noise and means nothing.
+# Range is robust to this, path length is not, so path length is computed from
+# the filtered signal and the noise level is reported so the choice is visible.
+kmx_cop_filter_hz   = 15.0
+kmx_force_filter_hz = 50.0           # for derived metrics only, NOT for events
+
+print("\n" + "-" * 74)
+print("  KINETIC METRICS")
+print("-" * 74)
+
+# -----------------------------------------------------------------------------
+# %% derive the plate origin offsets, then the free moment
+# -----------------------------------------------------------------------------
+# copX = -My/Fz + offset_x and copY = Mx/Fz + offset_y, so a regression of the
+# reported CoP on those ratios recovers each plate's offset. Solved per belt
+# because the two plates sit either side of the midline.
+
+def kmx_lowpass(signal, cutoff_hz, fs=None, order=4):
+    """Zero-phase Butterworth. Used for derived metrics only; gait events are
+    detected on the raw signal, where the thresholds were tuned."""
+    fs = kin_fs if fs is None else fs
+    kmx_b, kmx_a = butter(order, cutoff_hz / (fs / 2), 'low')
+    return filtfilt(kmx_b, kmx_a, signal)
+
+cop_filtered = {}
+for kmx_side in ('Left', 'Right'):
+    cop_filtered[kmx_side] = {
+        a: kmx_lowpass(force_data[f'{kmx_side} belt_COP_{a}'].to_numpy(),
+                       kmx_cop_filter_hz) for a in 'XY'}
+    kmx_raw = np.column_stack([force_data[f'{kmx_side} belt_COP_{a}'].to_numpy()
+                               for a in 'XY'])
+    kmx_fil = np.column_stack([cop_filtered[kmx_side][a] for a in 'XY'])
+    kmx_loaded = force_data[f'{kmx_side} belt_Force_Z'].to_numpy() > kmx_loaded_n
+    kmx_step_raw = np.median(np.linalg.norm(np.diff(kmx_raw[kmx_loaded], axis=0), axis=1))
+    kmx_step_fil = np.median(np.linalg.norm(np.diff(kmx_fil[kmx_loaded], axis=0), axis=1))
+    print(f"  {kmx_side} CoP sample step when loaded: {kmx_step_raw:.3f} mm raw, "
+          f"{kmx_step_fil:.3f} mm after a {kmx_cop_filter_hz:.0f} Hz lowpass")
+
+kmx_cop_offset = {}
+free_moment = {}
+for kmx_side in ('Left', 'Right'):
+    kmx_f = {a: force_data[f'{kmx_side} belt_Force_{a}'].to_numpy() for a in 'XYZ'}
+    kmx_m = {a: force_data[f'{kmx_side} belt_Moment_{a}'].to_numpy() for a in 'XYZ'}
+    # The offset is a geometric constant of the hardware, so it is calibrated
+    # against the RAW CoP -- the filtered signal would make the check depend on
+    # the filter choice rather than on the moment convention.
+    kmx_raw_c = {a: force_data[f'{kmx_side} belt_COP_{a}'].to_numpy() for a in 'XY'}
+    kmx_c = {a: cop_filtered[kmx_side][a] for a in 'XY'}
+
+    kmx_ok = kmx_f['Z'] > kmx_loaded_n
+    kmx_ox = float(np.median(kmx_raw_c['X'][kmx_ok]
+                             + 1000.0 * kmx_m['Y'][kmx_ok] / kmx_f['Z'][kmx_ok]))
+    kmx_oy = float(np.median(kmx_raw_c['Y'][kmx_ok]
+                             - 1000.0 * kmx_m['X'][kmx_ok] / kmx_f['Z'][kmx_ok]))
+    kmx_cop_offset[kmx_side] = (kmx_ox, kmx_oy)
+
+    # check the offsets actually reproduce the reported CoP
+    kmx_pred_x = -1000.0 * kmx_m['Y'][kmx_ok] / kmx_f['Z'][kmx_ok] + kmx_ox
+    kmx_resid = float(np.max(np.abs(kmx_pred_x - kmx_raw_c['X'][kmx_ok])))
+    print(f"  {kmx_side} plate origin offset ({kmx_ox:+.1f}, {kmx_oy:+.1f}) mm, "
+          f"CoP reconstruction residual {kmx_resid:.4f} mm")
+    if kmx_resid > 1.0:
+        print(f"    ! residual over 1 mm means the moment convention is not what")
+        print(f"      this assumes. Free moments below will be wrong; check the export.")
+
+    # free moment: the vertical torque not explained by the horizontal forces
+    # acting at the CoP, with the CoP taken relative to the moment origin
+    kmx_rx = (kmx_c['X'] - kmx_ox) / 1000.0
+    kmx_ry = (kmx_c['Y'] - kmx_oy) / 1000.0
+    free_moment[kmx_side] = kmx_m['Z'] - (kmx_rx * kmx_f['Y'] - kmx_ry * kmx_f['X'])
+
+kmx_belt_separation = abs(kmx_cop_offset['Left'][0] - kmx_cop_offset['Right'][0])
+print(f"  belt centres {kmx_belt_separation:.0f} mm apart")
+
+# -----------------------------------------------------------------------------
+# %% which AP sign is braking?
+# -----------------------------------------------------------------------------
+# Travel direction is known from the belt, so braking is the AP force opposing
+# it. Rather than trust that, the pattern is checked: the AP force should be
+# predominantly braking in the first half of stance and propulsive in the
+# second. If it is not, the axis or sign assumption is wrong.
+
+kmx_ap_sign_check = []
+for kmx_side in ('Left', 'Right'):
+    kmx_fy = force_data[f'{kmx_side} belt_Force_Y'].to_numpy()
+    kmx_first, kmx_second = [], []
+    for kmx_h, kmx_t in force_contacts[kmx_side]:
+        kmx_mid = (kmx_h + kmx_t) // 2
+        kmx_first.append(kmx_fy[kmx_h:kmx_mid].mean())
+        kmx_second.append(kmx_fy[kmx_mid:kmx_t].mean())
+    kmx_ap_sign_check.append((kmx_side, np.mean(kmx_first), np.mean(kmx_second)))
+    print(f"  {kmx_side} AP force: first half of stance {np.mean(kmx_first):+.1f} N, "
+          f"second half {np.mean(kmx_second):+.1f} N")
+
+kmx_forward_sign = com_belt_sign
+if kmx_ap_sign_check[0][2] < kmx_ap_sign_check[0][1]:
+    kmx_forward_sign = -com_belt_sign
+    print(f"  ! the AP pattern is reversed from what the belt direction implies;")
+    print(f"    using the force pattern, which is the more direct evidence.")
+print(f"  propulsion is the {'+' if kmx_forward_sign > 0 else '-'}Y direction")
+
+# -----------------------------------------------------------------------------
+# %% per-stance kinetic measures
+# -----------------------------------------------------------------------------
+
+kmx_rows = []
+for kmx_side in ('Left', 'Right'):
+    kmx_fx = force_data[f'{kmx_side} belt_Force_X'].to_numpy()
+    kmx_fy = force_data[f'{kmx_side} belt_Force_Y'].to_numpy() * kmx_forward_sign
+    kmx_fz = force_data[f'{kmx_side} belt_Force_Z'].to_numpy()
+    kmx_cx = cop_filtered[kmx_side]['X']
+    kmx_cy = cop_filtered[kmx_side]['Y']
+    kmx_free = free_moment[kmx_side]
+
+    for kmx_h, kmx_t in force_contacts[kmx_side]:
+        if kmx_t - kmx_h < kmx_min_stance_frames:
+            continue
+        kmx_n = kmx_t - kmx_h
+        kmx_vz = kmx_fz[kmx_h:kmx_t]
+        kmx_vy = kmx_fy[kmx_h:kmx_t]
+        kmx_dt = 1.0 / kin_fs
+
+        # --- AP impulses -----------------------------------------------------
+        kmx_brake = float(np.sum(kmx_vy[kmx_vy < 0]) * kmx_dt)      # negative
+        kmx_propel = float(np.sum(kmx_vy[kmx_vy > 0]) * kmx_dt)     # positive
+
+        # --- vertical GRF landmarks ------------------------------------------
+        kmx_a = int(kmx_peak_search[0] * kmx_n)
+        kmx_b = int(kmx_peak_search[1] * kmx_n)
+        kmx_mid = kmx_n // 2
+        kmx_f1_idx = kmx_a + int(np.argmax(kmx_vz[kmx_a:kmx_mid])) if kmx_mid > kmx_a else kmx_a
+        kmx_f2_idx = kmx_mid + int(np.argmax(kmx_vz[kmx_mid:kmx_b])) if kmx_b > kmx_mid else kmx_mid
+        kmx_trough_idx = (kmx_f1_idx + int(np.argmin(kmx_vz[kmx_f1_idx:kmx_f2_idx]))
+                          if kmx_f2_idx > kmx_f1_idx else kmx_f1_idx)
+        kmx_f1, kmx_f2 = float(kmx_vz[kmx_f1_idx]), float(kmx_vz[kmx_f2_idx])
+        kmx_trough = float(kmx_vz[kmx_trough_idx])
+
+        # --- loading rate, 20-80% of the first peak --------------------------
+        kmx_lr = np.nan
+        kmx_rise = kmx_vz[:kmx_f1_idx + 1]
+        if len(kmx_rise) > 5 and kmx_f1 > 0:
+            kmx_lo = np.argmax(kmx_rise >= kmx_loading_band[0] * kmx_f1)
+            kmx_hi = np.argmax(kmx_rise >= kmx_loading_band[1] * kmx_f1)
+            if kmx_hi > kmx_lo:
+                kmx_lr = float((kmx_rise[kmx_hi] - kmx_rise[kmx_lo])
+                               / ((kmx_hi - kmx_lo) * kmx_dt))
+
+        # --- centre of pressure ----------------------------------------------
+        kmx_px, kmx_py = kmx_cx[kmx_h:kmx_t], kmx_cy[kmx_h:kmx_t]
+        kmx_path = float(np.sum(np.hypot(np.diff(kmx_px), np.diff(kmx_py))))
+
+        kmx_rows.append({
+            'side': kmx_side,
+            'heel_strike_frame_100hz': int(kin_sample_to_frame(kmx_h)),
+            'stance_time': kmx_n / kin_fs,
+            'braking_impulse_ns': kmx_brake,
+            'propulsive_impulse_ns': kmx_propel,
+            'net_ap_impulse_ns': kmx_brake + kmx_propel,
+            'braking_impulse_bw_s': kmx_brake / kin_body_weight,
+            'propulsive_impulse_bw_s': kmx_propel / kin_body_weight,
+            'vertical_impulse_bw_s': float(np.sum(kmx_vz) * kmx_dt) / kin_body_weight,
+            'grf_peak1_bw': kmx_f1 / kin_body_weight,
+            'grf_trough_bw': kmx_trough / kin_body_weight,
+            'grf_peak2_bw': kmx_f2 / kin_body_weight,
+            'loading_rate_bw_s': kmx_lr / kin_body_weight if np.isfinite(kmx_lr) else np.nan,
+            'cop_ml_range_mm': float(np.ptp(kmx_px)),
+            'cop_ap_range_mm': float(np.ptp(kmx_py)),
+            'cop_path_mm': kmx_path,          # filtered; see kmx_cop_filter_hz
+            'free_moment_peak_nm': float(np.max(np.abs(kmx_free[kmx_h:kmx_t]))),
+            'free_moment_range_nm': float(np.ptp(kmx_free[kmx_h:kmx_t])),
+        })
+
+kinetic_metrics = pd.DataFrame(kmx_rows)
+
+# -----------------------------------------------------------------------------
+# %% report and symmetry
+# -----------------------------------------------------------------------------
+
+if len(kinetic_metrics):
+    print(f"\n  {len(kinetic_metrics)} stances")
+    for kmx_side, kmx_g in kinetic_metrics.groupby('side'):
+        print(f"    {kmx_side:5s} vGRF  F1 {kmx_g['grf_peak1_bw'].mean():.3f}  "
+              f"trough {kmx_g['grf_trough_bw'].mean():.3f}  "
+              f"F2 {kmx_g['grf_peak2_bw'].mean():.3f} BW   "
+              f"loading rate {kmx_g['loading_rate_bw_s'].mean():.1f} BW/s")
+        print(f"          impulse  braking {kmx_g['braking_impulse_bw_s'].mean():+.4f}  "
+              f"propulsive {kmx_g['propulsive_impulse_bw_s'].mean():+.4f}  "
+              f"net {kmx_g['net_ap_impulse_ns'].mean()/kin_body_weight:+.4f} BW*s")
+        print(f"          CoP  ML range {kmx_g['cop_ml_range_mm'].mean():.0f} mm  "
+              f"path {kmx_g['cop_path_mm'].mean():.0f} mm   "
+              f"free moment peak {kmx_g['free_moment_peak_nm'].mean():.1f} N*m")
+
+    # Net AP impulse must be near zero over a steady trial: the walker is not
+    # accelerating, so propulsion has to cancel braking. A large net value
+    # means a force-plate offset, not a physiological finding.
+    kmx_net = kinetic_metrics['net_ap_impulse_ns'].mean()
+    kmx_prop = kinetic_metrics['propulsive_impulse_ns'].mean()
+    print(f"\n  net AP impulse per stance {kmx_net:+.3f} N*s "
+          f"({100*abs(kmx_net)/abs(kmx_prop):.1f}% of the propulsive impulse)")
+    if abs(kmx_net) > 0.1 * abs(kmx_prop):
+        print(f"    ! that should be near zero at steady speed. Check the AP zero offset.")
+
+    # Symmetry angle [Zifchock2008]: bounded and reference-free, unlike the
+    # classic symmetry index which depends on which limb is the denominator.
+    print("\n  symmetry angle (0% = symmetric, sign gives direction)")
+    for kmx_var in ('propulsive_impulse_ns', 'braking_impulse_ns', 'grf_peak1_bw',
+                    'grf_peak2_bw', 'vertical_impulse_bw_s'):
+        kmx_l = kinetic_metrics[kinetic_metrics['side'] == 'Left'][kmx_var].mean()
+        kmx_r = kinetic_metrics[kinetic_metrics['side'] == 'Right'][kmx_var].mean()
+        if not (np.isfinite(kmx_l) and np.isfinite(kmx_r)) or kmx_r == 0:
+            continue
+        kmx_sa = (45.0 - np.degrees(np.arctan2(kmx_l, kmx_r))) / 90.0 * 100.0
+        if kmx_sa > 100.0:
+            kmx_sa -= 200.0
+        print(f"    {kmx_var:26s} L {kmx_l:+9.4f}  R {kmx_r:+9.4f}  SA {kmx_sa:+6.2f}%")
+else:
+    print("  ! no stances produced kinetic metrics")
