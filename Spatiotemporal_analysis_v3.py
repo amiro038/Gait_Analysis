@@ -2527,3 +2527,219 @@ if len(kinetic_metrics):
         print(f"    {kmx_var:26s} L {kmx_l:+9.4f}  R {kmx_r:+9.4f}  SA {kmx_sa:+6.2f}%")
 else:
     print("  ! no stances produced kinetic metrics")
+
+# =============================================================================
+# %% One stride series, shared by every stride-to-stride metric
+# =============================================================================
+# DFA, entropy, the goal-equivalent manifold analysis and the foot placement
+# model all consume a stride-indexed series, and all of them are N-DEPENDENT.
+# Build them separately and you end up comparing alpha on 756 strides against
+# lambda on 150, where part of any difference is sample size rather than
+# physiology. So they are built once, here, and every later cell draws from
+# this table.
+#
+# WHY A FIXED N MATTERS MORE THAN A LARGE N
+# alpha, sample entropy and lambda all drift with series length. If one
+# condition ran 15 minutes and another 10, the longer trial gets a
+# systematically different alpha for a reason that has nothing to do with the
+# walker. The fix is the same one the LDS cell already applies to stride count:
+# truncate every trial to a COMMON length, chosen as the shortest trial in the
+# dataset, and state it.
+#
+#   at 108 bpm the cadence is 54 strides/min, so
+#     15 min trial -> 810 strides, 756 after a 60 s warm-up
+#     10 min trial -> 540 strides, 486 after a 60 s warm-up
+#
+# 486 is below the 600 that [Damouras2010] recommend for a stable alpha, so on
+# 10 minute trials alpha carries wider confidence intervals. That is a reason
+# to report the interval, not a reason to use a different N per trial.
+#
+# References
+#   [Damouras2010]  Damouras et al. (2010) Gait Posture 31(3), 336-340.
+#   [Dingwell2010]  Dingwell, John & Cusumano (2010) PLoS Comput Biol 6(7), e1000856.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% stride series settings
+# -----------------------------------------------------------------------------
+
+ss_limb        = 'Right'   # which limb's heel strikes define a stride
+ss_warmup_s    = 60.0      # treadmill acclimatisation, excluded
+ss_fixed_n     = None      # None = use everything available. SET THIS to the
+                           # shortest trial in the dataset before comparing
+                           # trials, e.g. 480 for a 10 minute protocol.
+ss_match_tolerance = 5     # frames, for joining per-step tables onto strides
+
+print("\n" + "-" * 74)
+print("  STRIDE SERIES")
+print("-" * 74)
+
+# -----------------------------------------------------------------------------
+# %% the stride index, from the force events
+# -----------------------------------------------------------------------------
+# Force events rather than the merged event file, because they are one
+# consistent detector rather than a GRF/kinematic mixture, and mixed timing
+# sources put a step change into every interval they touch.
+
+ss_contacts = force_contacts[ss_limb]
+ss_hs_frames = np.array([int(kin_sample_to_frame(h)) for h, _ in ss_contacts])
+ss_to_frames = np.array([int(kin_sample_to_frame(t)) for _, t in ss_contacts])
+
+ss_keep = ss_hs_frames > ss_warmup_s * kin_kinematic_fs
+ss_hs_frames, ss_to_frames = ss_hs_frames[ss_keep], ss_to_frames[ss_keep]
+ss_contacts = [c for c, k in zip(ss_contacts, ss_keep) if k]
+
+print(f"  limb {ss_limb}, {ss_warmup_s:.0f} s warm-up excluded")
+print(f"  {len(ss_hs_frames)} strides available after the warm-up")
+
+stride_series = pd.DataFrame({
+    'stride': np.arange(len(ss_hs_frames)),
+    'heel_strike_frame_100hz': ss_hs_frames,
+    'toe_off_frame_100hz': ss_to_frames,
+})
+stride_series['stride_time'] = np.append(
+    np.diff(ss_hs_frames) / kin_kinematic_fs, np.nan)
+stride_series['stance_time'] = (ss_to_frames - ss_hs_frames) / kin_kinematic_fs
+stride_series['swing_time'] = stride_series['stride_time'] - stride_series['stance_time']
+stride_series['stance_percent'] = (100 * stride_series['stance_time']
+                                   / stride_series['stride_time'])
+stride_series['cadence_spm'] = 120.0 / stride_series['stride_time']
+
+# -----------------------------------------------------------------------------
+# %% stride length and velocity in the belt frame
+# -----------------------------------------------------------------------------
+# On a treadmill the foot returns to roughly the same lab position each stride,
+# so stride length is not a lab-frame displacement. It is the belt travel over
+# the stride plus whatever net progression the walker made:
+#     stride length = belt speed * stride time + (lab displacement of the foot)
+
+if f'{ss_limb}_Heel' in kinematic_positions:
+    ss_heel_ap = kinematic_positions[f'{ss_limb}_Heel'][:, com_ap_axis]
+    ss_disp = np.full(len(ss_hs_frames), np.nan)
+    for ss_i in range(len(ss_hs_frames) - 1):
+        ss_a, ss_b = ss_hs_frames[ss_i] - 1, ss_hs_frames[ss_i + 1] - 1
+        if 0 <= ss_a < len(ss_heel_ap) and 0 <= ss_b < len(ss_heel_ap):
+            ss_disp[ss_i] = ss_heel_ap[ss_b] - ss_heel_ap[ss_a]
+    stride_series['stride_length'] = (com_belt_speed_used * stride_series['stride_time']
+                                      + com_belt_sign * ss_disp)
+    stride_series['stride_velocity'] = (stride_series['stride_length']
+                                        / stride_series['stride_time'])
+
+# step width: the ML distance between the two feet at each heel strike
+if f'{ss_limb}_Heel' in kinematic_positions:
+    ss_other = 'Left' if ss_limb == 'Right' else 'Right'
+    if f'{ss_other}_Heel' in kinematic_positions:
+        ss_ml_self = kinematic_positions[f'{ss_limb}_Heel'][:, com_ml_axis]
+        ss_ml_other = kinematic_positions[f'{ss_other}_Heel'][:, com_ml_axis]
+        ss_idx = np.clip(ss_hs_frames - 1, 0, len(ss_ml_self) - 1)
+        stride_series['step_width'] = np.abs(ss_ml_self[ss_idx] - ss_ml_other[ss_idx])
+
+# -----------------------------------------------------------------------------
+# %% join the per-step tables onto the stride index
+# -----------------------------------------------------------------------------
+
+def ss_join(table, columns, frame_column='heel_strike_frame_100hz', prefix=''):
+    """Attach per-step values to the stride table, matched on `frame_column`.
+
+    The stride table carries both the heel strike and the toe off frame, and
+    the two must be matched on the SAME event: joining a toe-off-keyed table
+    onto heel strike frames misses by a whole stance phase and silently
+    produces an all-NaN column.
+    """
+    if table is None or not len(table):
+        return
+    ss_sub = table[table['side'] == ss_limb] if 'side' in table.columns else table
+    ss_sub = ss_sub[[frame_column] + [c for c in columns if c in ss_sub.columns]]
+    if len(ss_sub) == 0:
+        return
+    if frame_column not in stride_series.columns:
+        print(f"  ! cannot join on {frame_column}, it is not in the stride table")
+        return
+    ss_left = stride_series[[frame_column]].copy()
+    ss_left['_row'] = np.arange(len(ss_left))
+    ss_merged = pd.merge_asof(
+        ss_left.sort_values(frame_column),
+        ss_sub.sort_values(frame_column).rename(
+            columns={frame_column: frame_column + '_r'}),
+        left_on=frame_column, right_on=frame_column + '_r',
+        direction='nearest', tolerance=ss_match_tolerance)
+    ss_merged = ss_merged.sort_values('_row')
+    for ss_c in columns:
+        if ss_c in ss_merged.columns:
+            stride_series[prefix + ss_c] = ss_merged[ss_c].to_numpy()
+            ss_hit = np.isfinite(pd.to_numeric(ss_merged[ss_c],
+                                               errors='coerce')).mean()
+            if ss_hit < 0.5:
+                print(f"  ! {ss_c} matched only {100*ss_hit:.0f}% of strides on "
+                      f"{frame_column}; check the key and ss_match_tolerance")
+
+ss_join(kinetic_metrics, ['propulsive_impulse_bw_s', 'braking_impulse_bw_s',
+                          'vertical_impulse_bw_s', 'grf_peak1_bw', 'grf_peak2_bw',
+                          'loading_rate_bw_s', 'cop_ml_range_mm',
+                          'free_moment_peak_nm'])
+ss_join(margin_of_stability, ['mos_ml_contact', 'mos_ml_min',
+                              'mos_ap_contact', 'mos_ap_min'])
+ss_join(trip_risk, ['mfc_m', 'trip_risk_integral', 'moi_peak_mm'],
+        frame_column='toe_off_frame_100hz')
+
+# -----------------------------------------------------------------------------
+# %% truncate to a common length
+# -----------------------------------------------------------------------------
+
+ss_available = len(stride_series)
+if ss_fixed_n is not None:
+    if ss_available < ss_fixed_n:
+        print(f"  ! only {ss_available} strides, fewer than the {ss_fixed_n} this")
+        print(f"    dataset is standardised to. This trial is NOT comparable on any")
+        print(f"    N-dependent metric (alpha, entropy, lambda). Either shorten")
+        print(f"    ss_fixed_n for the whole dataset or exclude this trial.")
+    else:
+        stride_series = stride_series.iloc[:ss_fixed_n].copy()
+        print(f"  truncated to the dataset-wide {ss_fixed_n} strides "
+              f"({ss_available} were available)")
+else:
+    print(f"  using all {ss_available} strides. SET ss_fixed_n before comparing")
+    print(f"    trials: alpha, entropy and lambda all drift with series length, so")
+    print(f"    a 756-stride trial is not comparable with a 486-stride one.")
+
+# -----------------------------------------------------------------------------
+# %% what is usable
+# -----------------------------------------------------------------------------
+# A series with gaps is not a series. Anything that will be handed to DFA or
+# entropy has to be reported with its completeness, because those estimators
+# silently accept a NaN-filled array and return a number.
+
+ss_candidates = ['stride_time', 'stance_time', 'swing_time', 'stance_percent',
+                 'stride_length', 'stride_velocity', 'step_width',
+                 'mos_ml_contact', 'mos_ap_contact', 'mfc_m',
+                 'propulsive_impulse_bw_s', 'braking_impulse_bw_s',
+                 'grf_peak1_bw', 'grf_peak2_bw', 'trip_risk_integral']
+
+print(f"\n  series                      n valid   complete   mean        CV")
+stride_series_usable = []
+for ss_c in ss_candidates:
+    if ss_c not in stride_series.columns:
+        continue
+    ss_v = stride_series[ss_c].to_numpy(float)
+    ss_ok = np.isfinite(ss_v)
+    if ss_ok.sum() < 10:
+        continue
+    ss_pct = 100 * ss_ok.mean()
+    ss_mean = np.nanmean(ss_v)
+    ss_cv = 100 * np.nanstd(ss_v) / abs(ss_mean) if ss_mean else np.nan
+    print(f"    {ss_c:26s} {ss_ok.sum():5d}    {ss_pct:5.1f}%   "
+          f"{ss_mean:9.4f}  {ss_cv:6.2f}%")
+    if ss_pct > 95:
+        stride_series_usable.append(ss_c)
+
+print(f"\n  {len(stride_series_usable)} series are over 95% complete and will be")
+print(f"    carried into the stride-to-stride metrics:")
+print(f"    {', '.join(stride_series_usable)}")
+
+# The metronome constrains stride TIMING directly, so alpha on stride time
+# measures how tightly the walker locks to the beat. Series the metronome does
+# not set are the better primary outcomes.
+ss_cued = {'stride_time', 'stance_time', 'swing_time', 'cadence_spm'}
+ss_uncued = [c for c in stride_series_usable if c not in ss_cued]
+print(f"\n  with a metronome, prefer the series it does not directly constrain:")
+print(f"    {', '.join(ss_uncued[:8])}")
