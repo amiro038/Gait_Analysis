@@ -1112,3 +1112,368 @@ for lds_name in lds_curves:
     plt.grid(alpha=0.15)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+# =============================================================================
+# %% Kinetics: load the force file, check its quality, re-derive gait events
+# =============================================================================
+# The split-belt treadmill gives one force plate per limb, so there is no plate
+# hit to disambiguate. What it does need is care about three things that this
+# cell measures rather than assumes:
+#
+#   1. The unloaded baseline is NOT zero. On this hardware an unloaded belt
+#      reads about 8 N and peaks near 25 N. A 20 N threshold therefore sits
+#      INSIDE the noise and chatters, producing spurious contacts. The
+#      threshold is set as a fraction of body weight and then checked against
+#      the measured noise floor.
+#
+#   2. The handrails are instrumented. Their channels carry a small non-zero
+#      offset (2-3 N) that is a baseline, not contact. It is removed here, and
+#      genuine contact is flagged, because any hand force breaks the
+#      CoM-from-GRF calculation in the next cell.
+#
+#   3. Body mass comes from the data. The mean total vertical GRF over a
+#      steady walking trial is mg, so mass does not have to be entered by hand
+#      and cannot be mistyped.
+#
+# The threshold sweep at the end is the diagnostic that matters. Stride time CV
+# should be about 2-3% for metronome paced walking. If it is much higher at a
+# given threshold, that threshold is chattering, and the sweep shows you where
+# the plateau is instead of leaving you to trust one hardcoded number.
+#
+# References
+#   [Hof2005]     Hof, Gazendam & Sinke (2005) J Biomech 38, 1-8.
+#   [Schulz2017]  Schulz (2017) J Biomech 55, 107-112.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% kinetics settings
+# -----------------------------------------------------------------------------
+
+kin_force_folder   = "Force_csv_outputs"  # sibling of Theia_csv_outputs under base
+kin_fs             = 1000.0    # Hz, force sampling rate (checked against the file)
+kin_kinematic_fs   = 100.0     # Hz, matches the frame_100hz event convention
+
+# Contact thresholds as a fraction of body weight. 7% / 3% clears the measured
+# noise floor on this hardware with room to spare; the check below refuses to
+# continue quietly if it does not.
+kin_on_frac        = 0.07      # rising threshold, fraction of body weight
+kin_off_frac       = 0.03      # falling threshold, hysteresis
+kin_min_stance_s   = 0.25      # shorter "contacts" than this are threshold chatter
+kin_min_swing_s    = 0.15      # shorter "flights" than this are a dropout, not swing
+
+kin_handrail_contact_n = 15.0  # N above baseline that counts as real hand contact
+kin_sweep_fracs    = [0.02, 0.03, 0.05, 0.07, 0.10, 0.15]   # threshold diagnostic
+
+# -----------------------------------------------------------------------------
+# %% find and load the force file
+# -----------------------------------------------------------------------------
+# The force export names the trial with underscores where the event file uses a
+# space, so both spellings are tried rather than assuming one.
+
+kin_stem = gait_event_path.stem.replace('_merged_events', '')
+kin_candidates = [
+    base / kin_force_folder / f"{kin_stem}.csv",
+    base / kin_force_folder / f"{kin_stem.replace(' ', '_')}.csv",
+    base / kin_force_folder / f"{kin_stem.replace('_', ' ')}.csv",
+]
+kin_path = next((p for p in kin_candidates if p.exists()), None)
+
+if kin_path is None:
+    raise FileNotFoundError(
+        "No force file found. Tried:\n  " + "\n  ".join(str(p) for p in kin_candidates)
+        + "\nSet kin_force_folder to the folder holding the force exports.")
+
+print("\n" + "=" * 74)
+print("  KINETICS")
+print("=" * 74)
+print(f"  file: {kin_path.name}")
+
+force_data = pd.read_csv(kin_path, index_col=0)
+
+# -----------------------------------------------------------------------------
+# %% sampling rate, time base and synchronisation to the kinematics
+# -----------------------------------------------------------------------------
+
+kin_time = force_data['Left belt_TIME'].to_numpy()
+kin_fs_measured = 1.0 / np.median(np.diff(kin_time))
+
+if abs(kin_fs_measured - kin_fs) > 1.0:
+    print(f"  ! force file is {kin_fs_measured:.0f} Hz, not the {kin_fs:.0f} Hz "
+          f"configured. Using the measured rate.")
+    kin_fs = kin_fs_measured
+
+if not np.allclose(force_data['Left belt_TIME'], force_data['Right belt_TIME']):
+    print("  ! the two belts have different time columns, they should be identical")
+
+kin_n_samples = len(force_data)
+kin_duration  = kin_time[-1] - kin_time[0]
+print(f"  {kin_n_samples} samples, {kin_duration:.1f} s at {kin_fs:.0f} Hz")
+
+# Event frames are 1-based at 100 Hz, so frame f corresponds to force time
+# (f - 1) / 100. This mapping was checked against GRF-detected contacts and
+# agrees to about 3 ms once the threshold offset is removed.
+def kin_frame_to_sample(frame_100hz):
+    """100 Hz kinematic frame number -> index into the force arrays."""
+    return np.round((np.asarray(frame_100hz, float) - 1.0)
+                    * kin_fs / kin_kinematic_fs).astype(int)
+
+def kin_sample_to_frame(sample):
+    """Index into the force arrays -> 100 Hz kinematic frame number."""
+    return np.asarray(sample, float) * kin_kinematic_fs / kin_fs + 1.0
+
+# -----------------------------------------------------------------------------
+# %% body mass from the vertical GRF
+# -----------------------------------------------------------------------------
+# Over a steady walking trial the mean total vertical force is body weight. No
+# quiet-standing period is needed and nothing has to be typed in.
+
+kin_grf_z_total = (force_data['Left belt_Force_Z'].to_numpy()
+                   + force_data['Right belt_Force_Z'].to_numpy())
+kin_body_weight = float(np.mean(kin_grf_z_total))
+kin_body_mass   = kin_body_weight / 9.81
+
+print(f"  body weight from mean total vertical GRF: {kin_body_weight:.1f} N "
+      f"({kin_body_mass:.1f} kg)")
+
+# -----------------------------------------------------------------------------
+# %% handrails: remove the baseline, flag genuine contact
+# -----------------------------------------------------------------------------
+# Any hand force is an external force on the body, so it invalidates the
+# CoM-from-GRF calculation in the next cell. The channels carry a small
+# constant offset that must not be mistaken for contact, so the baseline is
+# taken as the median of each channel and removed first.
+
+handrail_force = {}
+for kin_side in ('Left', 'Right'):
+    kin_v = np.column_stack([
+        force_data[f'{kin_side} handrail_Force_{a}'].to_numpy() for a in 'XYZ'])
+    kin_baseline = np.median(kin_v, axis=0)
+    handrail_force[kin_side] = kin_v - kin_baseline
+    print(f"  {kin_side} handrail baseline removed: "
+          f"({kin_baseline[0]:+.2f}, {kin_baseline[1]:+.2f}, {kin_baseline[2]:+.2f}) N")
+
+handrail_magnitude = {s: np.linalg.norm(v, axis=1) for s, v in handrail_force.items()}
+handrail_contact = np.zeros(kin_n_samples, bool)
+for kin_side in ('Left', 'Right'):
+    kin_touch = handrail_magnitude[kin_side] > kin_handrail_contact_n
+    handrail_contact |= kin_touch
+    print(f"  {kin_side} handrail: residual |F| max {handrail_magnitude[kin_side].max():.1f} N, "
+          f"{100 * kin_touch.mean():.2f}% of samples over {kin_handrail_contact_n:.0f} N")
+
+if handrail_contact.any():
+    print(f"  ! handrail contact on {100 * handrail_contact.mean():.2f}% of samples. "
+          f"Those frames are excluded from the CoM fusion.")
+else:
+    print("  no handrail contact detected, the GRF is the only external force")
+
+# -----------------------------------------------------------------------------
+# %% measure the unloaded noise floor, then set the contact thresholds
+# -----------------------------------------------------------------------------
+# The noise floor is estimated from samples that are unambiguously unloaded
+# (below 5% body weight). The rising threshold has to clear it, otherwise the
+# detector will fire on noise.
+
+kin_grf_z = {s: force_data[f'{s} belt_Force_Z'].to_numpy() for s in ('Left', 'Right')}
+
+# -----------------------------------------------------------------------------
+# %% contact detection
+# -----------------------------------------------------------------------------
+
+def kin_detect_contacts(vertical_force, on_n, off_n,
+                        min_stance_s=None, min_swing_s=None, fs=None):
+    """Heel strike and toe off samples from one belt's vertical force.
+
+    A Schmitt trigger (rise above on_n, fall below off_n) rather than a single
+    threshold, because a single threshold chatters when the signal hovers near
+    it. Contacts shorter than min_stance_s are discarded as chatter, and gaps
+    shorter than min_swing_s are treated as a momentary dropout within one
+    contact rather than a real swing phase, so the two halves are merged.
+
+    Returns a list of (heel_strike_sample, toe_off_sample).
+    """
+    fs = kin_fs if fs is None else fs
+    min_stance_s = kin_min_stance_s if min_stance_s is None else min_stance_s
+    min_swing_s = kin_min_swing_s if min_swing_s is None else min_swing_s
+
+    loaded = np.zeros(len(vertical_force), bool)
+    kin_state = False
+    for kin_i, kin_val in enumerate(vertical_force):
+        kin_state = kin_val > off_n if kin_state else kin_val > on_n
+        loaded[kin_i] = kin_state
+
+    kin_rises = np.where(~loaded[:-1] & loaded[1:])[0] + 1
+    kin_falls = np.where(loaded[:-1] & ~loaded[1:])[0] + 1
+
+    kin_pairs = []
+    for kin_h in kin_rises:
+        kin_after = kin_falls[kin_falls > kin_h]
+        if len(kin_after) and (kin_after[0] - kin_h) / fs >= min_stance_s:
+            kin_pairs.append((int(kin_h), int(kin_after[0])))
+
+    kin_merged = []
+    for kin_h, kin_t in kin_pairs:
+        if kin_merged and (kin_h - kin_merged[-1][1]) / fs < min_swing_s:
+            kin_merged[-1] = (kin_merged[-1][0], kin_t)
+        else:
+            kin_merged.append((kin_h, kin_t))
+    return kin_merged
+
+
+# Two passes. A percentile of "samples below X" just returns X when the noise
+# reaches that far, so the first pass finds contacts with a threshold that is
+# safely clear of any plausible noise, and the second measures the floor only
+# during confirmed mid-swing, where the belt is genuinely unloaded.
+kin_noise_floor = {}
+for kin_side, kin_z in kin_grf_z.items():
+    kin_provisional = kin_detect_contacts(kin_z, 0.15 * kin_body_weight,
+                                          0.08 * kin_body_weight)
+    kin_swing_mask = np.zeros(len(kin_z), bool)
+    for kin_a, kin_b in zip(kin_provisional[:-1], kin_provisional[1:]):
+        kin_lo, kin_hi = kin_a[1], kin_b[0]          # toe off -> next heel strike
+        kin_pad = int(0.2 * (kin_hi - kin_lo))       # middle 60% of swing only
+        kin_swing_mask[kin_lo + kin_pad:kin_hi - kin_pad] = True
+    kin_quiet = kin_z[kin_swing_mask]
+    kin_noise_floor[kin_side] = float(np.percentile(kin_quiet, 99.9))
+    print(f"  {kin_side} belt unloaded (mid-swing, n={kin_swing_mask.sum()}): "
+          f"mean {kin_quiet.mean():.1f} N, 99.9th pct {kin_noise_floor[kin_side]:.1f} N, "
+          f"max {kin_quiet.max():.1f} N")
+
+# A plate that is much noisier than its partner is a hardware problem, not a
+# parameter choice, and it shows up downstream as one limb needing a kinematic
+# event fallback. Worth knowing before any left-right comparison is believed.
+kin_floor_ratio = (max(kin_noise_floor.values())
+                   / max(min(kin_noise_floor.values()), 1e-9))
+if kin_floor_ratio > 1.8:
+    kin_noisy = max(kin_noise_floor, key=kin_noise_floor.get)
+    print(f"  ! the {kin_noisy} belt's noise floor is {kin_floor_ratio:.1f}x the other's "
+          f"({kin_noise_floor[kin_noisy]:.0f} N vs "
+          f"{min(kin_noise_floor.values()):.0f} N).")
+    print(f"    That is a plate problem, not a threshold problem. It forces a higher")
+    print(f"    threshold for both limbs and is the usual reason one limb falls back")
+    print(f"    to kinematic event detection. Worth re-zeroing or servicing the plate.")
+
+kin_on_n  = kin_on_frac * kin_body_weight
+kin_off_n = kin_off_frac * kin_body_weight
+kin_worst_floor = max(kin_noise_floor.values())
+
+print(f"  thresholds: on {kin_on_n:.0f} N ({100*kin_on_frac:.0f}% BW), "
+      f"off {kin_off_n:.0f} N ({100*kin_off_frac:.0f}% BW)")
+if kin_on_n < 1.5 * kin_worst_floor:
+    print(f"  ! the rising threshold ({kin_on_n:.0f} N) is close to the noise "
+          f"floor ({kin_worst_floor:.0f} N). Raise kin_on_frac.")
+
+# crosstalk between belts would make one plate read the other's load
+for kin_side, kin_other in (('Left', 'Right'), ('Right', 'Left')):
+    kin_off_mask = kin_grf_z[kin_side] < 0.03 * kin_body_weight
+    if kin_off_mask.sum() > 100:
+        kin_slope = np.polyfit(kin_grf_z[kin_other][kin_off_mask],
+                               kin_grf_z[kin_side][kin_off_mask], 1)[0]
+        print(f"  {kin_side} belt crosstalk from {kin_other}: {100*kin_slope:.2f}%")
+
+force_contacts = {s: kin_detect_contacts(kin_grf_z[s], kin_on_n, kin_off_n)
+                  for s in ('Left', 'Right')}
+
+kin_contact_quality = {}
+print("\n  contacts detected")
+for kin_side, kin_con in force_contacts.items():
+    kin_stance = np.array([(t - h) / kin_fs for h, t in kin_con])
+    kin_stride = np.diff([h for h, _ in kin_con]) / kin_fs
+    print(f"    {kin_side:5s} n={len(kin_con):4d}  "
+          f"stance {kin_stance.mean():.3f} +- {kin_stance.std():.3f} s  "
+          f"stride {kin_stride.mean():.3f} +- {kin_stride.std():.3f} s "
+          f"(CV {100*kin_stride.std()/kin_stride.mean():.2f}%)")
+    kin_contact_quality[kin_side] = {'n': len(kin_con),
+                                     'stance_mean': kin_stance.mean(),
+                                     'stance_sd': kin_stance.std(),
+                                     'stride_cv': 100*kin_stride.std()/kin_stride.mean()}
+
+# Stance time SD is the sharper of the two: a noisy plate blurs toe off much
+# more than it blurs the stride period, which is set by the metronome anyway.
+if len(kin_contact_quality) == 2:
+    kin_sd_l = kin_contact_quality['Left']['stance_sd']
+    kin_sd_r = kin_contact_quality['Right']['stance_sd']
+    if max(kin_sd_l, kin_sd_r) > 2.0 * min(kin_sd_l, kin_sd_r):
+        kin_worse = 'Left' if kin_sd_l > kin_sd_r else 'Right'
+        print(f"    ! {kin_worse} stance time is {max(kin_sd_l,kin_sd_r)/min(kin_sd_l,kin_sd_r):.1f}x "
+              f"more variable than the other limb ({1000*max(kin_sd_l,kin_sd_r):.0f} vs "
+              f"{1000*min(kin_sd_l,kin_sd_r):.0f} ms SD).")
+        print(f"      Check this is the walker and not the plate before reporting "
+              f"any stance-time asymmetry.")
+
+# -----------------------------------------------------------------------------
+# %% threshold sensitivity, the diagnostic that catches a chattering belt
+# -----------------------------------------------------------------------------
+# Stride time CV should be about 2-3% under a metronome. A threshold that is
+# too low reads noise as contact and inflates CV badly. Look for the plateau:
+# if CV is still falling at the chosen threshold, the threshold is too low.
+
+print("\n  threshold sweep (stride time CV should plateau near 2-3%)")
+print("    %BW   on (N)    Left n   Left CV    Right n   Right CV")
+kin_sweep_rows = []
+for kin_frac in kin_sweep_fracs:
+    kin_row = {'fraction_bw': kin_frac, 'on_n': kin_frac * kin_body_weight}
+    kin_text = f"    {100*kin_frac:4.0f}  {kin_frac*kin_body_weight:7.0f}"
+    for kin_side in ('Left', 'Right'):
+        kin_con = kin_detect_contacts(kin_grf_z[kin_side],
+                                      kin_frac * kin_body_weight,
+                                      min(kin_off_n, 0.5 * kin_frac * kin_body_weight))
+        if len(kin_con) > 2:
+            kin_sd = np.diff([h for h, _ in kin_con]) / kin_fs
+            kin_cv = 100 * kin_sd.std() / kin_sd.mean()
+        else:
+            kin_cv = np.nan
+        kin_row[f'{kin_side}_n'] = len(kin_con)
+        kin_row[f'{kin_side}_stride_cv'] = kin_cv
+        kin_text += f"   {len(kin_con):6d}   {kin_cv:7.2f}%"
+    kin_sweep_rows.append(kin_row)
+    print(kin_text)
+
+kin_threshold_sweep = pd.DataFrame(kin_sweep_rows)
+
+# -----------------------------------------------------------------------------
+# %% agreement with the existing event file
+# -----------------------------------------------------------------------------
+# The merged event file already carries GRF-derived events with a kinematic
+# fallback. Comparing against a freshly detected set shows whether the fallback
+# events are systematically offset, which matters because mixed timing sources
+# add noise to every stride interval they touch.
+
+print("\n  agreement with the merged event file")
+kin_event_check = []
+for kin_side, kin_limb in (('Left', 'L'), ('Right', 'R')):
+    kin_file_ev = events[(events['event_type'] == 'heel_strike')
+                         & (events['support_limb'] == kin_limb)]
+    kin_file_t = (kin_file_ev['frame_100hz'].to_numpy() - 1.0) / kin_kinematic_fs
+    kin_file_src = kin_file_ev['source'].to_numpy()
+    kin_file_t = kin_file_t[kin_file_t <= kin_duration]
+    kin_file_src = kin_file_src[:len(kin_file_t)]
+
+    kin_mine_t = np.array([h for h, _ in force_contacts[kin_side]]) / kin_fs
+    if not len(kin_mine_t) or not len(kin_file_t):
+        continue
+    kin_offsets = np.array([(kin_file_t - x)[np.argmin(np.abs(kin_file_t - x))]
+                            for x in kin_mine_t]) * 1000.0
+    kin_n_kinematic = int((kin_file_src != 'GRF').sum())
+    print(f"    {kin_side:5s} file {len(kin_file_t):4d} events "
+          f"({kin_n_kinematic} kinematic-sourced), detected {len(kin_mine_t):4d}, "
+          f"offset {np.median(kin_offsets):+.1f} +- {kin_offsets.std():.1f} ms")
+    kin_event_check.append({'side': kin_side, 'n_file': len(kin_file_t),
+                            'n_detected': len(kin_mine_t),
+                            'n_kinematic_source': kin_n_kinematic,
+                            'median_offset_ms': float(np.median(kin_offsets)),
+                            'offset_sd_ms': float(kin_offsets.std())})
+
+kin_event_agreement = pd.DataFrame(kin_event_check)
+
+# Any limb whose events came partly from kinematics has a mixed timing source.
+# That is worth knowing before any symmetry metric is interpreted, because it
+# makes an instrumentation difference look like a biomechanical one.
+kin_fallback = events[events['source'] != 'GRF']
+if len(kin_fallback):
+    print(f"\n  ! {len(kin_fallback)} of {len(events)} events in the file came from "
+          f"kinematics, not GRF:")
+    for (kin_lm, kin_ty), kin_grp in kin_fallback.groupby(['support_limb', 'event_type']):
+        print(f"      {kin_lm} {kin_ty}: {len(kin_grp)}")
+    print("    If these are concentrated on one limb, that limb's stance and swing")
+    print("    times carry a different timing bias from the other, and any left-right")
+    print("    comparison is partly measuring the detector rather than the walker.")
