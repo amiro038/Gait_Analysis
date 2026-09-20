@@ -1960,3 +1960,296 @@ if len(margin_of_stability):
               f"rounding difference.")
 else:
     print("  ! no steps produced a margin, check the CoM and contact inputs")
+
+# =============================================================================
+# %% Minimum foot clearance, margin of instability and the trip risk integral
+# =============================================================================
+# [Schulz2017]. Minimum foot clearance says how close the foot came to the
+# ground; it does not say what would have happened if the foot had caught. Trip
+# risk needs both, because a low clearance in a mechanically stable
+# configuration is recoverable and the same clearance in an unstable one is not.
+#
+# MINIMUM FOOT CLEARANCE
+# Schulz digitised the soles of the shoes and took the minimum distance over
+# ALL digitised points. The posed mesh is the direct equivalent, and it matters:
+# the heel and toe joint centres used previously are interior points, so they
+# measure the clearance of somewhere inside the foot rather than of the sole.
+#
+# A valid MFC event is operationally defined [Schulz2011, Schulz2017] as
+#   1. a local minimum, lower than the preceding and following two frames
+#   2. foot speed in the upper quartile for that swing, which rejects the
+#      spurious minima just after foot off
+#   3. heel clearance not smaller than toe clearance, which rejects false
+#      detections at midfoot where the two segments meet
+# If more than one candidate qualifies, the smaller is used. Swings with NO
+# qualifying local minimum return NaN rather than a global minimum -- those
+# non-MTC cycles are real and Schulz devotes a figure to them.
+#
+# MARGIN OF INSTABILITY
+# The AP margin of stability, with three modifications:
+#   1. the CONTINUOUS trajectory through swing, not the stance minimum
+#   2. u_max is the most anterior toe point on EITHER foot -- the stance toe in
+#      early swing, the swing toe in late swing -- because that is where the
+#      anterior boundary of the base of support would be if the swing foot
+#      came down
+#   3. stable (positive) values are clamped to zero and the result negated, so
+#      MoI >= 0 and larger means more destabilising
+#
+#       MoI(t) = max( -MoS_AP(t), 0 )
+#
+# TRIP RISK INTEGRAL
+#       trip risk(t) = MoI(t) / MFC(t)          both in mm, dimensionless
+#       TRI = integral of trip risk over the swing phase
+#
+# The bounds are peak acceleration to peak deceleration of the MFC point, which
+# excludes the spikes at lift-off and landing where the foot is intentionally
+# close to the ground. Time is deliberately NOT normalised, so a longer swing
+# gives a larger TRI; that is Schulz's choice and it is kept for comparability.
+#
+# Direction of the effect: higher MFC means LESS risk, higher TRI means MORE.
+# Schulz's central result is that the two move oppositely with gait speed, and
+# that TRI is the one that tracks real trip-fall risk.
+#
+# References
+#   [Schulz2011]  Schulz (2011) J Biomech 44, 1277-1284.
+#   [Schulz2017]  Schulz (2017) J Biomech 55, 107-112.
+#   [Winter1992]  Winter (1992) Phys Ther 72, 45-46.
+#   [Hof2005]     Hof, Gazendam & Sinke (2005) J Biomech 38, 1-8.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% trip risk settings
+# -----------------------------------------------------------------------------
+
+tri_floor_height    = 0.0     # treadmill belt, flat, z = 0 in the Theia frame
+tri_speed_quantile  = 0.75    # "upper quartile" foot speed gate
+tri_local_window    = 2       # frames either side that a local minimum must beat
+tri_min_clearance_mm = 1.0    # guard: MoI/MFC blows up as MFC approaches zero
+tri_swing_trim      = 0.02    # fraction of swing trimmed at each end before
+                              # searching, removes the contact frames themselves
+
+# -----------------------------------------------------------------------------
+# %% per-frame foot geometry from the mesh
+# -----------------------------------------------------------------------------
+# Three quantities per foot per frame: the lowest point above the floor, which
+# vertex that was, and the most anterior extent. All are single reductions over
+# the vertex axis.
+
+print("\n" + "-" * 74)
+print("  MINIMUM FOOT CLEARANCE AND TRIP RISK")
+print("-" * 74)
+
+foot_clearance_mesh = {}
+foot_lowest_vertex = {}
+foot_anterior_mesh = {}
+
+if mos_have_mesh:
+    for tri_side, tri_verts in mos_foot_vertices.items():
+        tri_height = tri_verts[:, :, com_vt_axis] - tri_floor_height
+        foot_clearance_mesh[tri_side] = np.nanmin(tri_height, axis=1)
+        foot_lowest_vertex[tri_side] = np.nanargmin(
+            np.where(np.isfinite(tri_height), tri_height, np.inf), axis=1)
+        foot_anterior_mesh[tri_side] = np.nanmax(
+            com_belt_sign * tri_verts[:, :, com_ap_axis], axis=1)
+        print(f"  {tri_side}: clearance {1000*np.nanmin(foot_clearance_mesh[tri_side]):.1f} "
+              f"to {1000*np.nanmax(foot_clearance_mesh[tri_side]):.0f} mm over the trial")
+else:
+    print("  ! no mesh, MFC falls back to the heel and toe joint centres, which")
+    print("    are interior points and overstate the clearance by the distance")
+    print("    from the joint centre down to the sole.")
+    for tri_side in ('Left', 'Right'):
+        tri_stack = [kinematic_positions[f'{tri_side}_{j}'][:, com_vt_axis]
+                     for j in ('Heel', 'Toes') if f'{tri_side}_{j}' in kinematic_positions]
+        if tri_stack:
+            foot_clearance_mesh[tri_side] = np.nanmin(np.vstack(tri_stack), axis=0) - tri_floor_height
+            foot_anterior_mesh[tri_side] = com_belt_sign * kinematic_positions[
+                f'{tri_side}_Toes'][:, com_ap_axis]
+
+# Anterior boundary of the base of support: the furthest forward point on
+# EITHER foot, per Schulz's definition.
+tri_n_frames = min(len(v) for v in foot_anterior_mesh.values())
+bos_anterior = np.nanmax(np.vstack([foot_anterior_mesh[s][:tri_n_frames]
+                                    for s in foot_anterior_mesh]), axis=0)
+
+# -----------------------------------------------------------------------------
+# %% the margin of instability trajectory
+# -----------------------------------------------------------------------------
+
+def tri_margin_of_instability(frames):
+    """MoI in mm over `frames`: the AP margin, clamped at zero and negated."""
+    tri_out = np.full(len(frames), np.nan)
+    for tri_i, tri_f in enumerate(frames):
+        if tri_f >= len(com_position) or tri_f >= tri_n_frames:
+            continue
+        tri_l = np.nan
+        for tri_side in ('Left', 'Right'):
+            tri_l = mos_pendulum_length(tri_side, tri_f)
+            if np.isfinite(tri_l):
+                break
+        if not np.isfinite(tri_l):
+            continue
+        tri_w0 = np.sqrt(mos_gravity / tri_l)
+        tri_xcom = (com_belt_sign * com_position[tri_f, com_ap_axis]
+                    + com_belt_sign * com_velocity_belt[tri_f, com_ap_axis] / tri_w0)
+        tri_mos = bos_anterior[tri_f] - tri_xcom
+        tri_out[tri_i] = 1000.0 * max(-tri_mos, 0.0)
+    return tri_out
+
+# -----------------------------------------------------------------------------
+# %% per swing: MFC event, MoI, trip risk and its integral
+# -----------------------------------------------------------------------------
+
+tri_rows = []
+for tri_side in ('Left', 'Right'):
+    tri_contacts = force_contacts[tri_side]
+    for tri_k in range(len(tri_contacts) - 1):
+        tri_to_frame = int(kin_sample_to_frame(tri_contacts[tri_k][1])) - 1
+        tri_hs_frame = int(kin_sample_to_frame(tri_contacts[tri_k + 1][0])) - 1
+        if tri_to_frame < 0 or tri_hs_frame >= tri_n_frames or tri_hs_frame <= tri_to_frame:
+            continue
+
+        tri_pad = int(tri_swing_trim * (tri_hs_frame - tri_to_frame))
+        tri_frames = np.arange(tri_to_frame + tri_pad, tri_hs_frame - tri_pad + 1)
+        if len(tri_frames) < 10:
+            continue
+
+        tri_clear_m = foot_clearance_mesh[tri_side][tri_frames]
+        if not np.isfinite(tri_clear_m).any():
+            continue
+
+        # --- foot speed, for the upper-quartile gate --------------------------
+        if mos_have_mesh and tri_side in mos_foot_vertices:
+            tri_centroid = np.nanmean(mos_foot_vertices[tri_side][tri_frames], axis=1)
+        else:
+            tri_centroid = kinematic_positions[f'{tri_side}_Toes'][tri_frames]
+        tri_speed = np.linalg.norm(
+            np.gradient(tri_centroid, 1.0 / kin_kinematic_fs, axis=0), axis=1)
+        tri_fast = tri_speed >= np.nanquantile(tri_speed, tri_speed_quantile)
+
+        # --- heel clearance, for the midfoot rejection ------------------------
+        tri_heel_key = f'{tri_side}_Heel'
+        if tri_heel_key in kinematic_positions:
+            tri_heel_clear = (kinematic_positions[tri_heel_key][tri_frames, com_vt_axis]
+                              - tri_floor_height)
+        else:
+            tri_heel_clear = np.full(len(tri_frames), np.inf)
+
+        # --- local minima that satisfy all three criteria ---------------------
+        tri_candidates = []
+        for tri_i in range(tri_local_window, len(tri_clear_m) - tri_local_window):
+            tri_v = tri_clear_m[tri_i]
+            if not np.isfinite(tri_v):
+                continue
+            tri_before = tri_clear_m[tri_i - tri_local_window:tri_i]
+            tri_after = tri_clear_m[tri_i + 1:tri_i + tri_local_window + 1]
+            # <= rather than <, because a minimum that falls between two
+            # samples gives two equal neighbouring values and a strict test
+            # then finds nothing at all. Requiring a strict decrease on at
+            # least one side still rules out a flat run being called a
+            # minimum, and adjacent duplicates are collapsed below.
+            if not (np.all(tri_v <= tri_before) and np.all(tri_v <= tri_after)):
+                continue
+            if not (np.any(tri_v < tri_before) and np.any(tri_v < tri_after)):
+                continue
+            if not tri_fast[tri_i]:
+                continue
+            if tri_heel_clear[tri_i] < tri_v:
+                continue
+            tri_candidates.append(tri_i)
+
+        # collapse runs of adjacent indices (a flat minimum) to their first
+        tri_candidates = [c for j, c in enumerate(tri_candidates)
+                          if j == 0 or c != tri_candidates[j - 1] + 1]
+
+        tri_has_event = len(tri_candidates) > 0
+        if tri_has_event:
+            tri_idx = min(tri_candidates, key=lambda i: tri_clear_m[i])
+            tri_mfc_m = float(tri_clear_m[tri_idx])
+            tri_mfc_frame = int(tri_frames[tri_idx])
+            tri_mfc_vertex = (int(foot_lowest_vertex[tri_side][tri_mfc_frame])
+                              if mos_have_mesh else -1)
+        else:
+            tri_idx = tri_mfc_frame = tri_mfc_vertex = -1
+            tri_mfc_m = np.nan
+
+        # --- the MFC point's own kinematics, which set the integration bounds -
+        # Schulz tracks the single point identified as the MFC point, not
+        # whichever vertex happens to be lowest at each instant; tracking the
+        # latter would make the velocity jump whenever the lowest point moved.
+        tri_t1 = tri_t2 = np.nan
+        if tri_has_event and mos_have_mesh and tri_side in mos_foot_vertices:
+            tri_point = mos_foot_vertices[tri_side][tri_frames, tri_mfc_vertex, :]
+            tri_pt_vel = np.gradient(tri_point, 1.0 / kin_kinematic_fs, axis=0)
+            tri_pt_speed = np.linalg.norm(tri_pt_vel, axis=1)
+            tri_pt_acc = np.gradient(tri_pt_speed, 1.0 / kin_kinematic_fs)
+            tri_a = int(np.nanargmax(tri_pt_acc))          # peak acceleration
+            tri_b = int(np.nanargmin(tri_pt_acc))          # peak deceleration
+            if tri_b > tri_a:
+                tri_t1, tri_t2 = tri_a, tri_b
+
+        # --- MoI, trip risk, TRI ---------------------------------------------
+        tri_moi = tri_margin_of_instability(tri_frames)
+        tri_clear_mm = np.maximum(1000.0 * tri_clear_m, tri_min_clearance_mm)
+        tri_risk = tri_moi / tri_clear_mm
+
+        tri_integral = np.nan
+        if np.isfinite(tri_t1) and np.isfinite(tri_t2):
+            tri_seg = tri_risk[int(tri_t1):int(tri_t2) + 1]
+            if np.isfinite(tri_seg).any():
+                tri_integral = float(np.nansum(tri_seg) / kin_kinematic_fs)
+
+        tri_rows.append({
+            'side': tri_side,
+            'toe_off_frame_100hz': tri_to_frame + 1,
+            'next_heel_strike_frame_100hz': tri_hs_frame + 1,
+            'swing_time': (tri_hs_frame - tri_to_frame) / kin_kinematic_fs,
+            'mfc_m': tri_mfc_m,
+            'mfc_frame_100hz': tri_mfc_frame + 1 if tri_has_event else np.nan,
+            'mfc_vertex': tri_mfc_vertex if tri_has_event else np.nan,
+            'n_local_minima': len(tri_candidates),
+            'has_mfc_event': tri_has_event,
+            'moi_peak_mm': np.nanmax(tri_moi) if np.isfinite(tri_moi).any() else np.nan,
+            'moi_mean_mm': np.nanmean(tri_moi) if np.isfinite(tri_moi).any() else np.nan,
+            'trip_risk_peak': np.nanmax(tri_risk) if np.isfinite(tri_risk).any() else np.nan,
+            'trip_risk_integral': tri_integral,
+            'integration_window_s': ((tri_t2 - tri_t1) / kin_kinematic_fs
+                                     if np.isfinite(tri_t1) else np.nan),
+        })
+
+trip_risk = pd.DataFrame(tri_rows)
+
+# -----------------------------------------------------------------------------
+# %% report
+# -----------------------------------------------------------------------------
+
+if len(trip_risk):
+    print(f"\n  {len(trip_risk)} swings")
+    for tri_side, tri_grp in trip_risk.groupby('side'):
+        tri_with = tri_grp[tri_grp['has_mfc_event']]
+        print(f"    {tri_side:5s}  MFC {1000*tri_with['mfc_m'].mean():5.1f} "
+              f"+- {1000*tri_with['mfc_m'].std():4.1f} mm  "
+              f"(5th pct {1000*tri_with['mfc_m'].quantile(0.05):5.1f} mm)")
+        print(f"           MoI peak {tri_grp['moi_peak_mm'].mean():6.1f} mm   "
+              f"TRI {tri_grp['trip_risk_integral'].mean():.4f} "
+              f"+- {tri_grp['trip_risk_integral'].std():.4f} s")
+        print(f"           {len(tri_grp) - len(tri_with)} of {len(tri_grp)} swings had "
+              f"no qualifying MFC event, "
+              f"{(tri_grp['n_local_minima'] > 1).sum()} had more than one")
+
+    # For trip risk the tail matters more than the mean: one abnormally low
+    # clearance is what catches an obstacle.
+    tri_all = trip_risk[trip_risk['has_mfc_event']]['mfc_m']
+    if len(tri_all) > 10:
+        print(f"\n  MFC distribution over all swings: median {1000*tri_all.median():.1f} mm, "
+              f"IQR {1000*tri_all.quantile(0.25):.1f}-{1000*tri_all.quantile(0.75):.1f}, "
+              f"min {1000*tri_all.min():.1f} mm")
+
+    if mos_have_mesh and trip_risk['mfc_vertex'].notna().any():
+        tri_vc = trip_risk['mfc_vertex'].dropna().astype(int).value_counts()
+        print(f"  the lowest point was one of {len(tri_vc)} distinct vertices; the most "
+              f"frequent accounted for {100*tri_vc.iloc[0]/tri_vc.sum():.0f}% of swings")
+        print(f"    A single dominant vertex means the foot presents the same point")
+        print(f"    every stride. A spread means it moves, which is Schulz's argument")
+        print(f"    against treating MFC as one fixed point on the shoe.")
+else:
+    print("  ! no swings produced a trip risk value")

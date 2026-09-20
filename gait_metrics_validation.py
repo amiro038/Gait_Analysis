@@ -301,6 +301,169 @@ def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
     return ok
 
 
+
+# %%==========================================================================
+#  Minimum foot clearance, margin of instability, trip risk integral
+# ============================================================================
+# Schulz 2017. Engineered so every piece has a known answer: a clearance
+# profile whose minimum is known, a margin of instability held at a constant
+# value, and an integration window whose bounds follow from a speed profile
+# chosen so its acceleration peaks and troughs at known fractions of swing.
+
+def _trip_risk_scenario(mfc_true=0.018, base_clear=0.060, moi_mm=12.0,
+                        pendulum=1.00, swing_s=0.45, fs=100.0, n=1200,
+                        monotonic_clearance=False):
+    """Build the synthetic trial and run the two cells over it."""
+    import pandas as pd
+    import tempfile
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    g = 9.81
+    toe_off = 100
+    heel_strike = toe_off + int(swing_s * fs)
+    swing = np.arange(toe_off, heel_strike + 1)
+    u = (swing - toe_off) / (heel_strike - toe_off)
+
+    clearance = np.full(n, base_clear)
+    if monotonic_clearance:
+        # no local minimum anywhere: a non-MTC cycle, which must return NaN
+        clearance[swing] = base_clear - (base_clear - mfc_true) * u
+    else:
+        clearance[swing] = mfc_true + (base_clear - mfc_true) * ((u - 0.5) / 0.5) ** 2
+
+    # speed profile (1-cos)/2: acceleration peaks at u=0.25, troughs at u=0.75
+    speed = np.zeros(n)
+    speed[swing] = 0.5 * (1 - np.cos(2 * np.pi * u))
+
+    def foot(side):
+        v = np.zeros((n, 2, 3))
+        if side == "Right":
+            v[:, 0, 2] = clearance
+            v[:, 1, 2] = clearance + 0.05
+            v[:, :, 1] = 0.30              # anterior extent held CONSTANT so the
+            v[:, :, 0] = 0.1               # base of support boundary is fixed
+            v[swing, 0, 0] = 0.1 + np.cumsum(speed[swing]) / fs
+            v[swing, 1, 0] = v[swing, 0, 0]
+        else:
+            v[:, :, 2] = 0.001
+            v[:, :, 1] = 0.10
+            v[:, :, 0] = -0.1
+        return v
+
+    cols, data = [], []
+    for segment, side in (("left_foot", "Left"), ("right_foot", "Right")):
+        arr = foot(side)
+        for vi in range(arr.shape[1]):
+            for ai, axis in enumerate("XYZ"):
+                cols.append((segment, vi, axis))
+                data.append(arr[:, vi, ai])
+    mesh = pd.DataFrame(np.column_stack(data),
+                        columns=pd.MultiIndex.from_tuples(
+                            cols, names=["segment", "vertex", "axis"])).sort_index(axis=1)
+    tmp = Path(tempfile.mkdtemp())
+    mesh.to_pickle(tmp / "m_mesh.pkl")
+
+    columns = {}
+    for side, ml in (("Right", 0.1), ("Left", -0.1)):
+        for joint in ("Ankle", "Toes", "Heel", "Hip"):
+            columns[f"{side}_{joint}_Position"] = np.full(n, ml)
+            columns[f"{side}_{joint}_Position.1"] = np.full(
+                n, 0.3 if side == "Right" else 0.0)
+            columns[f"{side}_{joint}_Position.2"] = (
+                np.full(n, 0.9) if joint == "Hip"
+                else np.full(n, 0.20) if joint == "Heel" else np.zeros(n))
+    com_z = np.sqrt(pendulum ** 2 - 0.1 ** 2)
+    columns["Whole_body_COG"] = np.zeros(n)
+    columns["Whole_body_COG.1"] = np.zeros(n)
+    columns["Whole_body_COG.2"] = np.full(n, com_z)
+
+    # choose the CoM velocity that puts the XCoM exactly moi_mm beyond the
+    # anterior boundary, so the margin of instability is a known constant
+    omega0 = np.sqrt(g / pendulum)
+    com_ap_velocity = (0.30 + moi_mm / 1000.0) * omega0
+
+    namespace = dict(
+        np=np, pd=pd, Path=Path, plt=plt,
+        kinematic_data=pd.DataFrame(columns), metrics_path=tmp / "m.csv",
+        com_position=np.column_stack([np.zeros(n), np.zeros(n), np.full(n, com_z)]),
+        com_velocity_belt=np.column_stack([np.zeros(n), np.full(n, com_ap_velocity),
+                                           np.zeros(n)]),
+        com_ml_axis=0, com_ap_axis=1, com_vt_axis=2, com_belt_sign=1.0,
+        kin_kinematic_fs=fs,
+        force_contacts={"Right": [(0, toe_off * 10),
+                                  (heel_strike * 10, (heel_strike + 60) * 10)],
+                        "Left": []},
+        kin_sample_to_frame=lambda s: np.asarray(s, float) * 100.0 / 1000.0 + 1.0)
+
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        load_cell("# %% Margin of stability, with the base", namespace,
+                  until="# %% Minimum foot clearance, margin of instability")
+        load_cell("# %% Minimum foot clearance, margin of instability", namespace)
+    return (namespace["trip_risk"], clearance, speed, swing, toe_off,
+            heel_strike, fs, moi_mm)
+
+
+def validate_trip_risk():
+    print("=" * 74)
+    print("  MFC, MARGIN OF INSTABILITY, TRIP RISK INTEGRAL")
+    print("=" * 74)
+
+    result, clearance, speed, swing, toe_off, heel_strike, fs, moi_mm = \
+        _trip_risk_scenario()
+    row = result.iloc[0]
+
+    mfc_sampled = float(clearance[toe_off:heel_strike + 1].min())
+    expected_frame = toe_off + (heel_strike - toe_off) // 2 + 1
+
+    # independent integral. Schulz specifies the RESULTANT velocity and
+    # acceleration of the MFC point, so the vertical motion counts too --
+    # using only the horizontal component gives a different window.
+    n = len(clearance)
+    pad = int(0.02 * (heel_strike - toe_off))
+    frames = np.arange(toe_off + pad, heel_strike - pad + 1)
+    point = np.zeros((n, 3))
+    point[:, 2] = clearance
+    point[:, 1] = 0.30
+    point[:, 0] = 0.1
+    point[swing, 0] = 0.1 + np.cumsum(speed[swing]) / fs
+    resultant = np.linalg.norm(np.gradient(point[frames], 1 / fs, axis=0), axis=1)
+    accel = np.gradient(resultant, 1 / fs)
+    a, b = int(np.argmax(accel)), int(np.argmin(accel))
+    clear_mm = np.maximum(1000 * clearance[frames], 1.0)
+    expected_tri = float(np.sum((moi_mm / clear_mm)[a:b + 1]) / fs)
+
+    print(f"  MFC            {row.mfc_m:.6f} m vs sampled minimum {mfc_sampled:.6f} "
+          f"(diff {abs(row.mfc_m - mfc_sampled):.1e})")
+    print(f"  MFC frame      {int(row.mfc_frame_100hz)} vs expected {expected_frame}")
+    print(f"  MFC vertex     {int(row.mfc_vertex)} vs expected 0 (the low vertex)")
+    print(f"  MoI peak       {row.moi_peak_mm:.3f} mm vs engineered {moi_mm:.3f}")
+    print(f"  TRI            {row.trip_risk_integral:.6f} s vs independent "
+          f"{expected_tri:.6f} (diff {abs(row.trip_risk_integral - expected_tri):.1e})")
+    print(f"  window         {row.integration_window_s:.3f} s vs independent "
+          f"{(b - a) / fs:.3f} s")
+
+    ok = (abs(row.mfc_m - mfc_sampled) < 1e-12
+          and int(row.mfc_frame_100hz) == expected_frame
+          and int(row.mfc_vertex) == 0
+          and abs(row.moi_peak_mm - moi_mm) < 1e-6
+          and abs(row.trip_risk_integral - expected_tri) < 1e-12)
+    print(f"  {'PASS' if ok else 'FAIL'}: MFC event, margin and integral all exact")
+
+    # A swing with no local minimum must return NaN, not a global minimum.
+    # Schulz gives these non-MTC cycles a figure of their own.
+    mono = _trip_risk_scenario(monotonic_clearance=True)[0].iloc[0]
+    no_event = (not bool(mono.has_mfc_event)) and np.isnan(mono.mfc_m)
+    print(f"  monotonic clearance -> has_mfc_event={mono.has_mfc_event}, "
+          f"mfc={mono.mfc_m}")
+    print(f"  {'PASS' if no_event else 'FAIL'}: a non-MTC cycle returns NaN, "
+          f"not a global minimum\n")
+    return ok and no_event
+
+
 # %%==========================================================================
 #  run everything
 # ============================================================================
@@ -309,3 +472,4 @@ if __name__ == "__main__":
     validate_com_fusion()
     validate_belt_speed()
     validate_margin_of_stability()
+    validate_trip_risk()
