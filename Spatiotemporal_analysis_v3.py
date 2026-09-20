@@ -1477,3 +1477,237 @@ if len(kin_fallback):
     print("    If these are concentrated on one limb, that limb's stance and swing")
     print("    times carry a different timing bias from the other, and any left-right")
     print("    comparison is partly measuring the detector rather than the walker.")
+
+# =============================================================================
+# %% Centre of mass: fuse the segmental model with the force plates
+# =============================================================================
+# Every margin of stability number depends on CoM VELOCITY, and velocity is the
+# weak link. There are two ways to get it and each is bad in a different band:
+#
+#   Differentiating the segmental-model CoM position is trustworthy at low
+#     frequency (it cannot drift, it is tied to the markers) but differentiation
+#     amplifies noise, so it is poor at high frequency exactly where the
+#     within-stride dynamics live.
+#
+#   Integrating the GRF is trustworthy at high frequency (force is measured
+#     directly, at 1000 Hz, with no differentiation) but any residual offset
+#     integrates into a drifting velocity, so it is poor at low frequency.
+#
+# A complementary filter takes each where it is good: low frequencies from the
+# kinematics, high frequencies from the force, with matched cutoffs so the two
+# halves sum to unity and nothing is double counted or lost.
+#
+#     v_fused = lowpass(v_kinematic) + [ v_force - lowpass(v_force) ]
+#
+# Two things make this honest here. Body mass is taken as the mean total
+# vertical GRF over the trial, so the mean of the force-derived acceleration is
+# zero BY CONSTRUCTION and there is no net velocity ramp to remove. And the
+# handrails are instrumented, so frames where the hand is loaded -- where the
+# GRF is no longer the only external force and the fusion's assumption fails --
+# are known rather than guessed at.
+#
+# The cutoff is the one real choice. Below it you are trusting the markers,
+# above it the force plates. It is set below the stride fundamental so that
+# within-stride dynamics come from the force, and the sweep printed at the end
+# shows how little the answer moves over a sensible range of cutoffs.
+#
+# References
+#   [Shimba1984]  Shimba (1984) J Biomech 17(1), 53-60. CoM from force plates.
+#   [Maus2011]    Maus et al. (2011) J Exp Biol 214(21), 3511. Combining forces
+#                 and kinematics for consistent CoM trajectories.
+#   [Hof2005]     Hof, Gazendam & Sinke (2005) J Biomech 38, 1-8.
+# =============================================================================
+
+from scipy.signal import butter, filtfilt
+
+# -----------------------------------------------------------------------------
+# %% CoM settings
+# -----------------------------------------------------------------------------
+
+com_crossover_hz   = 0.5    # complementary filter cutoff, see the sweep below
+com_filter_order   = 2
+com_antialias_hz   = 40.0   # lowpass before decimating 1000 Hz -> 100 Hz
+com_belt_speed_ms  = 1.3    # nominal; measured from the kinematics below
+com_stance_window  = (0.30, 0.70)   # fraction of stance used as "foot flat"
+com_cutoff_sweep   = [0.25, 0.5, 1.0, 2.0]
+
+# Which axis is which. The force file and the Theia export agree: X is
+# mediolateral, Y is anterior-posterior, Z is vertical.
+com_ml_axis, com_ap_axis, com_vt_axis = 0, 1, 2
+
+# -----------------------------------------------------------------------------
+# %% force-derived CoM acceleration, resampled to the kinematic rate
+# -----------------------------------------------------------------------------
+# Newton's second law on the whole body: the sum of the external forces equals
+# mass times CoM acceleration. Gravity is already in the measured vertical GRF
+# as the mean, so subtracting body weight leaves the acceleration.
+
+com_grf_total = np.column_stack([
+    force_data[f'Left belt_Force_{a}'].to_numpy()
+    + force_data[f'Right belt_Force_{a}'].to_numpy() for a in 'XYZ'])
+
+# Over a steady treadmill trial the walker has no net acceleration in ANY axis,
+# so the mean of each force channel is a zero offset rather than physiology.
+# Vertical is handled by taking body weight as that mean; the horizontal
+# channels get the same treatment for the same reason. On this hardware the
+# horizontal offsets are ~3 N, which is small but integrates to metres per
+# second of spurious velocity if it is left in. The complementary high-pass
+# would hide it, but removing it explicitly is honest and makes the three axes
+# consistent.
+com_force_offset = com_grf_total.mean(axis=0)
+com_force_offset[com_vt_axis] = kin_body_weight        # vertical mean IS mg
+print("\n  force channel offsets removed (N): "
+      f"ML {com_force_offset[com_ml_axis]:+.2f}, "
+      f"AP {com_force_offset[com_ap_axis]:+.2f}, "
+      f"VT {com_force_offset[com_vt_axis]:+.1f} (= body weight)")
+if max(abs(com_force_offset[com_ml_axis]), abs(com_force_offset[com_ap_axis])) > 10.0:
+    print("    ! a horizontal offset over 10 N is large. Check the plate zeroing;")
+    print("      it biases propulsive and braking impulses, which are not high-passed.")
+
+com_accel_force_1k = (com_grf_total - com_force_offset) / kin_body_mass
+
+def com_decimate(signal_1k, factor=None, antialias_hz=None, fs=None):
+    """1000 Hz -> 100 Hz with an anti-alias lowpass first.
+
+    Taking every 10th sample without filtering folds everything above 50 Hz
+    back into the band we care about. Heel strike transients are broadband, so
+    this is not a hypothetical problem.
+    """
+    fs = kin_fs if fs is None else fs
+    antialias_hz = com_antialias_hz if antialias_hz is None else antialias_hz
+    factor = int(round(fs / kin_kinematic_fs)) if factor is None else factor
+    com_b, com_a = butter(4, antialias_hz / (fs / 2), 'low')
+    com_smooth = filtfilt(com_b, com_a, signal_1k, axis=0)
+    return com_smooth[::factor]
+
+com_accel_force = com_decimate(com_accel_force_1k)
+handrail_contact_100hz = com_decimate(handrail_contact.astype(float)) > 0.05
+
+print("\n" + "-" * 74)
+print("  CENTRE OF MASS")
+print("-" * 74)
+print(f"  GRF-derived CoM acceleration: {com_accel_force.shape[0]} samples at "
+      f"{kin_kinematic_fs:.0f} Hz")
+print(f"    mean {com_accel_force.mean(axis=0)} m/s^2  (should be ~0 in all axes)")
+
+# -----------------------------------------------------------------------------
+# %% kinematic CoM, and the measured belt speed
+# -----------------------------------------------------------------------------
+
+com_have_kinematics = 'Whole_body_COG' in kinematic_data.columns
+if com_have_kinematics:
+    com_pos_kin = np.column_stack([
+        kinematic_data['Whole_body_COG'].to_numpy(),
+        kinematic_data['Whole_body_COG.1'].to_numpy(),
+        kinematic_data['Whole_body_COG.2'].to_numpy()])
+    print(f"  kinematic CoM: {len(com_pos_kin)} frames, "
+          f"{100*np.isfinite(com_pos_kin).all(axis=1).mean():.1f}% finite")
+else:
+    com_pos_kin = None
+    print("  ! no Whole_body_COG column, the fusion cannot run for this trial")
+
+# The belt speed CANNOT be read off the centre of pressure. During stance the
+# CoP travels heel to toe ALONG the foot at the same time as the foot travels
+# backwards WITH the belt, and the CoP alone cannot separate the two. The foot
+# itself can: during foot-flat mid-stance it is stationary relative to the belt,
+# so its velocity in the lab frame IS the belt velocity.
+com_belt_measured = np.nan
+com_belt_samples = []
+if 'Left_Heel_Position.1' in kinematic_data.columns:
+    for com_side, com_col in (('Left', 'Left_Heel_Position.1'),
+                              ('Right', 'Right_Heel_Position.1')):
+        com_heel_ap = kinematic_data[com_col].to_numpy()
+        for com_h, com_t in force_contacts[com_side]:
+            com_a = int(kin_sample_to_frame(com_h + com_stance_window[0] * (com_t - com_h))) - 1
+            com_b = int(kin_sample_to_frame(com_h + com_stance_window[1] * (com_t - com_h))) - 1
+            if com_a < 0 or com_b >= len(com_heel_ap) or com_b - com_a < 5:
+                continue
+            com_seg = com_heel_ap[com_a:com_b]
+            if not np.isfinite(com_seg).all():
+                continue
+            com_belt_samples.append(
+                np.polyfit(np.arange(len(com_seg)) / kin_kinematic_fs, com_seg, 1)[0])
+
+if len(com_belt_samples) > 10:
+    com_belt_samples = np.array(com_belt_samples)
+    com_belt_measured = float(np.median(np.abs(com_belt_samples)))
+    print(f"  belt speed measured from heel AP velocity during foot-flat: "
+          f"{com_belt_measured:.3f} m/s "
+          f"(IQR {np.percentile(np.abs(com_belt_samples), 25):.3f}-"
+          f"{np.percentile(np.abs(com_belt_samples), 75):.3f}, "
+          f"n={len(com_belt_samples)} stances)")
+    com_belt_sign = -np.sign(np.median(com_belt_samples))   # walking direction
+    if abs(com_belt_measured - com_belt_speed_ms) > 0.1:
+        print(f"    ! that differs from the configured {com_belt_speed_ms:.2f} m/s by "
+              f"{abs(com_belt_measured - com_belt_speed_ms):.3f} m/s. The measured "
+              f"value is used; check the protocol if the gap is large.")
+    com_belt_speed_used = com_belt_measured
+else:
+    com_belt_sign = 1.0
+    com_belt_speed_used = com_belt_speed_ms
+    print(f"  ! could not measure belt speed from the kinematics, using the "
+          f"configured {com_belt_speed_ms:.2f} m/s")
+
+# -----------------------------------------------------------------------------
+# %% the complementary fusion
+# -----------------------------------------------------------------------------
+
+def com_fuse_velocity(position_kin, accel_force, crossover_hz=None,
+                      fs=None, order=None):
+    """Complementary blend of a differentiated position and an integrated force.
+
+    Returns velocity in the same frame as `position_kin`. The two branches are
+    filtered with the SAME cutoff and summed, so their transfer functions add
+    to one at every frequency: nothing is counted twice and nothing is lost.
+    """
+    fs = kin_kinematic_fs if fs is None else fs
+    crossover_hz = com_crossover_hz if crossover_hz is None else crossover_hz
+    order = com_filter_order if order is None else order
+
+    com_n = min(len(position_kin), len(accel_force))
+    com_p, com_acc = position_kin[:com_n], accel_force[:com_n]
+
+    com_v_kin = np.gradient(com_p, 1.0 / fs, axis=0)
+    com_v_force = np.cumsum(com_acc, axis=0) / fs
+    com_v_force -= com_v_force.mean(axis=0)
+
+    com_b, com_a_coef = butter(order, crossover_hz / (fs / 2), 'low')
+    com_low = filtfilt(com_b, com_a_coef, com_v_kin, axis=0)
+    com_force_low = filtfilt(com_b, com_a_coef, com_v_force, axis=0)
+    return com_low + (com_v_force - com_force_low)
+
+if com_have_kinematics:
+    com_n_use = min(len(com_pos_kin), len(com_accel_force))
+    com_velocity_kin = np.gradient(com_pos_kin[:com_n_use], 1.0 / kin_kinematic_fs, axis=0)
+    com_velocity = com_fuse_velocity(com_pos_kin, com_accel_force)
+    com_position = com_pos_kin[:com_n_use]
+
+    # In the belt frame the walker is travelling forward at belt speed even
+    # though the lab-frame mean is ~0. Every AP margin needs this.
+    com_velocity_belt = com_velocity.copy()
+    com_velocity_belt[:, com_ap_axis] += com_belt_sign * com_belt_speed_used
+
+    print(f"  fused at {com_crossover_hz:.2f} Hz crossover")
+    print(f"    lab-frame AP velocity: kinematic mean {com_velocity_kin[:, com_ap_axis].mean():+.3f}, "
+          f"fused {com_velocity[:, com_ap_axis].mean():+.3f} m/s (both ~0 on a treadmill)")
+    print(f"    belt-frame AP velocity mean {com_velocity_belt[:, com_ap_axis].mean():+.3f} m/s")
+
+    # How much did the fusion actually change things? Reported as the RMS
+    # difference from the kinematics-only velocity, per axis.
+    com_delta = com_velocity - com_velocity_kin
+    print(f"    RMS change vs differentiating the markers alone: "
+          f"ML {1000*com_delta[:, 0].std():.1f}, AP {1000*com_delta[:, 1].std():.1f}, "
+          f"VT {1000*com_delta[:, 2].std():.1f} mm/s")
+
+    print("\n  crossover sensitivity (AP velocity RMS difference from the 0.5 Hz result)")
+    for com_fc in com_cutoff_sweep:
+        com_alt = com_fuse_velocity(com_pos_kin, com_accel_force, crossover_hz=com_fc)
+        com_d = (com_alt - com_velocity)[:, com_ap_axis]
+        print(f"    {com_fc:4.2f} Hz: {1000*com_d.std():6.1f} mm/s")
+
+    if handrail_contact_100hz[:com_n_use].any():
+        print(f"  ! {handrail_contact_100hz[:com_n_use].sum()} frames have handrail "
+              f"contact; the GRF is not the only external force there and the "
+              f"fused velocity is unreliable on those frames.")
+else:
+    com_velocity = com_velocity_belt = com_position = None
