@@ -1711,3 +1711,252 @@ if com_have_kinematics:
               f"fused velocity is unreliable on those frames.")
 else:
     com_velocity = com_velocity_belt = com_position = None
+
+# =============================================================================
+# %% Margin of stability, with the base of support taken from the foot meshes
+# =============================================================================
+# [Hof2005]:  XCoM = x + v / omega_0,   omega_0 = sqrt(g / l),   MoS = u_max - XCoM
+#
+# The CoM is not just somewhere, it is going somewhere. If active control
+# stopped now, inverted pendulum dynamics would carry the body to the
+# extrapolated CoM. MoS is how much base of support is left beyond that point.
+#
+# What changes here is u_max. It is normally the ankle joint centre or a toe
+# marker, both of which are points INSIDE the foot, several centimetres from
+# the border that would actually stop you falling. The posed foot meshes give
+# the real boundary, and both are computed so the difference is quantified
+# rather than assumed away.
+#
+# Sign convention, chosen so it does not depend on which way the lab axes point:
+#   ML  u_max is the most LATERAL vertex of the stance foot, where lateral
+#       means away from the other foot. Positive MoS = XCoM inside the foot.
+#   AP  u_max is the most ANTERIOR vertex, anterior being the direction of
+#       travel, which is measured from the belt not assumed.
+#
+# Two readings are reported per step, because they answer different questions:
+#   at foot contact      the conventional value, how much margin the step bought
+#   minimum over stance  the worst moment within the step [McAndrewYoung2012]
+#
+# AP MoS is routinely NEGATIVE in walking and that is not a pathology. Walking
+# is controlled falling forward; a negative anterior margin is what propulsion
+# looks like. Only the ML margin reads as "how close to falling sideways".
+#
+# References
+#   [Hof2005]             Hof, Gazendam & Sinke (2005) J Biomech 38, 1-8.
+#   [Hof2008]             Hof (2008) Hum Mov Sci 27(1), 112-125.
+#   [McAndrewYoung2012]   McAndrew Young & Dingwell (2012) Gait Posture 36(2), 219-224.
+#   [Hak2013]             Hak et al. (2013) PLoS One 8(12), e82842.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% margin of stability settings
+# -----------------------------------------------------------------------------
+
+mos_gravity          = 9.81
+mos_pendulum_mode    = 'per_frame'   # 'per_frame' CoM-to-ankle, or 'leg_length'
+mos_mesh_pickle_suffix = '_mesh.pkl' # written next to the metrics csv by apply_binding
+mos_stance_fraction  = (0.0, 1.0)    # portion of stance searched for the minimum
+mos_report_marker_bos = True         # also compute the marker-based boundary
+
+# -----------------------------------------------------------------------------
+# %% load the posed foot meshes for this trial
+# -----------------------------------------------------------------------------
+# apply_binding.py writes <TRIAL>_mesh.pkl beside the metrics csv: a DataFrame
+# indexed by frame with a (segment, vertex, axis) column MultiIndex, in Theia
+# world metres. If it is missing the cell still runs, on markers alone, and
+# says so rather than silently changing what it measures.
+
+mos_mesh_path = metrics_path.with_name(metrics_path.stem + mos_mesh_pickle_suffix)
+
+print("\n" + "-" * 74)
+print("  MARGIN OF STABILITY")
+print("-" * 74)
+
+if mos_mesh_path.exists():
+    mesh_positions = pd.read_pickle(mos_mesh_path)
+    mos_have_mesh = True
+    print(f"  mesh: {mos_mesh_path.name}  {mesh_positions.shape[0]} frames, "
+          f"{mesh_positions.shape[1] // 3} vertices")
+else:
+    mesh_positions = None
+    mos_have_mesh = False
+    print(f"  ! {mos_mesh_path.name} not found. Falling back to marker-based")
+    print(f"    boundaries, which sit inside the foot and will overstate the")
+    print(f"    margin. Run apply_binding.py on this trial to fix that.")
+
+# Per-foot vertex blocks, as plain arrays (frames, vertices, 3), so the
+# per-frame extreme is one vectorised reduction rather than a pandas lookup.
+mos_foot_vertices = {}
+if mos_have_mesh:
+    for mos_seg, mos_side in (('left_foot', 'Left'), ('right_foot', 'Right')):
+        if mos_seg in mesh_positions.columns.get_level_values('segment'):
+            mos_block = mesh_positions[mos_seg]
+            mos_n_vert = mos_block.shape[1] // 3
+            mos_foot_vertices[mos_side] = (mos_block.to_numpy()
+                                           .reshape(len(mos_block), mos_n_vert, 3))
+            print(f"    {mos_side}: {mos_n_vert} vertices")
+
+# -----------------------------------------------------------------------------
+# %% pull the joint positions the cell needs into plain arrays
+# -----------------------------------------------------------------------------
+
+kinematic_positions = {}
+for mos_joint in ('Ankle', 'Toes', 'Heel', 'Hip', 'Knee'):
+    for mos_side in ('Left', 'Right'):
+        mos_col = f'{mos_side}_{mos_joint}_Position'
+        if mos_col in kinematic_data.columns:
+            kinematic_positions[f'{mos_side}_{mos_joint}'] = np.column_stack([
+                kinematic_data[mos_col].to_numpy(),
+                kinematic_data[f'{mos_col}.1'].to_numpy(),
+                kinematic_data[f'{mos_col}.2'].to_numpy()])
+
+# A constant fallback pendulum length, for the sensitivity comparison
+mos_leg_length = np.nan
+if 'Left_Hip' in kinematic_positions and 'Left_Ankle' in kinematic_positions:
+    mos_leg_length = float(np.nanmedian(np.linalg.norm(
+        kinematic_positions['Left_Hip'] - kinematic_positions['Left_Ankle'], axis=1)))
+    print(f"  leg length (hip to ankle, median): {mos_leg_length:.3f} m")
+
+# -----------------------------------------------------------------------------
+# %% geometry helpers
+# -----------------------------------------------------------------------------
+
+def mos_lateral_unit(stance_side, frame):
+    """Unit vector in the ground plane pointing laterally for the stance foot.
+
+    Defined as the direction from the contralateral foot toward the stance
+    foot, so it does not depend on whether lab +X points left or right, and it
+    follows the walker if the treadmill heading drifts.
+    """
+    mos_other = 'Right' if stance_side == 'Left' else 'Left'
+    mos_a = kinematic_positions[f'{mos_other}_Ankle'][frame]
+    mos_b = kinematic_positions[f'{stance_side}_Ankle'][frame]
+    mos_v = np.array([mos_b[com_ml_axis] - mos_a[com_ml_axis],
+                      mos_b[com_ap_axis] - mos_a[com_ap_axis]])
+    mos_n = np.linalg.norm(mos_v)
+    if not np.isfinite(mos_n) or mos_n < 1e-6:
+        return np.array([1.0, 0.0])
+    return mos_v / mos_n
+
+
+def mos_boundary(stance_side, frame, direction_2d):
+    """Furthest extent of the stance foot along `direction_2d`, in metres.
+
+    Uses the mesh when it is available -- the real surface boundary -- and the
+    ankle and toe markers otherwise, which are interior points.
+    """
+    if mos_have_mesh and stance_side in mos_foot_vertices:
+        mos_v = mos_foot_vertices[stance_side]
+        if frame < len(mos_v):
+            mos_pts = mos_v[frame][:, [com_ml_axis, com_ap_axis]]
+            if np.isfinite(mos_pts).all():
+                return float(np.max(mos_pts @ direction_2d))
+    mos_cands = []
+    for mos_name in ('Ankle', 'Toes', 'Heel'):
+        mos_key = f'{stance_side}_{mos_name}'
+        if mos_key in kinematic_positions:
+            mos_p = kinematic_positions[mos_key][frame]
+            if np.isfinite(mos_p).all():
+                mos_cands.append([mos_p[com_ml_axis], mos_p[com_ap_axis]])
+    if not mos_cands:
+        return np.nan
+    return float(np.max(np.array(mos_cands) @ direction_2d))
+
+
+def mos_pendulum_length(stance_side, frame):
+    """Effective pendulum length: CoM height above the stance ankle."""
+    if mos_pendulum_mode == 'leg_length' and np.isfinite(mos_leg_length):
+        return mos_leg_length
+    mos_ank = kinematic_positions[f'{stance_side}_Ankle'][frame]
+    if not np.isfinite(mos_ank).all() or frame >= len(com_position):
+        return np.nan
+    mos_l = np.linalg.norm(com_position[frame] - mos_ank)
+    return mos_l if mos_l > 0.2 else np.nan
+
+# -----------------------------------------------------------------------------
+# %% the margin, per step
+# -----------------------------------------------------------------------------
+
+mos_rows = []
+for mos_side in ('Left', 'Right'):
+    for mos_hs_sample, mos_to_sample in force_contacts[mos_side]:
+        mos_hs = int(kin_sample_to_frame(mos_hs_sample)) - 1
+        mos_to = int(kin_sample_to_frame(mos_to_sample)) - 1
+        if mos_hs < 0 or mos_to >= len(com_velocity_belt) or mos_to <= mos_hs:
+            continue
+
+        mos_a = mos_hs + int(mos_stance_fraction[0] * (mos_to - mos_hs))
+        mos_b = mos_hs + int(mos_stance_fraction[1] * (mos_to - mos_hs))
+        mos_ml_series, mos_ap_series = [], []
+        mos_ml_marker_series = []
+
+        for mos_f in range(mos_a, min(mos_b + 1, len(com_position))):
+            mos_l = mos_pendulum_length(mos_side, mos_f)
+            if not np.isfinite(mos_l):
+                mos_ml_series.append(np.nan); mos_ap_series.append(np.nan)
+                mos_ml_marker_series.append(np.nan); continue
+            mos_w0 = np.sqrt(mos_gravity / mos_l)
+
+            # extrapolated CoM in the ground plane, belt-corrected in AP
+            mos_xcom = np.array([
+                com_position[mos_f, com_ml_axis]
+                + com_velocity_belt[mos_f, com_ml_axis] / mos_w0,
+                com_position[mos_f, com_ap_axis]
+                + com_velocity_belt[mos_f, com_ap_axis] / mos_w0])
+
+            mos_lat = mos_lateral_unit(mos_side, mos_f)
+            mos_ml_series.append(mos_boundary(mos_side, mos_f, mos_lat)
+                                 - float(mos_xcom @ mos_lat))
+
+            mos_fwd = np.array([0.0, com_belt_sign])
+            mos_ap_series.append(mos_boundary(mos_side, mos_f, mos_fwd)
+                                 - float(mos_xcom @ mos_fwd))
+
+            if mos_report_marker_bos and mos_have_mesh:
+                mos_ank = kinematic_positions[f'{mos_side}_Ankle'][mos_f]
+                mos_ml_marker_series.append(
+                    float(np.array([mos_ank[com_ml_axis],
+                                    mos_ank[com_ap_axis]]) @ mos_lat)
+                    - float(mos_xcom @ mos_lat))
+
+        mos_ml_series = np.array(mos_ml_series, float)
+        mos_ap_series = np.array(mos_ap_series, float)
+        if not np.isfinite(mos_ml_series).any():
+            continue
+
+        mos_rows.append({
+            'side': mos_side,
+            'heel_strike_frame_100hz': mos_hs + 1,
+            'toe_off_frame_100hz': mos_to + 1,
+            'mos_ml_contact': mos_ml_series[0],
+            'mos_ml_min': np.nanmin(mos_ml_series),
+            'mos_ap_contact': mos_ap_series[0],
+            'mos_ap_min': np.nanmin(mos_ap_series),
+            'mos_ml_contact_marker_bos': (np.array(mos_ml_marker_series)[0]
+                                          if mos_ml_marker_series else np.nan),
+            'pendulum_length': mos_pendulum_length(mos_side, mos_hs),
+        })
+
+margin_of_stability = pd.DataFrame(mos_rows)
+
+if len(margin_of_stability):
+    print(f"\n  {len(margin_of_stability)} steps")
+    for mos_side, mos_grp in margin_of_stability.groupby('side'):
+        print(f"    {mos_side:5s}  ML at contact {1000*mos_grp['mos_ml_contact'].mean():6.1f} "
+              f"+- {1000*mos_grp['mos_ml_contact'].std():5.1f} mm   "
+              f"ML min over stance {1000*mos_grp['mos_ml_min'].mean():6.1f} mm")
+        print(f"           AP at contact {1000*mos_grp['mos_ap_contact'].mean():6.1f} "
+              f"+- {1000*mos_grp['mos_ap_contact'].std():5.1f} mm   "
+              f"(negative is normal, walking falls forward)")
+
+    if mos_have_mesh and margin_of_stability['mos_ml_contact_marker_bos'].notna().any():
+        mos_diff = 1000 * (margin_of_stability['mos_ml_contact']
+                           - margin_of_stability['mos_ml_contact_marker_bos'])
+        print(f"\n  mesh boundary vs ankle joint centre: the mesh gives a margin "
+              f"{mos_diff.mean():.1f} +- {mos_diff.std():.1f} mm larger")
+        print(f"    That gap is the distance from the ankle joint centre out to the")
+        print(f"    real lateral border of the shoe. Against a margin of "
+              f"{1000*margin_of_stability['mos_ml_contact'].mean():.0f} mm it is not a "
+              f"rounding difference.")
+else:
+    print("  ! no steps produced a margin, check the CoM and contact inputs")

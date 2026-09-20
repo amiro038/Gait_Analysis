@@ -50,6 +50,21 @@ def load_function(name, script=None, extra=None):
     return namespace[name]
 
 
+def load_cell(marker, namespace, script=None, until=None):
+    """Exec one `# %%` cell of the analysis script against a prepared namespace.
+
+    Used where the thing under test is the cell body itself rather than a
+    function inside it. Same principle as load_function: run the shipped code,
+    not a copy.
+    """
+    script = ANALYSIS_SCRIPT if script is None else script
+    src = io.open(script, encoding="utf-8").read()
+    start = src.index(marker)
+    stop = src.index(until, start) if until else len(src)
+    exec(compile(src[start:stop], script, "exec"), namespace)
+    return namespace
+
+
 def rms(x, axis=0):
     return np.sqrt(np.mean(np.square(x), axis=axis))
 
@@ -188,9 +203,109 @@ def validate_belt_speed(true_belt=1.3, fs=100.0, stance_s=0.69, stride_s=1.11,
 
 
 # %%==========================================================================
+#  Margin of stability
+# ============================================================================
+# Analytic check: a single stance with a known CoM state, a known pendulum
+# length and a foot whose lateral border is at a known place, so MoS can be
+# worked out by hand and compared against what the cell produces.
+
+def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
+                                 com_velocity_ml=0.30, pendulum_length=1.00,
+                                 n_frames=400, fs=100.0, g=9.81):
+    import pandas as pd
+    import tempfile
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    omega0 = np.sqrt(g / pendulum_length)
+    xcom_ml = com_velocity_ml / omega0
+    expected_ml = foot_lateral_edge - xcom_ml
+    expected_marker = ankle_ml - xcom_ml
+
+    print("=" * 74)
+    print("  MARGIN OF STABILITY")
+    print("=" * 74)
+    print(f"  by hand: omega0 = sqrt({g}/{pendulum_length}) = {omega0:.5f} rad/s")
+    print(f"           XCoM   = 0 + {com_velocity_ml}/{omega0:.5f} = {xcom_ml:.5f} m")
+    print(f"           MoS_ML = {foot_lateral_edge} - {xcom_ml:.5f} = {expected_ml:.5f} m")
+
+    # CoM placed so that |CoM - ankle| is exactly the pendulum length
+    com_z = np.sqrt(pendulum_length ** 2 - ankle_ml ** 2)
+
+    columns = {}
+    for side, ml in (("Right", ankle_ml), ("Left", -ankle_ml)):
+        for joint in ("Ankle", "Toes", "Heel", "Hip"):
+            columns[f"{side}_{joint}_Position"] = np.full(n_frames, ml)
+            columns[f"{side}_{joint}_Position.1"] = np.zeros(n_frames)
+            columns[f"{side}_{joint}_Position.2"] = (
+                np.full(n_frames, 0.9) if joint == "Hip" else np.zeros(n_frames))
+    columns["Whole_body_COG"] = np.zeros(n_frames)
+    columns["Whole_body_COG.1"] = np.zeros(n_frames)
+    columns["Whole_body_COG.2"] = np.full(n_frames, com_z)
+
+    def foot_box(lo, hi):
+        grid = np.array([[x, y, 0.01]
+                         for x in np.linspace(lo, hi, 9)
+                         for y in np.linspace(-0.10, 0.15, 9)])
+        return np.repeat(grid[None, :, :], n_frames, axis=0)
+
+    blocks = {"left_foot": foot_box(-foot_lateral_edge, -0.06),
+              "right_foot": foot_box(0.06, foot_lateral_edge)}
+    cols, data = [], []
+    for segment, arr in blocks.items():
+        for v in range(arr.shape[1]):
+            for ai, axis in enumerate("XYZ"):
+                cols.append((segment, v, axis))
+                data.append(arr[:, v, ai])
+    mesh = pd.DataFrame(np.column_stack(data),
+                        columns=pd.MultiIndex.from_tuples(
+                            cols, names=["segment", "vertex", "axis"]))
+    mesh = mesh.sort_index(axis=1)
+
+    tmp = Path(tempfile.mkdtemp())
+    mesh.to_pickle(tmp / "metrics_mesh.pkl")
+
+    namespace = dict(
+        np=np, pd=pd, Path=Path, plt=plt,
+        kinematic_data=pd.DataFrame(columns), metrics_path=tmp / "metrics.csv",
+        com_position=np.column_stack([np.zeros(n_frames), np.zeros(n_frames),
+                                      np.full(n_frames, com_z)]),
+        com_velocity_belt=np.column_stack([np.full(n_frames, com_velocity_ml),
+                                           np.zeros(n_frames), np.zeros(n_frames)]),
+        com_ml_axis=0, com_ap_axis=1, com_vt_axis=2, com_belt_sign=1.0,
+        force_contacts={"Right": [(1000, 1600)], "Left": []},
+        kin_sample_to_frame=lambda s: np.asarray(s, float) * 100.0 / 1000.0 + 1.0)
+
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        load_cell("# %% Margin of stability, with the base", namespace)
+    result = namespace["margin_of_stability"]
+
+    got_mesh = float(result["mos_ml_contact"].iloc[0])
+    got_marker = float(result["mos_ml_contact_marker_bos"].iloc[0])
+    got_length = float(result["pendulum_length"].iloc[0])
+
+    print(f"  cell:    MoS_ML = {got_mesh:.5f} m   (diff {abs(got_mesh-expected_ml):.2e})")
+    print(f"           marker-BoS margin {got_marker:.5f} m "
+          f"(expected {expected_marker:.5f})")
+    print(f"           pendulum length {got_length:.5f} m "
+          f"(expected {pendulum_length:.5f})")
+    print(f"           mesh vs marker gap {1000*(got_mesh-got_marker):.1f} mm "
+          f"(built in: {1000*(foot_lateral_edge-ankle_ml):.1f} mm)")
+    ok = (abs(got_mesh - expected_ml) < 1e-6
+          and abs(got_marker - expected_marker) < 1e-6
+          and abs(got_length - pendulum_length) < 1e-6)
+    print(f"  {'PASS' if ok else 'FAIL'}: margin, boundary and pendulum length exact\n")
+    return ok
+
+
+# %%==========================================================================
 #  run everything
 # ============================================================================
 
 if __name__ == "__main__":
     validate_com_fusion()
     validate_belt_speed()
+    validate_margin_of_stability()
