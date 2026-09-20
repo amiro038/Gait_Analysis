@@ -584,6 +584,99 @@ def validate_dfa(lengths=(486, 756), hursts=(0.5, 0.7, 0.9, 0.95),
     return ok
 
 
+
+# %%==========================================================================
+#  Entropy
+# ============================================================================
+# Sample entropy has a CLOSED FORM for white noise, which makes this one of the
+# few estimators here that can be checked against an exact answer rather than
+# an ordering. For a z-scored iid Gaussian series, two independent points
+# differ by N(0, 2), so
+#
+#     P(|x_i - x_j| <= r) = 2 * Phi(r / sqrt(2)) - 1
+#
+# Extending a match from m to m+1 points adds one more independent comparison,
+# so A/B = P and SampEn = -ln(P) for any m. Anything else is a bug.
+
+def validate_entropy(seed=0):
+    from scipy.spatial import cKDTree
+    from scipy.stats import norm
+
+    extra = dict(cKDTree=cKDTree, ent_m=2, ent_r=0.2, ent_normalise=True,
+                 ent_mse_scales=10)
+    counts = load_function("ent_match_counts", extra=extra)
+    extra["ent_match_counts"] = counts
+    sampen = load_function("ent_sample_entropy", extra=extra)
+    coarse = load_function("ent_coarse_grain", extra=extra)
+    extra["ent_coarse_grain"] = coarse
+    rcmse = load_function("ent_rcmse", extra=extra)
+    rng = np.random.default_rng(seed)
+
+    print("=" * 74)
+    print("  ENTROPY")
+    print("=" * 74)
+
+    # 1. the exact check
+    print("  white noise against the closed form -ln(P), N=5000, 10 repeats")
+    worst = 0.0
+    for r in (0.15, 0.20, 0.25, 0.30):
+        exact = -np.log(2 * norm.cdf(r / np.sqrt(2)) - 1)
+        got = [sampen(rng.normal(size=5000), m=2, r=r) for _ in range(10)]
+        diff = abs(np.mean(got) - exact)
+        worst = max(worst, diff)
+        print(f"    r={r:.2f}   exact {exact:.4f}   measured {np.mean(got):.4f} "
+              f"+- {np.std(got):.4f}   diff {diff:.4f}")
+
+    # 2. the ordering: regular < chaotic < random
+    n = 4000
+    sine = np.sin(2 * np.pi * np.arange(n) / 50)
+    x = 0.4
+    logistic = []
+    for _ in range(n + 1000):
+        x = 4 * x * (1 - x)
+        logistic.append(x)
+    logistic = np.array(logistic[1000:])
+    white = rng.normal(size=n)
+
+    e_sine, e_logi, e_white = (sampen(sine), sampen(logistic), sampen(white))
+    print(f"\n  ordering at m=2, r=0.2, N={n}")
+    print(f"    sine (periodic)          {e_sine:.4f}")
+    print(f"    logistic map (chaotic)   {e_logi:.4f}")
+    print(f"    white noise (random)     {e_white:.4f}")
+    ordered = e_sine < e_logi < e_white
+
+    # 3. multiscale: white noise must fall away, 1/f must hold up
+    def pink_noise(n, rng):
+        f = np.fft.rfftfreq(n)
+        f[0] = f[1]
+        spectrum = (rng.normal(size=len(f)) + 1j * rng.normal(size=len(f))) / np.sqrt(f)
+        return np.fft.irfft(spectrum, n)
+
+    m = 12000
+    curve_white = rcmse(rng.normal(size=m))
+    curve_pink = pink_noise(m, rng)
+    curve_pink = rcmse(curve_pink)
+    print(f"\n  refined composite MSE, N={m}")
+    print("    scale :", " ".join(f"{s:5d}" for s in range(1, 11)))
+    print("    white :", " ".join(f"{v:5.2f}" for v in curve_white))
+    print("    1/f   :", " ".join(f"{v:5.2f}" for v in curve_pink))
+    fall_white = curve_white[0] - curve_white[-1]
+    fall_pink = abs(curve_pink[0] - curve_pink[-1])
+    area_white, area_pink = np.nansum(curve_white), np.nansum(curve_pink)
+    print(f"    white falls {fall_white:.2f} across scales; 1/f moves {fall_pink:.2f}")
+    print(f"    area: white {area_white:.2f}, 1/f {area_pink:.2f}")
+    print(f"    Note white noise has the HIGHER single-scale entropy "
+          f"({curve_white[0]:.2f} vs {curve_pink[0]:.2f})")
+    print(f"    but the LOWER area. That is exactly why the curve is the")
+    print(f"    complexity measure and the scale-1 value is not.")
+
+    mse_ok = fall_white > 0.5 and fall_pink < 0.2 and area_pink > area_white
+    ok = worst < 0.02 and ordered and mse_ok
+    print(f"  {'PASS' if ok else 'FAIL'}: closed form to {worst:.4f}, ordering "
+          f"correct, MSE separates noise from structure\n")
+    return ok
+
+
 # %%==========================================================================
 #  run everything
 # ============================================================================
@@ -594,3 +687,4 @@ if __name__ == "__main__":
     validate_margin_of_stability()
     validate_trip_risk()
     validate_dfa()
+    validate_entropy()

@@ -2986,3 +2986,275 @@ if len(dfa_results):
     print(f"  The uncued series are the better primary outcomes.")
 else:
     print("  ! no series produced an alpha")
+
+# =============================================================================
+# %% Entropy: sample entropy and refined composite multiscale entropy
+# =============================================================================
+# Sample entropy asks how predictable a series is. Take every template of m
+# consecutive points; count how many other templates match it within a
+# tolerance r; then count how many of those still match when extended to m+1
+# points. The negative log of that ratio is the entropy.
+#
+#     SampEn(m, r, N) = -ln( A / B )
+#
+#   B  pairs of length-m templates within Chebyshev distance r
+#   A  pairs that are STILL within r when extended to length m+1
+#
+# Self-matches are excluded, which is the difference from approximate entropy
+# and removes ApEn's bias toward calling everything regular.
+#
+# THE INTERPRETATION TRAP
+# High entropy gets called "complex", but white noise has MAXIMAL sample
+# entropy and no complexity at all. That is why multiscale entropy exists:
+# coarse-grain the series over longer and longer windows and recompute. White
+# noise starts high and falls away steeply; a genuinely structured signal holds
+# its entropy across scales. The CURVE is the complexity measure, not the
+# single-scale value.
+#
+# The refined composite variant averages the match COUNTS over all tau
+# coarse-graining phases before taking the logarithm, rather than averaging
+# tau separate entropies. That is much steadier at long scales, where any one
+# phase has few points left [Wu2014].
+#
+# THERE ARE NO TRANSFERABLE NORMATIVE VALUES
+# SampEn is defined only relative to its m, r, N and preprocessing, and those
+# vary across the literature. Compare conditions analysed identically; never
+# compare an absolute value against another paper. [Yentes2021] requires m, r
+# and N to be reported every time, and warns against assuming one r transfers
+# between conditions -- so r is swept here rather than fixed at 0.2 SD and
+# hoped for.
+#
+# References
+#   [Richman2000]  Richman & Moorman (2000) Am J Physiol Heart Circ Physiol
+#                  278(6), H2039-H2049.
+#   [Costa2002]    Costa, Goldberger & Peng (2002) Phys Rev Lett 89, 068102.
+#   [Yentes2013]   Yentes et al. (2013) Ann Biomed Eng 41(2), 349-365.
+#   [Wu2014]       Wu et al. (2014) Phys Lett A 378(20), 1369-1374.
+#   [Yentes2021]   Yentes & Raffalt (2021) Ann Biomed Eng 49(3), 979-990.
+# =============================================================================
+
+from scipy.spatial import cKDTree      # repeated so the cell runs alone
+
+# -----------------------------------------------------------------------------
+# %% entropy settings
+# -----------------------------------------------------------------------------
+
+ent_m          = 2                       # template length
+ent_r          = 0.2                     # tolerance, as a fraction of the SD
+ent_r_sweep    = [0.10, 0.15, 0.20, 0.25, 0.30]   # [Yentes2021]
+ent_m_sweep    = [2, 3]
+ent_normalise  = True                    # z-score before computing
+ent_mse_scales = 10                      # coarse-graining scales for RCMSE
+ent_min_n      = 200                     # [Yentes2013]: below this, unreliable
+
+# -----------------------------------------------------------------------------
+# %% the estimators
+# -----------------------------------------------------------------------------
+
+def ent_match_counts(series, m, r):
+    """Counts of matching template pairs at lengths m and m+1.
+
+    Returned rather than the entropy itself, because the refined composite
+    multiscale variant has to sum counts across coarse-graining phases BEFORE
+    taking the logarithm.
+
+    Counting is done with a KD-tree under the Chebyshev metric. The obvious
+    double loop is O(N^2) and is fine for a few hundred strides but hopeless on
+    a continuous signal, where multiscale entropy needs tens of thousands of
+    points at every scale and phase.
+
+    A length-(m+1) match implies a length-m match, since the Chebyshev distance
+    over m+1 coordinates is never smaller than over the first m. So A is simply
+    the pair count in the (m+1)-dimensional tree; there is no need to filter
+    the m-dimensional matches a second time.
+    """
+    ent_x = np.asarray(series, float)
+    ent_x = ent_x[np.isfinite(ent_x)]
+    ent_n = len(ent_x)
+    if ent_n < m + 2:
+        return 0, 0
+
+    # the SAME N-m start indices at both lengths, so the counts are comparable
+    ent_k = ent_n - m
+    ent_starts = np.arange(ent_k)
+    ent_tpl_m = ent_x[ent_starts[:, None] + np.arange(m)[None, :]]
+    ent_tpl_m1 = ent_x[ent_starts[:, None] + np.arange(m + 1)[None, :]]
+
+    ent_tree_m = cKDTree(ent_tpl_m)
+    ent_tree_m1 = cKDTree(ent_tpl_m1)
+    # count_neighbors counts ordered pairs and includes i == j, so subtract the
+    # k self-matches and halve to get unordered distinct pairs
+    ent_b = int((ent_tree_m.count_neighbors(ent_tree_m, r, p=np.inf) - ent_k) // 2)
+    ent_a = int((ent_tree_m1.count_neighbors(ent_tree_m1, r, p=np.inf) - ent_k) // 2)
+    return ent_a, ent_b
+
+
+def ent_sample_entropy(series, m=None, r=None, normalise=None):
+    """SampEn. r is a fraction of the series SD unless normalise is False."""
+    m = ent_m if m is None else m
+    r = ent_r if r is None else r
+    normalise = ent_normalise if normalise is None else normalise
+
+    ent_x = np.asarray(series, float)
+    ent_x = ent_x[np.isfinite(ent_x)]
+    if len(ent_x) < m + 2:
+        return np.nan
+    ent_sd = np.std(ent_x)
+    if ent_sd == 0:
+        return np.nan
+    if normalise:
+        ent_x = (ent_x - ent_x.mean()) / ent_sd
+        ent_tol = r
+    else:
+        ent_tol = r * ent_sd
+
+    ent_a, ent_b = ent_match_counts(ent_x, m, ent_tol)
+    if ent_a == 0 or ent_b == 0:
+        return np.nan            # no matches: undefined, not zero
+    return float(-np.log(ent_a / ent_b))
+
+
+def ent_coarse_grain(series, scale, phase=0):
+    """Non-overlapping means of `scale` points, starting at `phase`."""
+    ent_x = np.asarray(series, float)[phase:]
+    ent_k = len(ent_x) // scale
+    if ent_k < 1:
+        return np.array([])
+    return ent_x[:ent_k * scale].reshape(ent_k, scale).mean(axis=1)
+
+
+def ent_rcmse(series, scales=None, m=None, r=None):
+    """Refined composite multiscale entropy.
+
+    At each scale the match counts are summed over all `scale` coarse-graining
+    phases before the log is taken, rather than averaging separate entropies.
+    Far steadier at long scales, where one phase leaves few points.
+    """
+    scales = ent_mse_scales if scales is None else scales
+    m = ent_m if m is None else m
+    r = ent_r if r is None else r
+
+    ent_x = np.asarray(series, float)
+    ent_x = ent_x[np.isfinite(ent_x)]
+    if len(ent_x) < m + 2:
+        return np.full(scales, np.nan)
+    ent_sd = np.std(ent_x)
+    if ent_sd == 0:
+        return np.full(scales, np.nan)
+    # tolerance is fixed on the ORIGINAL series, not recomputed per scale --
+    # coarse-graining reduces the SD, so a per-scale r would change what is
+    # being asked at every scale and the curve would not be comparable
+    ent_x = (ent_x - ent_x.mean()) / ent_sd
+    ent_out = np.full(scales, np.nan)
+    for ent_s in range(1, scales + 1):
+        ent_a_sum = ent_b_sum = 0
+        for ent_p in range(ent_s):
+            ent_cg = ent_coarse_grain(ent_x, ent_s, ent_p)
+            if len(ent_cg) < m + 2:
+                continue
+            ent_a, ent_b = ent_match_counts(ent_cg, m, r)
+            ent_a_sum += ent_a
+            ent_b_sum += ent_b
+        if ent_a_sum > 0 and ent_b_sum > 0:
+            ent_out[ent_s - 1] = float(-np.log(ent_a_sum / ent_b_sum))
+    return ent_out
+
+# -----------------------------------------------------------------------------
+# %% run it over the stride series
+# -----------------------------------------------------------------------------
+
+print("\n" + "-" * 74)
+print("  ENTROPY")
+print("-" * 74)
+print(f"  m = {ent_m}, r = {ent_r} x SD, N = {len(stride_series)}, "
+      f"z-scored = {ent_normalise}")
+if len(stride_series) < ent_min_n:
+    print(f"  ! N is under {ent_min_n}. [Yentes2013] shows both algorithms become")
+    print(f"    extremely parameter sensitive below that.")
+
+ent_rows = []
+for ent_name in stride_series_usable:
+    ent_series = stride_series[ent_name].to_numpy(float)
+    ent_row = {'series': ent_name, 'n': int(np.isfinite(ent_series).sum()),
+               'm': ent_m, 'r': ent_r}
+    ent_row['sampen'] = ent_sample_entropy(ent_series)
+    for ent_rv in ent_r_sweep:
+        ent_row[f'sampen_r{ent_rv:.2f}'] = ent_sample_entropy(ent_series, r=ent_rv)
+    for ent_mv in ent_m_sweep:
+        ent_row[f'sampen_m{ent_mv}'] = ent_sample_entropy(ent_series, m=ent_mv)
+    ent_rows.append(ent_row)
+
+entropy_results = pd.DataFrame(ent_rows)
+
+if len(entropy_results):
+    print(f"\n  sample entropy, and how it moves with r")
+    print(f"    series                     SampEn   " +
+          "".join(f"r={v:.2f} " for v in ent_r_sweep))
+    for _, ent_r_row in entropy_results.iterrows():
+        ent_txt = f"    {ent_r_row['series']:26s} {ent_r_row['sampen']:6.3f}   "
+        for ent_rv in ent_r_sweep:
+            ent_txt += f"{ent_r_row[f'sampen_r{ent_rv:.2f}']:5.3f}  "
+        print(ent_txt)
+
+    # How sensitive is the ranking to r? If the order of the series changes
+    # with r, no single r tells you anything durable about them.
+    ent_ranks = {}
+    for ent_rv in ent_r_sweep:
+        ent_col = entropy_results[f'sampen_r{ent_rv:.2f}']
+        if ent_col.notna().sum() > 2:
+            ent_ranks[ent_rv] = ent_col.rank().to_numpy()
+    if len(ent_ranks) > 1:
+        ent_keys = list(ent_ranks)
+        ent_corrs = [np.corrcoef(ent_ranks[ent_keys[0]], ent_ranks[k])[0, 1]
+                     for k in ent_keys[1:]]
+        print(f"\n  rank correlation with the r={ent_keys[0]:.2f} ordering: "
+              f"{np.round(ent_corrs, 3)}")
+        if np.nanmin(ent_corrs) < 0.8:
+            print(f"    ! the ordering of the series changes with r. Report the sweep,")
+            print(f"      not a single r, and do not read much into one value.")
+        else:
+            print(f"    the ordering is stable across r, so the single-r value is")
+            print(f"    reporting something about the series rather than about r.")
+
+# -----------------------------------------------------------------------------
+# %% multiscale entropy on the continuous trunk acceleration
+# -----------------------------------------------------------------------------
+# On a stride series there are only a few hundred points, so coarse-graining
+# runs out quickly. The continuous signal has enough samples for the curve to
+# mean something.
+
+ent_mse_signal = None
+for ent_col in ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
+    if ent_col in kinematic_data.columns:
+        ent_mse_signal = np.column_stack([
+            kinematic_data[ent_col].to_numpy(),
+            kinematic_data[f'{ent_col}.1'].to_numpy(),
+            kinematic_data[f'{ent_col}.2'].to_numpy()])
+        ent_mse_name = ent_col
+        break
+
+multiscale_entropy = None
+if ent_mse_signal is not None:
+    ent_start = int(ss_warmup_s * kin_kinematic_fs)
+    ent_seg = ent_mse_signal[ent_start:]
+    ent_curves = {}
+    for ent_ax, ent_label in enumerate(('ML', 'AP', 'VT')):
+        ent_curves[ent_label] = ent_rcmse(ent_seg[:, ent_ax])
+    multiscale_entropy = pd.DataFrame(ent_curves,
+                                      index=np.arange(1, ent_mse_scales + 1))
+    multiscale_entropy.index.name = 'scale'
+
+    print(f"\n  refined composite MSE on {ent_mse_name}, "
+          f"{len(ent_seg)} samples after the warm-up")
+    print(f"    scale   ML     AP     VT")
+    for ent_s, ent_row2 in multiscale_entropy.iterrows():
+        print(f"    {ent_s:5d}  {ent_row2['ML']:5.3f}  {ent_row2['AP']:5.3f}  "
+              f"{ent_row2['VT']:5.3f}")
+    ent_area = multiscale_entropy.sum()
+    print(f"    area under the curve: ML {ent_area['ML']:.2f}  "
+          f"AP {ent_area['AP']:.2f}  VT {ent_area['VT']:.2f}")
+    print(f"    The AREA is the complexity measure, not the scale-1 value. A")
+    print(f"    curve that falls away steeply is noise-like; one that holds up")
+    print(f"    across scales has structure at multiple time scales.")
+else:
+    print("\n  ! no trunk acceleration column found, MSE skipped")
