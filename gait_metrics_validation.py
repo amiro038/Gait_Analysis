@@ -734,6 +734,93 @@ def validate_harmonic_ratio(n_samples=110):
     return ok
 
 
+
+# %%==========================================================================
+#  Supplementary metrics
+# ============================================================================
+
+def validate_supplementary(seed=0):
+    gem = load_function("sup_gem_decompose")
+    lag1 = load_function("sup_lag1")
+    placement = load_function("sup_foot_placement_model")
+    autocorr = load_function("sup_unbiased_autocorr")
+    sym_angle = load_function("sup_symmetry_angle")
+    rng = np.random.default_rng(seed)
+
+    print("=" * 74)
+    print("  SUPPLEMENTARY METRICS")
+    print("=" * 74)
+
+    # --- GEM: build strides FROM known components, then recover them --------
+    n, v_star, t_bar = 600, 1.30, 1.11
+    par_true = rng.normal(0, 0.030, n)
+    perp_true = rng.normal(0, 0.010, n)
+    norm = np.sqrt(1 + v_star ** 2)
+    d_t = (par_true - v_star * perp_true) / norm
+    d_l = (v_star * par_true + perp_true) / norm
+    g = gem(t_bar + d_t, v_star * t_bar + d_l)
+    err_par = np.max(np.abs(g["parallel"] - (par_true - par_true.mean())))
+    err_perp = np.max(np.abs(g["perpendicular"] - (perp_true - perp_true.mean())))
+    print(f"  GEM: v* {g['v_star']:.4f} (true {v_star:.4f}), "
+          f"component error {max(err_par, err_perp):.1e}")
+    print(f"       SD par {np.std(g['parallel']):.4f} (built {np.std(par_true):.4f}), "
+          f"perp {np.std(g['perpendicular']):.4f} (built {np.std(perp_true):.4f})")
+    gem_ok = max(err_par, err_perp) < 1e-4
+
+    # --- lag-1 autocorrelation against a known AR(1) ------------------------
+    print("  lag-1 autocorrelation of AR(1):", end=" ")
+    ar_ok = True
+    for phi in (-0.6, -0.3, 0.0, 0.4):
+        x = np.zeros(4000)
+        for i in range(1, 4000):
+            x[i] = phi * x[i - 1] + rng.normal()
+        got = lag1(x)
+        ar_ok &= abs(got - phi) < 0.05
+        print(f"{phi:+.1f}->{got:+.3f}", end="  ")
+    print()
+
+    # --- foot placement with known gains ------------------------------------
+    b0, b1, b2 = 0.05, 0.80, 0.20
+    z = rng.normal(0, 0.02, 800)
+    v = rng.normal(0, 0.10, 800)
+    r_clean = placement(z, v, b0 + b1 * z + b2 * v)
+    print(f"  foot placement (noiseless): R2 {r_clean['r2']:.4f}, gains "
+          f"{r_clean['gain_position']:.3f}/{r_clean['gain_velocity']:.3f} "
+          f"(true {b1}/{b2})")
+    fp_ok = (r_clean["r2"] > 0.9999
+             and abs(r_clean["gain_position"] - b1) < 1e-6
+             and abs(r_clean["gain_velocity"] - b2) < 1e-6)
+
+    # --- autocorrelation regularity -----------------------------------------
+    t = np.arange(3000)
+    period = 110
+    symmetric = np.sin(2 * np.pi * 2 * t / period)
+    asymmetric = symmetric + 0.5 * np.sin(2 * np.pi * t / period)
+    ac_s = autocorr(symmetric, 3 * period)
+    ac_a = autocorr(asymmetric, 3 * period)
+    print(f"  autocorrelation: symmetric step/stride/symmetry "
+          f"{ac_s[period//2]:.3f}/{ac_s[period]:.3f}/"
+          f"{ac_s[period//2]/ac_s[period]:.3f}")
+    print(f"                   asymmetric                    "
+          f"{ac_a[period//2]:.3f}/{ac_a[period]:.3f}/"
+          f"{ac_a[period//2]/ac_a[period]:.3f}")
+    ac_ok = (abs(ac_s[period // 2] - 1) < 0.01 and abs(ac_s[period] - 1) < 0.01
+             and ac_a[period // 2] < 0.9 * ac_a[period])
+
+    # --- symmetry angle ------------------------------------------------------
+    print("  symmetry angle:", end=" ")
+    sa_ok = abs(sym_angle(1.0, 1.0)) < 1e-9
+    sa_ok &= abs(sym_angle(1.1, 0.9) + sym_angle(0.9, 1.1)) < 1e-9
+    for left, right in ((1.0, 1.0), (1.1, 0.9), (0.9, 1.1), (2.0, 1.0)):
+        print(f"L{left}/R{right}->{sym_angle(left, right):+.2f}%", end="  ")
+    print()
+
+    ok = gem_ok and ar_ok and fp_ok and ac_ok and sa_ok
+    print(f"  {'PASS' if ok else 'FAIL'}: GEM exact and orthogonal, AR(1) "
+          f"recovered, regression exact, symmetry antisymmetric\n")
+    return ok
+
+
 # %%==========================================================================
 #  run everything
 # ============================================================================
@@ -746,3 +833,4 @@ if __name__ == "__main__":
     validate_dfa()
     validate_entropy()
     validate_harmonic_ratio()
+    validate_supplementary()

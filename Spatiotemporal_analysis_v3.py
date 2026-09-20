@@ -3436,3 +3436,281 @@ else:
                       f"median {hr_v.median():.2f}: the tail is doing the work.")
                 print(f"      This is the unboundedness [Pasciuto2017] describes. "
                       f"Use iHR, which is bounded 0-100%.")
+
+# =============================================================================
+# %% Supplementary metrics
+# =============================================================================
+# Five measures that each answer something the main set does not.
+#
+# GOAL-EQUIVALENT MANIFOLD [Dingwell2010]
+# The one that changes how the rest is read. At a fixed belt speed the task
+# goal is unambiguous: keep stride length over stride time equal to belt speed.
+# In the (T, L) plane that goal is a LINE, L = v* T, and every stride's
+# deviation splits into a component ALONG the line, which does not threaten the
+# goal, and one PERPENDICULAR to it, which does.
+#
+#     delta_par  = ( dT + v* dL ) / sqrt(1 + v*^2)      goal-equivalent
+#     delta_perp = ( -v* dT + dL ) / sqrt(1 + v*^2)     goal-relevant
+#
+# Two walkers with identical total variability can have completely different
+# goal-relevant error. The lag-1 autocorrelation of each component says how
+# hard the controller works to correct it: strongly negative means tightly
+# corrected stride to stride, near zero means left alone.
+#
+# FOOT PLACEMENT CONTROL [Wang2014]
+# Regress where the foot lands on the CoM state at midstance. The R^2 IS the
+# measure: it says how much of foot placement is driven by body state, which
+# is a statement about the controller rather than about the margin. Healthy
+# mediolateral values are above 0.8.
+#
+# AUTOCORRELATION REGULARITY AND SYMMETRY [MoeNilssen2004]
+# From the unbiased autocorrelation of trunk acceleration: the coefficient at
+# the one-step lag is step regularity, at the one-stride lag is stride
+# regularity, and their ratio is symmetry. Cheaper and more robust than the
+# harmonic ratio, and a useful cross-check on it.
+#
+# SYMMETRY ANGLE [Zifchock2008]
+# Bounded and reference-free, unlike the classic symmetry index, which divides
+# by one limb and therefore depends on which limb you picked and diverges as
+# that denominator approaches zero.
+#
+# WALK RATIO
+# Step length over cadence. Nearly constant within a person across speeds,
+# which makes deviation from it sensitive. With BOTH speed and cadence fixed by
+# the protocol it is largely determined by the protocol here, so it is reported
+# but should not be read as a free control variable.
+#
+# References
+#   [Dingwell2010]    Dingwell, John & Cusumano (2010) PLoS Comput Biol 6(7), e1000856.
+#   [Wang2014]        Wang & Srinivasan (2014) Biol Lett 10(9), 20140405.
+#   [MoeNilssen2004]  Moe-Nilssen & Helbostad (2004) J Biomech 37, 121-126.
+#   [Zifchock2008]    Zifchock et al. (2008) Gait Posture 27(4), 622-627.
+# =============================================================================
+
+sup_midstance_fraction = 0.5    # point in stance where the CoM state is read
+sup_autocorr_max_lag_s = 3.0
+
+print("\n" + "-" * 74)
+print("  SUPPLEMENTARY METRICS")
+print("-" * 74)
+
+# -----------------------------------------------------------------------------
+# %% goal-equivalent manifold
+# -----------------------------------------------------------------------------
+
+def sup_gem_decompose(stride_time, stride_length):
+    """Split each stride's deviation into goal-equivalent and goal-relevant.
+
+    The goal is constant speed, so the manifold is the line L = v* T with
+    v* the mean speed. Returns the two components and the direction vectors,
+    which are orthogonal by construction.
+    """
+    sup_t = np.asarray(stride_time, float)
+    sup_l = np.asarray(stride_length, float)
+    sup_ok = np.isfinite(sup_t) & np.isfinite(sup_l)
+    if sup_ok.sum() < 10:
+        return None
+    sup_t, sup_l = sup_t[sup_ok], sup_l[sup_ok]
+
+    sup_vstar = sup_l.mean() / sup_t.mean()
+    sup_dt = sup_t - sup_t.mean()
+    sup_dl = sup_l - sup_l.mean()
+    sup_norm = np.sqrt(1.0 + sup_vstar ** 2)
+    return dict(
+        v_star=float(sup_vstar),
+        parallel=(sup_dt + sup_vstar * sup_dl) / sup_norm,
+        perpendicular=(-sup_vstar * sup_dt + sup_dl) / sup_norm,
+        n=int(sup_ok.sum()))
+
+
+def sup_lag1(series):
+    """Lag-1 autocorrelation. Negative means stride-to-stride correction."""
+    sup_x = np.asarray(series, float)
+    sup_x = sup_x[np.isfinite(sup_x)]
+    if len(sup_x) < 10:
+        return np.nan
+    sup_x = sup_x - sup_x.mean()
+    sup_d = np.sum(sup_x ** 2)
+    return float(np.sum(sup_x[:-1] * sup_x[1:]) / sup_d) if sup_d > 0 else np.nan
+
+goal_equivalent = None
+if {'stride_time', 'stride_length'} <= set(stride_series.columns):
+    goal_equivalent = sup_gem_decompose(stride_series['stride_time'],
+                                        stride_series['stride_length'])
+if goal_equivalent:
+    sup_par_sd = float(np.std(goal_equivalent['parallel']))
+    sup_perp_sd = float(np.std(goal_equivalent['perpendicular']))
+    sup_par_ac = sup_lag1(goal_equivalent['parallel'])
+    sup_perp_ac = sup_lag1(goal_equivalent['perpendicular'])
+    print(f"\n  goal-equivalent manifold  (v* = {goal_equivalent['v_star']:.3f} m/s, "
+          f"n = {goal_equivalent['n']})")
+    print(f"    goal-equivalent (along the manifold)  SD {1000*sup_par_sd:6.1f} mm   "
+          f"lag-1 autocorr {sup_par_ac:+.3f}")
+    print(f"    goal-relevant  (across it)            SD {1000*sup_perp_sd:6.1f} mm   "
+          f"lag-1 autocorr {sup_perp_ac:+.3f}")
+    print(f"    ratio of goal-relevant to goal-equivalent SD: "
+          f"{sup_perp_sd/sup_par_sd:.3f}")
+    if sup_perp_ac < sup_par_ac - 0.1:
+        print(f"    The goal-relevant component is corrected more strongly than the")
+        print(f"    goal-equivalent one, which is the signature of a controller")
+        print(f"    exploiting the redundancy rather than fighting all variability.")
+    else:
+        print(f"    The two components are corrected about equally, which is NOT")
+        print(f"    what [Dingwell2010] report for healthy treadmill walking.")
+
+# -----------------------------------------------------------------------------
+# %% mediolateral foot placement control
+# -----------------------------------------------------------------------------
+
+def sup_foot_placement_model(com_ml, com_ml_velocity, foot_ml):
+    """Least squares foot placement on CoM state. Returns R^2 and the gains."""
+    sup_ok = (np.isfinite(com_ml) & np.isfinite(com_ml_velocity)
+              & np.isfinite(foot_ml))
+    if sup_ok.sum() < 20:
+        return None
+    sup_x = np.column_stack([np.ones(sup_ok.sum()),
+                             np.asarray(com_ml)[sup_ok],
+                             np.asarray(com_ml_velocity)[sup_ok]])
+    sup_y = np.asarray(foot_ml)[sup_ok]
+    sup_beta, *_ = np.linalg.lstsq(sup_x, sup_y, rcond=None)
+    sup_pred = sup_x @ sup_beta
+    sup_ss_res = np.sum((sup_y - sup_pred) ** 2)
+    sup_ss_tot = np.sum((sup_y - sup_y.mean()) ** 2)
+    return dict(r2=float(1 - sup_ss_res / sup_ss_tot) if sup_ss_tot > 0 else np.nan,
+                intercept=float(sup_beta[0]), gain_position=float(sup_beta[1]),
+                gain_velocity=float(sup_beta[2]), n=int(sup_ok.sum()))
+
+foot_placement = None
+sup_other = 'Left' if ss_limb == 'Right' else 'Right'
+if (com_position is not None and f'{sup_other}_Heel' in kinematic_positions):
+    sup_com_ml, sup_com_v, sup_foot_ml = [], [], []
+    for sup_i in range(len(stride_series)):
+        sup_hs = int(stride_series['heel_strike_frame_100hz'].iloc[sup_i]) - 1
+        sup_to = int(stride_series['toe_off_frame_100hz'].iloc[sup_i]) - 1
+        sup_mid = int(sup_hs + sup_midstance_fraction * (sup_to - sup_hs))
+        # the NEXT contralateral contact is the foot placement being predicted
+        sup_next = [h for h, _ in force_contacts[sup_other]
+                    if kin_sample_to_frame(h) - 1 > sup_hs]
+        if not sup_next or sup_mid >= len(com_position):
+            continue
+        sup_land = int(kin_sample_to_frame(sup_next[0])) - 1
+        if sup_land >= len(kinematic_positions[f'{sup_other}_Heel']):
+            continue
+        sup_com_ml.append(com_position[sup_mid, com_ml_axis])
+        sup_com_v.append(com_velocity[sup_mid, com_ml_axis])
+        sup_foot_ml.append(
+            kinematic_positions[f'{sup_other}_Heel'][sup_land, com_ml_axis])
+    foot_placement = sup_foot_placement_model(
+        np.array(sup_com_ml), np.array(sup_com_v), np.array(sup_foot_ml))
+
+if foot_placement:
+    print(f"\n  mediolateral foot placement on CoM state at midstance "
+          f"(n = {foot_placement['n']})")
+    print(f"    R^2 = {foot_placement['r2']:.3f}   "
+          f"position gain {foot_placement['gain_position']:+.3f}, "
+          f"velocity gain {foot_placement['gain_velocity']:+.3f} s")
+    print(f"    [Wang2014] report over 0.8 for healthy mediolateral placement.")
+    if foot_placement['r2'] < 0.5:
+        print(f"    ! well under that. Either foot placement is not being driven by")
+        print(f"      CoM state here, or the midstance timing needs checking.")
+
+# -----------------------------------------------------------------------------
+# %% autocorrelation regularity and symmetry
+# -----------------------------------------------------------------------------
+
+def sup_unbiased_autocorr(signal, max_lag):
+    """Unbiased autocorrelation, normalised so lag 0 is 1.
+
+    Unbiased -- divide by the number of overlapping samples at each lag, not by
+    N -- because the biased form tapers toward zero with lag and would make
+    stride regularity look worse than step regularity for that reason alone.
+    """
+    sup_x = np.asarray(signal, float)
+    sup_x = sup_x[np.isfinite(sup_x)]
+    sup_x = sup_x - sup_x.mean()
+    sup_n = len(sup_x)
+    sup_out = np.full(max_lag + 1, np.nan)
+    for sup_k in range(max_lag + 1):
+        if sup_n - sup_k < 10:
+            continue
+        sup_out[sup_k] = np.sum(sup_x[:sup_n - sup_k] * sup_x[sup_k:]) / (sup_n - sup_k)
+    return sup_out / sup_out[0] if sup_out[0] else sup_out
+
+gait_regularity = None
+if hr_signal is not None and len(stride_series) > 10:
+    sup_stride_s = float(np.nanmedian(stride_series['stride_time']))
+    sup_step_lag = int(round(0.5 * sup_stride_s * kin_kinematic_fs))
+    sup_stride_lag = int(round(sup_stride_s * kin_kinematic_fs))
+    sup_max_lag = int(sup_autocorr_max_lag_s * kin_kinematic_fs)
+    sup_start = int(ss_warmup_s * kin_kinematic_fs)
+
+    sup_rows = []
+    for sup_ax, sup_label in ((com_ml_axis, 'ML'), (com_ap_axis, 'AP'),
+                              (com_vt_axis, 'VT')):
+        sup_ac = sup_unbiased_autocorr(hr_acc[sup_start:, sup_ax], sup_max_lag)
+        if not np.isfinite(sup_ac[sup_step_lag:sup_stride_lag + 1]).any():
+            continue
+        sup_d1 = float(sup_ac[sup_step_lag])
+        sup_d2 = float(sup_ac[sup_stride_lag])
+        sup_rows.append({'axis': sup_label, 'step_regularity': sup_d1,
+                         'stride_regularity': sup_d2,
+                         'symmetry': sup_d1 / sup_d2 if sup_d2 else np.nan})
+    gait_regularity = pd.DataFrame(sup_rows)
+
+if gait_regularity is not None and len(gait_regularity):
+    print(f"\n  autocorrelation regularity (step lag {sup_step_lag}, "
+          f"stride lag {sup_stride_lag} samples)")
+    print(f"    axis   step reg   stride reg   symmetry")
+    for _, sup_r in gait_regularity.iterrows():
+        print(f"    {sup_r['axis']:5s}  {sup_r['step_regularity']:8.3f}  "
+              f"{sup_r['stride_regularity']:10.3f}  {sup_r['symmetry']:9.3f}")
+    print(f"    Coefficients near 1 mean each step or stride closely repeats the")
+    print(f"    last; a symmetry ratio near 1 means the two steps are equivalent.")
+
+# -----------------------------------------------------------------------------
+# %% symmetry angle and walk ratio
+# -----------------------------------------------------------------------------
+
+def sup_symmetry_angle(left, right):
+    """Zifchock symmetry angle, percent. 0 is symmetric, sign gives direction."""
+    if not (np.isfinite(left) and np.isfinite(right)) or right == 0:
+        return np.nan
+    sup_sa = (45.0 - np.degrees(np.arctan2(left, right))) / 90.0 * 100.0
+    return sup_sa - 200.0 if sup_sa > 100.0 else sup_sa
+
+sup_sym_rows = []
+for sup_var, sup_src in (('stance_time', None), ('swing_time', None),
+                         ('propulsive_impulse_bw_s', kinetic_metrics),
+                         ('mos_ml_contact', margin_of_stability),
+                         ('mfc_m', trip_risk)):
+    if sup_src is None or 'side' not in getattr(sup_src, 'columns', []):
+        continue
+    if sup_var not in sup_src.columns:
+        continue
+    sup_l = sup_src[sup_src['side'] == 'Left'][sup_var].mean()
+    sup_r = sup_src[sup_src['side'] == 'Right'][sup_var].mean()
+    sup_sym_rows.append({'variable': sup_var, 'left': sup_l, 'right': sup_r,
+                         'symmetry_angle_pct': sup_symmetry_angle(sup_l, sup_r)})
+
+symmetry_angles = pd.DataFrame(sup_sym_rows)
+if len(symmetry_angles):
+    print(f"\n  symmetry angle (0% symmetric, bounded, reference-free)")
+    for _, sup_r in symmetry_angles.iterrows():
+        print(f"    {sup_r['variable']:26s} L {sup_r['left']:+9.4f}  "
+              f"R {sup_r['right']:+9.4f}   SA {sup_r['symmetry_angle_pct']:+6.2f}%")
+
+walk_ratio = np.nan
+if {'stride_length', 'cadence_spm'} <= set(stride_series.columns):
+    sup_step_len = stride_series['stride_length'] / 2.0
+    walk_ratio = float(np.nanmedian(sup_step_len / stride_series['cadence_spm']))
+    print(f"\n  walk ratio {walk_ratio:.5f} m per step/min "
+          f"(step length {np.nanmedian(sup_step_len):.3f} m, "
+          f"cadence {np.nanmedian(stride_series['cadence_spm']):.1f} steps/min)")
+    print(f"    Both speed and cadence are fixed by this protocol, so the walk")
+    print(f"    ratio is largely set by the protocol rather than by the walker.")
+
+print(f"\n  note: whole-body angular momentum is NOT computed here. It needs")
+print(f"  segment masses and inertia tensors mapped onto Theia's segment")
+print(f"  definitions, which is an anthropometric table this script does not")
+print(f"  have. Supply it and WBAM is a natural addition, with the GRF moment")
+print(f"  about the CoM as an independent check via dH/dt = M_ext.")
