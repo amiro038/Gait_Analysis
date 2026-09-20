@@ -677,6 +677,63 @@ def validate_entropy(seed=0):
     return ok
 
 
+
+# %%==========================================================================
+#  Harmonic ratio
+# ============================================================================
+# A two-tone signal makes HR exactly computable. With
+#     x(t) = A2*sin(2*2pi*t) + A1*sin(1*2pi*t)
+# over exactly one stride, harmonic 1 has amplitude A1, harmonic 2 has A2 and
+# every other harmonic is zero, so
+#     HR(even/odd) = A2 / A1
+#     iHR          = A2^2 / (A1^2 + A2^2) * 100
+# A1 is the asymmetric component: bigger A1 means a more asymmetric stride and
+# must give a lower HR.
+
+def validate_harmonic_ratio(n_samples=110):
+    extra = dict(hr_n_harmonics=20)
+    harmonics = load_function("hr_harmonics", extra=extra)
+    ratio = load_function("hr_ratio", extra=extra)
+
+    print("=" * 74)
+    print("  HARMONIC RATIO")
+    print("=" * 74)
+    t = np.arange(n_samples) / n_samples
+
+    print("   A1     A2    HR expect     HR got   iHR expect   iHR got")
+    exact = True
+    for a1, a2 in ((0.05, 1.0), (0.10, 1.0), (0.25, 1.0), (0.50, 1.0), (1.0, 1.0)):
+        amp = harmonics(a2 * np.sin(2 * 2 * np.pi * t) + a1 * np.sin(2 * np.pi * t))
+        hr, ihr = ratio(amp, odd_dominant=False)
+        expect_hr = a2 / a1
+        expect_ihr = 100 * a2 ** 2 / (a1 ** 2 + a2 ** 2)
+        exact &= abs(hr - expect_hr) < 1e-9 and abs(ihr - expect_ihr) < 1e-9
+        print(f"  {a1:.2f}   {a2:.2f}   {expect_hr:9.4f} {hr:9.4f}   "
+              f"{expect_ihr:9.2f}% {ihr:8.2f}%")
+
+    # the mediolateral convention must invert the ratio, not recompute it
+    amp = harmonics(np.sin(2 * 2 * np.pi * t) + 0.25 * np.sin(2 * np.pi * t))
+    hr_even, _ = ratio(amp, odd_dominant=False)
+    hr_odd, _ = ratio(amp, odd_dominant=True)
+    inverts = abs(hr_even * hr_odd - 1.0) < 1e-9
+    print(f"\n  ML convention: even/odd {hr_even:.4f} x odd/even {hr_odd:.4f} "
+          f"= {hr_even * hr_odd:.9f}")
+
+    print("\n  HR must fall as the asymmetric component grows")
+    previous, monotone = np.inf, True
+    for a1 in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        hr, _ = ratio(harmonics(np.sin(2 * 2 * np.pi * t)
+                                + a1 * np.sin(2 * np.pi * t)), odd_dominant=False)
+        monotone &= hr < previous
+        previous = hr
+        print(f"    asymmetry {a1:.2f} -> HR {hr:7.3f}")
+
+    ok = exact and inverts and monotone
+    print(f"  {'PASS' if ok else 'FAIL'}: exact on the two-tone case, ML inverts, "
+          f"monotone in asymmetry\n")
+    return ok
+
+
 # %%==========================================================================
 #  run everything
 # ============================================================================
@@ -688,3 +745,4 @@ if __name__ == "__main__":
     validate_trip_risk()
     validate_dfa()
     validate_entropy()
+    validate_harmonic_ratio()

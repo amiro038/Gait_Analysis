@@ -3258,3 +3258,181 @@ if ent_mse_signal is not None:
     print(f"    across scales has structure at multiple time scales.")
 else:
     print("\n  ! no trunk acceleration column found, MSE skipped")
+
+# =============================================================================
+# %% Harmonic ratio and improved harmonic ratio
+# =============================================================================
+# Smoothness and rhythmic regularity of trunk motion WITHIN a stride. This is a
+# waveform-shape measure, so it is independent of everything in the DFA and
+# entropy cells, which are about variation BETWEEN strides.
+#
+# WHY ODD AND EVEN
+# One stride is two steps. If the two steps produce the same trunk
+# acceleration, the signal repeats twice per stride and its energy lands on the
+# EVEN harmonics of stride frequency. Asymmetry, jerkiness or an irregular
+# event leaks energy into the ODD harmonics.
+#
+#     HR(AP, vertical) = sum(even harmonics) / sum(odd harmonics)
+#
+# Mediolateral is the exception and it is the part people get backwards. You
+# sway left over one step and right over the other, so ML completes ONE cycle
+# per stride, not two: ML is odd-dominant and the ratio flips.
+#
+#     HR(ML) = sum(odd harmonics) / sum(even harmonics)
+#
+# HR IS NOT A SYMMETRY MEASURE
+# It is widely described as one. [Pasciuto2017] showed that is wrong -- a
+# perfectly symmetric but jerky gait scores low -- and that HR's unboundedness
+# makes group means unstable when a denominator is small. Their improved
+# harmonic ratio relates the intrinsic harmonic power to the TOTAL power,
+# giving a bounded 0-100% index, and is reported alongside.
+#
+# THE FRAME
+# Accelerations are rotated by a single yaw taken from the mean trunk heading
+# over the trial, not by the instantaneous pelvis orientation. Rotating frame
+# by frame would mix pelvis rotation into the acceleration, which is not what
+# this measure is about.
+#
+# References
+#   [Menz2003]      Menz, Lord & Fitzpatrick (2003) Gait Posture 18(1), 35-46.
+#   [Bellanca2013]  Bellanca et al. (2013) J Biomech 46(4), 828-831.
+#   [Pasciuto2017]  Pasciuto et al. (2017) J Biomech 53, 84-89.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% harmonic ratio settings
+# -----------------------------------------------------------------------------
+
+hr_n_harmonics  = 20        # the established convention
+hr_min_samples  = 40        # a stride shorter than this cannot carry 20 harmonics
+hr_signal_order = ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc')
+
+print("\n" + "-" * 74)
+print("  HARMONIC RATIO")
+print("-" * 74)
+
+# -------------------------------------------------------------------------
+# %% per-stride spectrum
+# -------------------------------------------------------------------------
+
+def hr_harmonics(segment, n_harmonics=None):
+    """Amplitudes of harmonics 1..n of the stride frequency.
+
+    The segment is exactly one stride, so DFT bin 1 IS the stride
+    fundamental and bin k is the k-th harmonic. No windowing: a window
+    would smear energy between the odd and even bins that the ratio is
+    built on.
+    """
+    n_harmonics = hr_n_harmonics if n_harmonics is None else n_harmonics
+    hr_seg = np.asarray(segment, float)
+    hr_seg = hr_seg - hr_seg.mean()
+    hr_spec = np.abs(np.fft.rfft(hr_seg))
+    if len(hr_spec) <= n_harmonics:
+        return None
+    return hr_spec[1:n_harmonics + 1]
+
+
+def hr_ratio(amplitudes, odd_dominant=False):
+    """Harmonic ratio and the Pasciuto improved harmonic ratio.
+
+    `odd_dominant` is True for mediolateral, where the walker completes one
+    cycle per stride rather than two.
+    """
+    hr_k = np.arange(1, len(amplitudes) + 1)
+    hr_odd = amplitudes[hr_k % 2 == 1]
+    hr_even = amplitudes[hr_k % 2 == 0]
+    hr_intrinsic = hr_odd if odd_dominant else hr_even
+    hr_other = hr_even if odd_dominant else hr_odd
+
+    hr_value = (hr_intrinsic.sum() / hr_other.sum()
+                if hr_other.sum() > 0 else np.nan)
+    hr_total_power = np.sum(amplitudes ** 2)
+    hr_i = (100.0 * np.sum(hr_intrinsic ** 2) / hr_total_power
+            if hr_total_power > 0 else np.nan)
+    return hr_value, hr_i
+
+# -----------------------------------------------------------------------------
+# %% signal and frame
+# -----------------------------------------------------------------------------
+
+hr_signal = None
+for hr_col in hr_signal_order:
+    if hr_col in kinematic_data.columns:
+        hr_signal = np.column_stack([
+            kinematic_data[hr_col].to_numpy(),
+            kinematic_data[f'{hr_col}.1'].to_numpy(),
+            kinematic_data[f'{hr_col}.2'].to_numpy()])
+        hr_signal_name = hr_col
+        break
+
+if hr_signal is None:
+    print("  ! no trunk acceleration column, harmonic ratio skipped")
+    harmonic_ratio = pd.DataFrame()
+else:
+    print(f"  signal: {hr_signal_name}, "
+          f"{100*np.isfinite(hr_signal).all(axis=1).mean():.1f}% finite")
+
+    # A single yaw from the mean heading. On a treadmill the heading is fixed,
+    # so this is close to identity -- it exists to remove any lab-to-walker
+    # misalignment rather than to track the pelvis.
+    hr_heading = np.array([0.0, com_belt_sign])          # travel direction, ML/AP
+    hr_yaw = np.arctan2(hr_heading[0], hr_heading[1])
+    hr_c, hr_s = np.cos(hr_yaw), np.sin(hr_yaw)
+    hr_rot = np.array([[hr_c, -hr_s], [hr_s, hr_c]])
+    hr_acc = hr_signal.copy()
+    hr_acc[:, [com_ml_axis, com_ap_axis]] = (
+        hr_signal[:, [com_ml_axis, com_ap_axis]] @ hr_rot.T)
+    print(f"  heading yaw applied: {np.degrees(hr_yaw):+.1f} deg")
+
+    hr_axis_spec = [(com_ap_axis, 'AP', False),
+                    (com_vt_axis, 'VT', False),
+                    (com_ml_axis, 'ML', True)]
+
+    hr_rows = []
+    for hr_i_stride in range(len(stride_series) - 1):
+        hr_a = int(stride_series['heel_strike_frame_100hz'].iloc[hr_i_stride]) - 1
+        hr_b = int(stride_series['heel_strike_frame_100hz'].iloc[hr_i_stride + 1]) - 1
+        if hr_b - hr_a < hr_min_samples or hr_b > len(hr_acc):
+            continue
+        hr_seg_all = hr_acc[hr_a:hr_b]
+        if not np.isfinite(hr_seg_all).all():
+            continue
+
+        hr_row = {'stride': int(stride_series['stride'].iloc[hr_i_stride]),
+                  'n_samples': hr_b - hr_a}
+        hr_good = True
+        for hr_ax, hr_label, hr_odd_dom in hr_axis_spec:
+            hr_amp = hr_harmonics(hr_seg_all[:, hr_ax])
+            if hr_amp is None:
+                hr_good = False
+                break
+            hr_v, hr_ih = hr_ratio(hr_amp, odd_dominant=hr_odd_dom)
+            hr_row[f'hr_{hr_label}'] = hr_v
+            hr_row[f'ihr_{hr_label}'] = hr_ih
+        if hr_good:
+            hr_rows.append(hr_row)
+
+    harmonic_ratio = pd.DataFrame(hr_rows)
+
+    if len(harmonic_ratio):
+        print(f"\n  {len(harmonic_ratio)} strides")
+        print(f"    axis   HR median (IQR)              iHR median (IQR)")
+        for _, hr_label, hr_odd_dom in hr_axis_spec:
+            hr_v = harmonic_ratio[f'hr_{hr_label}']
+            hr_ih = harmonic_ratio[f'ihr_{hr_label}']
+            hr_dom = 'odd/even' if hr_odd_dom else 'even/odd'
+            print(f"    {hr_label}    {hr_v.median():5.2f} "
+                  f"({hr_v.quantile(0.25):.2f}-{hr_v.quantile(0.75):.2f})  {hr_dom}"
+                  f"      {hr_ih.median():5.1f}% "
+                  f"({hr_ih.quantile(0.25):.1f}-{hr_ih.quantile(0.75):.1f})")
+
+        # The median is reported rather than the mean because HR is an
+        # unbounded ratio: one stride with a small denominator drags a mean
+        # anywhere. This says how far apart the two are.
+        for _, hr_label, _ in hr_axis_spec:
+            hr_v = harmonic_ratio[f'hr_{hr_label}']
+            if hr_v.median() > 0 and abs(hr_v.mean() - hr_v.median()) > 0.3 * hr_v.median():
+                print(f"    ! {hr_label} HR mean {hr_v.mean():.2f} is far from its "
+                      f"median {hr_v.median():.2f}: the tail is doing the work.")
+                print(f"      This is the unboundedness [Pasciuto2017] describes. "
+                      f"Use iHR, which is bounded 0-100%.")
