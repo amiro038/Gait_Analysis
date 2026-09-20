@@ -2743,3 +2743,246 @@ ss_cued = {'stride_time', 'stance_time', 'swing_time', 'cadence_spm'}
 ss_uncued = [c for c in stride_series_usable if c not in ss_cued]
 print(f"\n  with a metronome, prefer the series it does not directly constrain:")
 print(f"    {', '.join(ss_uncued[:8])}")
+
+# =============================================================================
+# %% Long-range correlations: detrended fluctuation analysis
+# =============================================================================
+# DFA asks whether a stride is statistically related to strides HUNDREDS of
+# strides earlier. Not how much gait varies -- how the variation is organised
+# in time. It is blind to magnitude: shuffle a series and its SD is unchanged
+# while alpha collapses to 0.5.
+#
+#   integrate      Y(k) = sum_{i<=k} (x_i - mean(x))
+#   segment        non-overlapping boxes of length n, forwards AND backwards so
+#                  no data is discarded when n does not divide N
+#   detrend        least squares polynomial of order 1 within each box
+#   fluctuate      F(n) = RMS of the residuals over all boxes
+#   scale          F(n) ~ n^alpha, alpha is the slope in log-log space
+#
+#   alpha < 0.5   anti-persistent, a long stride is corrected by a short one
+#   alpha = 0.5   uncorrelated, no memory
+#   0.5 < a < 1   persistent, deviations tend to be followed by more of the same
+#   alpha ~ 1.0   1/f, scale free
+#   alpha > 1.0   non-stationary, usually a trend rather than a property of
+#                 control -- check for drift before interpreting
+#
+# THE BOX RANGE IS THE CHOICE THAT MATTERS
+# [Damouras2010] examined this directly and recommends 16 <= n <= N/9. The
+# widely used 4 to N/4 inflates alpha: small boxes are dominated by the
+# detrending fit itself, and boxes past N/9 contain too few segments to average.
+#
+# TWO CHECKS RUN EVERY TIME
+#   a shuffled surrogate must return alpha = 0.5. If it does not, the
+#     implementation is wrong, and this catches it on the real data rather than
+#     only in the validation file.
+#   a second estimator, GPH on the periodogram, gives d and hence alpha = d+0.5
+#     by a completely different route. DFA alone cannot resolve the fGn/fBm
+#     ambiguity, so agreement between the two is worth having and disagreement
+#     is worth knowing about.
+#
+# References
+#   [Peng1994]      Peng et al. (1994) Phys Rev E 49, 1685-1689.
+#   [Hausdorff1996] Hausdorff et al. (1996) J Appl Physiol 80(5), 1448-1457.
+#   [Damouras2010]  Damouras et al. (2010) Gait Posture 31(3), 336-340.
+#   [Ravi2020]      Ravi et al. (2020) Front Physiol 11, 562.
+#   [GPH1983]       Geweke & Porter-Hudak (1983) J Time Ser Anal 4(4), 221-238.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# %% DFA settings
+# -----------------------------------------------------------------------------
+
+dfa_order        = 1        # DFA-1, linear detrending within each box
+dfa_min_box      = 16       # [Damouras2010]
+dfa_max_box_frac = 1.0 / 9  # [Damouras2010]
+dfa_n_boxes      = 20       # how many box sizes to sample, log spaced
+dfa_n_surrogate  = 50       # shuffles for the surrogate check
+dfa_seed         = 0
+dfa_gph_power    = 0.5      # GPH bandwidth: m = N**dfa_gph_power
+
+# -----------------------------------------------------------------------------
+# %% the estimators
+# -----------------------------------------------------------------------------
+
+def dfa_fluctuation(series, box_sizes, order=None):
+    """F(n) for each box size. Forward and backward boxes at every scale."""
+    order = dfa_order if order is None else order
+    dfa_x = np.asarray(series, float)
+    dfa_x = dfa_x[np.isfinite(dfa_x)]
+    dfa_y = np.cumsum(dfa_x - dfa_x.mean())
+    dfa_n_total = len(dfa_y)
+
+    dfa_out = np.full(len(box_sizes), np.nan)
+    for dfa_i, dfa_n in enumerate(box_sizes):
+        dfa_n = int(dfa_n)
+        dfa_count = dfa_n_total // dfa_n
+        if dfa_count < 2:
+            continue
+        # forward from the start, and backward from the end, so a series whose
+        # length is not a multiple of n does not lose its tail
+        dfa_fwd = dfa_y[:dfa_count * dfa_n].reshape(dfa_count, dfa_n)
+        dfa_bwd = dfa_y[dfa_n_total - dfa_count * dfa_n:].reshape(dfa_count, dfa_n)
+        dfa_seg = np.vstack([dfa_fwd, dfa_bwd])
+
+        dfa_t = np.arange(dfa_n)
+        dfa_coef = np.polyfit(dfa_t, dfa_seg.T, order)
+        dfa_trend = np.polyval(dfa_coef, dfa_t[:, None]).T
+        dfa_out[dfa_i] = np.sqrt(np.mean((dfa_seg - dfa_trend) ** 2))
+    return dfa_out
+
+
+def dfa_alpha(series, min_box=None, max_box=None, order=None, n_boxes=None):
+    """Scaling exponent, plus the fit quality and the curve it came from."""
+    min_box = dfa_min_box if min_box is None else min_box
+    n_boxes = dfa_n_boxes if n_boxes is None else n_boxes
+    dfa_x = np.asarray(series, float)
+    dfa_x = dfa_x[np.isfinite(dfa_x)]
+    dfa_N = len(dfa_x)
+    max_box = int(dfa_max_box_frac * dfa_N) if max_box is None else int(max_box)
+
+    if max_box <= min_box or dfa_N < 4 * min_box:
+        return dict(alpha=np.nan, se=np.nan, r2=np.nan, n=dfa_N,
+                    boxes=np.array([]), fluctuation=np.array([]))
+
+    dfa_boxes = np.unique(np.round(np.logspace(
+        np.log10(min_box), np.log10(max_box), n_boxes)).astype(int))
+    dfa_f = dfa_fluctuation(dfa_x, dfa_boxes, order=order)
+    dfa_ok = np.isfinite(dfa_f) & (dfa_f > 0)
+    if dfa_ok.sum() < 4:
+        return dict(alpha=np.nan, se=np.nan, r2=np.nan, n=dfa_N,
+                    boxes=dfa_boxes, fluctuation=dfa_f)
+
+    dfa_lx = np.log10(dfa_boxes[dfa_ok])
+    dfa_ly = np.log10(dfa_f[dfa_ok])
+    dfa_slope, dfa_icept = np.polyfit(dfa_lx, dfa_ly, 1)
+
+    dfa_pred = dfa_slope * dfa_lx + dfa_icept
+    dfa_resid = dfa_ly - dfa_pred
+    dfa_dof = max(len(dfa_lx) - 2, 1)
+    dfa_se = float(np.sqrt(np.sum(dfa_resid ** 2) / dfa_dof
+                           / np.sum((dfa_lx - dfa_lx.mean()) ** 2)))
+    dfa_r2 = float(1 - np.sum(dfa_resid ** 2)
+                   / np.sum((dfa_ly - dfa_ly.mean()) ** 2))
+    return dict(alpha=float(dfa_slope), se=dfa_se, r2=dfa_r2, n=dfa_N,
+                boxes=dfa_boxes[dfa_ok], fluctuation=dfa_f[dfa_ok])
+
+
+def dfa_gph(series, power=None):
+    """Geweke-Porter-Hudak estimate of the fractional differencing parameter d.
+
+    A completely different route to the same property: regress the log
+    periodogram on log(4 sin^2(w/2)) over the lowest frequencies. For
+    fractional Gaussian noise alpha = d + 0.5, so this is an independent check
+    on DFA rather than a restatement of it.
+    """
+    power = dfa_gph_power if power is None else power
+    dfa_x = np.asarray(series, float)
+    dfa_x = dfa_x[np.isfinite(dfa_x)]
+    dfa_N = len(dfa_x)
+    dfa_m = int(dfa_N ** power)
+    if dfa_m < 4:
+        return dict(d=np.nan, alpha=np.nan, m=dfa_m)
+
+    dfa_per = np.abs(np.fft.rfft(dfa_x - dfa_x.mean())) ** 2 / (2 * np.pi * dfa_N)
+    dfa_w = 2 * np.pi * np.arange(len(dfa_per)) / dfa_N
+    dfa_j = np.arange(1, min(dfa_m, len(dfa_per) - 1) + 1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dfa_reg = np.log(4 * np.sin(dfa_w[dfa_j] / 2) ** 2)
+        dfa_resp = np.log(dfa_per[dfa_j])
+    # a periodogram ordinate can be exactly zero, which the log sends to -inf
+    dfa_ok = np.isfinite(dfa_reg) & np.isfinite(dfa_resp)
+    if dfa_ok.sum() < 4:
+        return dict(d=np.nan, alpha=np.nan, m=dfa_m)
+    dfa_slope = np.polyfit(dfa_reg[dfa_ok], dfa_resp[dfa_ok], 1)[0]
+    dfa_d = float(-dfa_slope)
+    return dict(d=dfa_d, alpha=dfa_d + 0.5, m=dfa_m)
+
+
+def dfa_surrogate_alpha(series, n_surrogate=None, seed=None):
+    """alpha of shuffled copies. Shuffling destroys order but not the values,
+    so alpha must fall to 0.5 while the SD is untouched."""
+    n_surrogate = dfa_n_surrogate if n_surrogate is None else n_surrogate
+    dfa_rng = np.random.default_rng(dfa_seed if seed is None else seed)
+    dfa_x = np.asarray(series, float)
+    dfa_x = dfa_x[np.isfinite(dfa_x)]
+    dfa_vals = [dfa_alpha(dfa_rng.permutation(dfa_x))['alpha']
+                for _ in range(n_surrogate)]
+    return np.array(dfa_vals, float)
+
+# -----------------------------------------------------------------------------
+# %% run it over every usable series
+# -----------------------------------------------------------------------------
+
+print("\n" + "-" * 74)
+print("  LONG-RANGE CORRELATIONS (DFA)")
+print("-" * 74)
+
+dfa_N_used = len(stride_series)
+dfa_max_box_used = int(dfa_max_box_frac * dfa_N_used)
+print(f"  N = {dfa_N_used} strides, boxes {dfa_min_box} to {dfa_max_box_used} "
+      f"(Damouras: 16 to N/9)")
+if dfa_N_used < 600:
+    print(f"  ! under the 600 strides [Damouras2010] recommend. alpha is still")
+    print(f"    estimable but its confidence interval is wider; report it.")
+if dfa_max_box_used <= dfa_min_box * 2:
+    print(f"  ! the box range spans less than one octave, alpha is not meaningful")
+
+dfa_rows = []
+for dfa_name in stride_series_usable:
+    dfa_series = stride_series[dfa_name].to_numpy(float)
+    dfa_res = dfa_alpha(dfa_series)
+    if not np.isfinite(dfa_res['alpha']):
+        continue
+    dfa_g = dfa_gph(dfa_series)
+    dfa_sur = dfa_surrogate_alpha(dfa_series)
+    dfa_rows.append({
+        'series': dfa_name,
+        'n': dfa_res['n'],
+        'alpha': dfa_res['alpha'],
+        'alpha_se': dfa_res['se'],
+        'r2': dfa_res['r2'],
+        'alpha_gph': dfa_g['alpha'],
+        'surrogate_alpha_mean': float(np.nanmean(dfa_sur)),
+        'surrogate_alpha_sd': float(np.nanstd(dfa_sur)),
+        'cued_by_metronome': dfa_name in ss_cued,
+    })
+
+dfa_results = pd.DataFrame(dfa_rows)
+
+if len(dfa_results):
+    print(f"\n  series                      alpha   +-SE     R2    GPH    "
+          f"surrogate      cued")
+    for _, dfa_r in dfa_results.iterrows():
+        dfa_flag = '  yes' if dfa_r['cued_by_metronome'] else '   no'
+        print(f"    {dfa_r['series']:26s} {dfa_r['alpha']:5.3f}  "
+              f"{dfa_r['alpha_se']:.3f}  {dfa_r['r2']:.3f}  "
+              f"{dfa_r['alpha_gph']:5.3f}  "
+              f"{dfa_r['surrogate_alpha_mean']:.3f}+-{dfa_r['surrogate_alpha_sd']:.3f}"
+              f"{dfa_flag}")
+
+    # the surrogate check, on the real data
+    dfa_bad = dfa_results[np.abs(dfa_results['surrogate_alpha_mean'] - 0.5) > 0.05]
+    if len(dfa_bad):
+        print(f"\n  ! {len(dfa_bad)} series have a shuffled surrogate away from 0.5.")
+        print(f"    A shuffle destroys order and nothing else, so alpha must go to")
+        print(f"    0.5. Anything else means the estimator is misbehaving at this N.")
+    else:
+        print(f"\n  surrogate check passed: every shuffled series returned "
+              f"alpha ~ 0.5")
+
+    # DFA against GPH. The validation puts GPH's own scatter at 0.15-0.21 for
+    # N in the 500-750 range, against 0.06-0.10 for DFA, so GPH is a coarse
+    # sanity check on the ballpark rather than a precise second opinion. Only a
+    # large gap is informative.
+    dfa_gap = np.abs(dfa_results['alpha'] - dfa_results['alpha_gph'])
+    print(f"  DFA vs GPH: median gap {np.nanmedian(dfa_gap):.3f}, "
+          f"worst {np.nanmax(dfa_gap):.3f}  (GPH scatter alone is ~0.15 at this N)")
+    if np.nanmedian(dfa_gap) > 0.25:
+        print(f"    ! the two estimators disagree. Usually that means the series is")
+        print(f"      not a clean fGn -- check for a trend or a level shift.")
+
+    print(f"\n  reminder: this protocol paces cadence with a metronome, so alpha on")
+    print(f"  the cued series measures how tightly the walker locks to the beat.")
+    print(f"  The uncued series are the better primary outcomes.")
+else:
+    print("  ! no series produced an alpha")

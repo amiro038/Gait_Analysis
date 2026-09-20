@@ -280,7 +280,10 @@ def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
 
     import contextlib
     with contextlib.redirect_stdout(io.StringIO()):
-        load_cell("# %% Margin of stability, with the base", namespace)
+        # bounded: without `until` this runs on into the later cells, which
+        # need force_data and the rest of the real pipeline
+        load_cell("# %% Margin of stability, with the base", namespace,
+                  until="# %% Minimum foot clearance, margin of instability")
     result = namespace["margin_of_stability"]
 
     got_mesh = float(result["mos_ml_contact"].iloc[0])
@@ -402,7 +405,8 @@ def _trip_risk_scenario(mfc_true=0.018, base_clear=0.060, moi_mm=12.0,
     with contextlib.redirect_stdout(io.StringIO()):
         load_cell("# %% Margin of stability, with the base", namespace,
                   until="# %% Minimum foot clearance, margin of instability")
-        load_cell("# %% Minimum foot clearance, margin of instability", namespace)
+        load_cell("# %% Minimum foot clearance, margin of instability", namespace,
+                  until="# %% Kinetic metrics: impulses")
     return (namespace["trip_risk"], clearance, speed, swing, toe_off,
             heel_strike, fs, moi_mm)
 
@@ -464,6 +468,122 @@ def validate_trip_risk():
     return ok and no_event
 
 
+
+# %%==========================================================================
+#  Detrended fluctuation analysis
+# ============================================================================
+# Tested against fractional Gaussian noise, where alpha = H is known exactly.
+# The generator is checked FIRST, against the theoretical autocovariance, so a
+# generator bug cannot be mistaken for an estimator bug.
+#
+# N is set to the lengths this protocol actually produces -- 486 strides from a
+# 10 minute trial and 756 from a 15 minute one -- because the question that
+# matters is not whether DFA works in principle but how precisely it works on
+# the data in hand.
+
+def fractional_gaussian_noise(n, hurst, rng):
+    """Exact fGn by Davies-Harte circulant embedding.
+
+    H = 1 is degenerate for fGn: the autocovariance becomes 1 at every lag, so
+    the process is perfectly correlated and there is nothing to estimate. Stay
+    below it.
+    """
+    k = np.arange(0, n + 1)
+    gamma = 0.5 * (np.abs(k - 1) ** (2 * hurst)
+                   - 2 * np.abs(k) ** (2 * hurst)
+                   + np.abs(k + 1) ** (2 * hurst))
+    circulant = np.concatenate([gamma, gamma[-2:0:-1]])
+    eigenvalues = np.maximum(np.fft.fft(circulant).real, 0.0)
+    m = len(eigenvalues)
+    noise = rng.normal(size=m) + 1j * rng.normal(size=m)
+    return np.fft.fft(np.sqrt(eigenvalues / (2 * m)) * noise).real[:n]
+
+
+def validate_dfa(lengths=(486, 756), hursts=(0.5, 0.7, 0.9, 0.95),
+                 n_reps=60, seed=0):
+    extra = dict(dfa_order=1, dfa_min_box=16, dfa_max_box_frac=1.0 / 9,
+                 dfa_n_boxes=20, dfa_gph_power=0.5, dfa_n_surrogate=50,
+                 dfa_seed=0)
+    fluct = load_function("dfa_fluctuation", extra=extra)
+    extra["dfa_fluctuation"] = fluct
+    alpha_fn = load_function("dfa_alpha", extra=extra)
+    gph_fn = load_function("dfa_gph", extra=extra)
+    rng = np.random.default_rng(seed)
+
+    print("=" * 74)
+    print("  DETRENDED FLUCTUATION ANALYSIS")
+    print("=" * 74)
+
+    # 1. the generator itself
+    print("  generator: empirical vs theoretical autocovariance, N=20000")
+    gen_ok = True
+    for hurst in (0.5, 0.7, 0.9):
+        acv = np.zeros(6)
+        for _ in range(20):
+            x = fractional_gaussian_noise(20000, hurst, rng)
+            x = x - x.mean()
+            acv += np.array([np.mean(x[:len(x) - k] * x[k:])
+                             for k in range(6)]) / 20
+        acv /= acv[0]
+        k = np.arange(6)
+        theory = 0.5 * (np.abs(k - 1) ** (2 * hurst) - 2 * np.abs(k) ** (2 * hurst)
+                        + np.abs(k + 1) ** (2 * hurst))
+        err = np.abs(acv - theory).max()
+        gen_ok &= err < 0.12
+        print(f"    H={hurst:.1f}  max autocovariance error {err:.4f}")
+
+    # 2. recovery at the lengths this protocol produces
+    print(f"\n  alpha recovered from fGn, {n_reps} repetitions per cell")
+    header = "     N   " + "".join(f"  H={h:.2f}        " for h in hursts)
+    print(header)
+    rows = []
+    for n in lengths:
+        line = f"  {n:4d}   "
+        for hurst in hursts:
+            vals = [alpha_fn(fractional_gaussian_noise(n, hurst, rng))["alpha"]
+                    for _ in range(n_reps)]
+            line += f"{np.mean(vals):.3f}+-{np.std(vals):.3f}  "
+            rows.append(dict(n=n, hurst=hurst, mean=np.mean(vals),
+                             sd=np.std(vals), bias=np.mean(vals) - hurst))
+        print(line)
+
+    worst_bias = max(abs(r["bias"]) for r in rows)
+    typical_sd = np.median([r["sd"] for r in rows])
+    print(f"\n  worst bias {worst_bias:.3f}, typical scatter {typical_sd:.3f}")
+    print(f"  So a single trial pins alpha to about +-{typical_sd:.2f}. A")
+    print(f"  between-condition difference smaller than that is inside the noise")
+    print(f"  of one trial and needs repeated trials or more strides.")
+
+    # 3. the confirmatory estimator, so its precision is known rather than assumed
+    print(f"\n  GPH on the same series")
+    gph_sd = []
+    for n in lengths:
+        line = f"  {n:4d}   "
+        for hurst in hursts:
+            vals = [gph_fn(fractional_gaussian_noise(n, hurst, rng))["alpha"]
+                    for _ in range(n_reps)]
+            line += f"{np.mean(vals):.3f}+-{np.std(vals):.3f}  "
+            gph_sd.append(np.std(vals))
+        print(line)
+    print(f"  GPH scatter {np.median(gph_sd):.3f} vs DFA {typical_sd:.3f}: it is a")
+    print(f"  ballpark cross-check, not a precise second opinion.")
+
+    # 4. the surrogate property, which is the check that runs on real data
+    x = fractional_gaussian_noise(756, 0.9, rng)
+    shuffled = [alpha_fn(rng.permutation(x))["alpha"] for _ in range(60)]
+    sur_mean = float(np.mean(shuffled))
+    sur_ok = abs(sur_mean - 0.5) < 0.05
+    print(f"\n  shuffled surrogate of an H=0.9 series: alpha {sur_mean:.3f} "
+          f"(must be 0.5)")
+    print(f"    SD is unchanged by shuffling, alpha is not -- which is the whole")
+    print(f"    point: alpha measures order, not magnitude.")
+
+    ok = gen_ok and worst_bias < 0.05 and sur_ok
+    print(f"  {'PASS' if ok else 'FAIL'}: generator exact, DFA unbiased, "
+          f"surrogate returns 0.5\n")
+    return ok
+
+
 # %%==========================================================================
 #  run everything
 # ============================================================================
@@ -473,3 +593,4 @@ if __name__ == "__main__":
     validate_belt_speed()
     validate_margin_of_stability()
     validate_trip_risk()
+    validate_dfa()
