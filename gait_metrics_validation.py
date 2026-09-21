@@ -265,7 +265,15 @@ def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
     mesh = mesh.sort_index(axis=1)
 
     tmp = Path(tempfile.mkdtemp())
-    mesh.to_pickle(tmp / "metrics_mesh.pkl")
+    # The cell rebuilds vertices from a _posed.npz through apply_binding rather
+    # than reading a pickle, so stand in for both: an empty file so the exists
+    # check passes, and a stub module that hands back the mesh built above.
+    (tmp / "metrics_posed.npz").write_bytes(b"")
+    import sys
+    import types
+    stub = types.ModuleType("apply_binding")
+    stub.mesh_dataframe = lambda source=None, binding=None, dtype=None: mesh
+    sys.modules["apply_binding"] = stub
 
     namespace = dict(
         np=np, pd=pd, Path=Path, plt=plt,
@@ -367,7 +375,12 @@ def _trip_risk_scenario(mfc_true=0.018, base_clear=0.060, moi_mm=12.0,
                         columns=pd.MultiIndex.from_tuples(
                             cols, names=["segment", "vertex", "axis"])).sort_index(axis=1)
     tmp = Path(tempfile.mkdtemp())
-    mesh.to_pickle(tmp / "m_mesh.pkl")
+    (tmp / "m_posed.npz").write_bytes(b"")
+    import sys
+    import types
+    stub = types.ModuleType("apply_binding")
+    stub.mesh_dataframe = lambda source=None, binding=None, dtype=None: mesh
+    sys.modules["apply_binding"] = stub
 
     columns = {}
     for side, ml in (("Right", 0.1), ("Left", -0.1)):
