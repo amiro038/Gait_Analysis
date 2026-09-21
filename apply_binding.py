@@ -110,6 +110,12 @@ H5_COMPRESS = "gzip"         # gzip+shuffle buys ~24% on float coordinates and
                              # costs ~20x the write time; None is the other
                              # sensible choice. Measured, not guessed.
 OUT_SUFFIX = "_posed"
+# Where the _posed.npz goes. None puts it beside the trial CSV, so an
+# analysis script can find it from the trial path alone and it does not
+# matter which directory you happened to run from -- which matters with
+# absolute trial paths and Spyder, where the working directory is rarely
+# the data folder. Set "." to keep it in the working directory instead.
+OUT_DIR = None
 VERBOSE = True
 
 SHAPE_TOLERANCE_MM = 5.0
@@ -699,6 +705,19 @@ def show_3d(result, frame=0, zoom=None):
 #  MAIN
 # ============================================================================
 
+def posed_path(trial_csv=None, out_dir=None):
+    """Where apply_binding() writes, and vertex_tracks() looks for, the .npz.
+
+    One place, so the writer and the readers cannot disagree about it.
+    """
+    trial_csv = TRIAL_METRICS_CSV if trial_csv is None else trial_csv
+    out_dir = OUT_DIR if out_dir is None else out_dir
+    stem = os.path.splitext(os.path.basename(trial_csv))[0]
+    if out_dir is None:
+        out_dir = os.path.dirname(os.path.abspath(trial_csv))
+    return os.path.join(out_dir, stem + OUT_SUFFIX + ".npz")
+
+
 def load_binding(path=None):
     path = BINDING_FILE if path is None else path
     if not os.path.exists(path):
@@ -789,8 +808,7 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
         verts = apply_poses(poses, v_local, segment_blocks(seg_of),
                             dtype=np.float32)
 
-    stem = os.path.splitext(os.path.basename(trial_csv))[0]
-    out_npz = stem + OUT_SUFFIX + ".npz"
+    out_npz = posed_path(trial_csv)
     # The binding's mesh entries carry the entire .obj file text -- `lines`
     # plus the v/vn line numbers -- so the builder can rewrite the meshes.
     # Nothing downstream of here reads it: vertex_tracks() wants only
@@ -885,8 +903,7 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None,
         poses, z = source["poses"], source["binding_npz"]
     else:
         if source is None:
-            source = (os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
-                      + OUT_SUFFIX + ".npz")
+            source = posed_path()
         posed = np.load(source, allow_pickle=False)
         poses = posed["poses"]
         _, z = load_binding(binding)
@@ -1003,8 +1020,7 @@ def save_mesh_h5(source=None, trial_csv=None, path=None, binding=None,
         src_path = trial_csv or source.get("trial_path") or TRIAL_METRICS_CSV
     else:
         if source is None:
-            source = (os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
-                      + OUT_SUFFIX + ".npz")
+            source = posed_path()
         poses = np.load(source, allow_pickle=False)["poses"]
         _, z = load_binding(binding)
         trial = os.path.basename(str(source))
