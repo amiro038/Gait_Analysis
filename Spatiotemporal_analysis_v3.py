@@ -1759,33 +1759,37 @@ else:
 
 mos_gravity          = 9.81
 mos_pendulum_mode    = 'per_frame'   # 'per_frame' CoM-to-ankle, or 'leg_length'
-mos_mesh_pickle_suffix = '_mesh.pkl' # written next to the metrics csv by apply_binding
+mos_posed_suffix     = '_posed.npz'   # written next to the metrics csv by apply_binding
+mos_binding_file     = 'foot_mesh_binding.npz'   # from build_foot_binding.py
 mos_stance_fraction  = (0.0, 1.0)    # portion of stance searched for the minimum
 mos_report_marker_bos = True         # also compute the marker-based boundary
 
 # -----------------------------------------------------------------------------
 # %% load the posed foot meshes for this trial
 # -----------------------------------------------------------------------------
-# apply_binding.py writes <TRIAL>_mesh.pkl beside the metrics csv: a DataFrame
-# indexed by frame with a (segment, vertex, axis) column MultiIndex, in Theia
-# world metres. If it is missing the cell still runs, on markers alone, and
-# says so rather than silently changing what it measures.
+# apply_binding.py writes <TRIAL>_posed.npz beside the metrics csv. That file
+# holds POSES, not positions -- the vertices are one matrix multiply away, so
+# they are rebuilt here rather than read. mesh_dataframe does that and hands
+# back a frame-indexed DataFrame with a (segment, vertex, axis) column
+# MultiIndex, in Theia world metres. If it is missing the cell still runs, on
+# markers alone, and says so rather than silently changing what it measures.
 
-mos_mesh_path = metrics_path.with_name(metrics_path.stem + mos_mesh_pickle_suffix)
+mos_posed_path = metrics_path.with_name(metrics_path.stem + mos_posed_suffix)
 
 print("\n" + "-" * 74)
 print("  MARGIN OF STABILITY")
 print("-" * 74)
 
-if mos_mesh_path.exists():
-    mesh_positions = pd.read_pickle(mos_mesh_path)
+if mos_posed_path.exists():
+    import apply_binding as ab
+    mesh_positions = ab.mesh_dataframe(str(mos_posed_path), binding=mos_binding_file)
     mos_have_mesh = True
-    print(f"  mesh: {mos_mesh_path.name}  {mesh_positions.shape[0]} frames, "
-          f"{mesh_positions.shape[1] // 3} vertices")
+    print(f"  mesh: {mos_posed_path.name}  {mesh_positions.shape[0]} frames, "
+          f"{mesh_positions.shape[1] // 3} vertices rebuilt from the poses")
 else:
     mesh_positions = None
     mos_have_mesh = False
-    print(f"  ! {mos_mesh_path.name} not found. Falling back to marker-based")
+    print(f"  ! {mos_posed_path.name} not found. Falling back to marker-based")
     print(f"    boundaries, which sit inside the foot and will overstate the")
     print(f"    margin. Run apply_binding.py on this trial to fix that.")
 
