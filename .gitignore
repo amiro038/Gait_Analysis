@@ -8,3 +8,4 @@ posed_frames/
 *_posed_feet.gif
 *_vertices_*.csv
 *_mesh.pkl
+*_mesh.h5

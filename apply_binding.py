@@ -20,9 +20,8 @@ movie of the whole trial. From a terminal you can override with flags:
     python apply_binding.py TRIAL_metrics.csv --video --feet
     python apply_binding.py TRIAL_metrics.csv --no-video
     python apply_binding.py TRIAL_metrics.csv --no-plot
-    python apply_binding.py TRIAL_metrics.csv --vertices --obj
-    python apply_binding.py TRIAL_metrics.csv --csv
-    python apply_binding.py TRIAL_metrics.csv --pickle
+    python apply_binding.py TRIAL_metrics.csv --vertices
+    python apply_binding.py TRIAL_metrics.csv --h5
 
 HOW IT WORKS
 ------------
@@ -40,14 +39,20 @@ independent routes to the same pose.
 
 WHAT COMES OUT
 --------------
-`poses` (frames, segments, 4, 4) is always written and is tiny -- it is the
-whole result, since vertices are one matrix multiply away. `--vertices` also
-stores the (frames, vertices, 3) array and `--obj` writes one .obj per frame.
-Both get large fast: 10000 vertices over 500 frames is 50 MB as float32.
+`poses` (frames, segments, 4, 4) is the whole result and it is tiny. The
+binding is rigid -- every vertex rides exactly one segment -- so a vertex
+position is exactly
 
-To get vertex positions for analysis, do not turn `--vertices` on and load a
-50 MB array -- call `vertex_tracks()` on the small .npz and ask for the
-vertices you need:
+    p(t) = R_seg(t) @ v_local + t_seg(t)
+
+and the (frames, vertices, 3) array is an *algebraically exact* function of
+`poses`. Storing it is storing the same information over and over: for a
+3000-frame trial of 10208 vertices, 0.25 MB of poses against 368 MB of baked
+positions, a factor of about 1500, and the rebuild agrees to the last bit
+rather than to some tolerance.
+
+So do not store vertices. Call `vertex_tracks()` on the small .npz and ask
+for the vertices you need:
 
     import apply_binding as ab
     V, idx = ab.vertex_tracks("TRIAL_posed.npz", mesh="left")
@@ -56,6 +61,15 @@ vertices you need:
 index of each column. Units are metres and the frame is Theia's, the same one
 the skeleton is in, so the array drops straight into any analysis that already
 works on the export's joint positions.
+
+Measured on a 3000-frame trial: the whole mesh rebuilds in 0.69 s, one foot
+in 0.65 s, 100 vertices in 15 ms, a single vertex in 0.5 ms. Reading the
+368 MB baked array off disk takes 0.09 s, so it only wins if you genuinely
+want every vertex of every frame at once -- and it costs 368 MB to do it.
+
+`--vertices` (into the .npz) and `--h5` (a standalone HDF5 beside the trial)
+still exist for handing a baked array to something that cannot do the matrix
+multiply itself. They are off by default and should stay that way.
 
 Frames where the pose is missing come back as NaN rather than stopping the
 run, and interior gaps keep their frame numbering.
@@ -83,30 +97,22 @@ import numpy as np
 BINDING_FILE = "foot_mesh_binding.npz"
 TRIAL_METRICS_CSV = "D05_C01_SKS_metrics.csv"
 
-SAVE_VERTICES = False
-WRITE_OBJ_SEQUENCE = False
-
-# Vertex positions as CSV. Only sensible for a selection -- the full mesh is
-# 30624 columns, which is past Excel's 16384 limit and ~138 MB per trial.
-SAVE_VERTEX_CSV = False
-CSV_VERTICES = None          # explicit global indices, e.g. [0, 1500, 9000]
-CSV_MESH = None              # or a whole mesh: "left", "right", "both"
-CSV_LAYOUT = "wide"          # "wide": a row per frame; "long": tidy rows
-
-# Every vertex position as a pandas DataFrame pickle, written NEXT TO THE
-# TRIAL CSV so an analysis script can find it from the trial path alone.
-# Columns are a MultiIndex (segment, vertex, axis), index is the frame, so
-# df["left_foot"] is that foot and df.attrs carries units and provenance.
-SAVE_MESH_PICKLE = True
-PICKLE_SUFFIX = "_mesh.pkl"
-PICKLE_DTYPE = "float32"     # float64 doubles the file for sub-micron gains
-OBJ_DIR = "posed_frames"
-OBJ_STRIDE = 1
+# Baked vertex positions. Both of these write the (frames, vertices, 3) array
+# that `poses` already determines exactly, so both are redundant by ~1500x and
+# both are off. Turn one on only to hand the array to something that cannot
+# rebuild it -- a collaborator without the binding, or a tool that reads
+# arrays and not matrices. For your own analysis use vertex_tracks().
+SAVE_VERTICES = False        # also put the full array in the _posed.npz
+SAVE_MESH_H5 = False         # ... or write it beside the trial CSV as HDF5
+H5_SUFFIX = "_mesh.h5"
+H5_DTYPE = "float32"         # float64 doubles the file for sub-micron gains
+H5_COMPRESS = "gzip"         # gzip+shuffle buys ~24% on float coordinates and
+                             # costs ~20x the write time; None is the other
+                             # sensible choice. Measured, not guessed.
 OUT_SUFFIX = "_posed"
 VERBOSE = True
 
 SHAPE_TOLERANCE_MM = 5.0
-EXCEL_MAX_COLS = 16384
 
 # --- 3D check figure --------------------------------------------------------
 # Draws the whole body from the export -- every joint and segment position,
@@ -268,16 +274,96 @@ def poses_from_landmarks(local, world):
 
 
 def orthonormalise(R):
-    U, _, Vt = np.linalg.svd(R)
-    D = np.ones(U.shape[:-1])
-    D[..., -1] = np.sign(np.linalg.det(U @ Vt))
-    return (U * D[..., None, :]) @ Vt
+    """Nearest rotation to each 3x3 in a stack, missing frames left NaN.
+
+    The NaN guard is not decoration: a trial with a gap in its
+    `<Side>_Foot_Global_4x4` signal puts a NaN block into this stack, and
+    np.linalg.svd raises "SVD did not converge" on it rather than returning
+    NaN. Without this the whole run dies on one dropped frame.
+    """
+    R = np.asarray(R, dtype=float)
+    flat = R.reshape(-1, *R.shape[-2:])
+    out = np.full_like(flat, np.nan)
+    ok = np.isfinite(flat).all(axis=(1, 2))
+    if ok.any():
+        U, _, Vt = np.linalg.svd(flat[ok])
+        D = np.ones(U.shape[:-1])
+        D[..., -1] = np.sign(np.linalg.det(U @ Vt))
+        out[ok] = (U * D[..., None, :]) @ Vt
+    return out.reshape(R.shape)
 
 
 def rotation_gap_deg(A, B):
     """Angle between two stacks of rotations, in degrees."""
     tr = np.trace(np.einsum("fij,fkj->fik", A, B), axis1=1, axis2=2)
     return np.degrees(np.arccos(np.clip((tr - 1) / 2, -1, 1)))
+
+
+def segment_blocks(seg_of):
+    """Contiguous runs of one segment: [(segment, start, stop), ...].
+
+    The meshes are laid out back to back, so this is normally one run per
+    mesh and the pose can then be applied to a whole slice at once. If the
+    numbering really is interleaved it degrades to more runs and still gives
+    the right answer, just with less work done per call.
+    """
+    seg = np.asarray(seg_of).ravel()
+    if not seg.size:
+        return []
+    cut = np.flatnonzero(seg[1:] != seg[:-1]) + 1
+    return [(int(seg[s]), int(s), int(e)) for s, e in
+            zip(np.concatenate(([0], cut)), np.concatenate((cut, [seg.size])))]
+
+
+def apply_poses(poses, v_local, blocks, dtype=np.float64):
+    """(frames, segments, 4, 4) x (V, 3) -> (frames, V, 3) world positions.
+
+    One batched matrix multiply per run rather than one per frame per
+    segment. That is the whole job -- the rigid binding means there is no
+    blending to do -- and it is about 6.5x faster than looping frames and
+    writes into the output dtype directly instead of building float64 and
+    converting, which halves the peak memory.
+
+    Frames whose pose is missing come back NaN, and are given the identity
+    before the multiply so a NaN never reaches BLAS.
+    """
+    v_local = np.asarray(v_local, dtype=dtype)
+    out = np.empty((len(poses), len(v_local), 3), dtype=dtype)
+    for k, s, e in blocks:
+        P = poses[:, k]
+        bad = ~np.isfinite(P).all(axis=(1, 2))
+        R = P[:, :3, :3].astype(dtype, copy=True)
+        t = P[:, :3, 3].astype(dtype, copy=True)
+        if bad.any():
+            R[bad] = np.eye(3, dtype=dtype)
+            t[bad] = 0.0
+        # (1, n, 3) @ (frames, 3, 3) -> (frames, n, 3), i.e. v @ R.T + t
+        out[:, s:e] = v_local[s:e][None] @ R.transpose(0, 2, 1) + t[:, None, :]
+        if bad.any():
+            out[bad, s:e] = np.nan
+    return out
+
+
+def apply_poses_selected(poses, v_local, seg_of, idx, dtype=np.float64):
+    """Same, for an arbitrary selection of global vertex indices."""
+    idx = np.asarray(idx, dtype=np.intp).ravel()
+    v_local = np.asarray(v_local, dtype=dtype)
+    seg = np.asarray(seg_of).ravel()[idx]
+    out = np.empty((len(poses), idx.size, 3), dtype=dtype)
+    for k in np.unique(seg):
+        col = np.flatnonzero(seg == k)
+        P = poses[:, int(k)]
+        bad = ~np.isfinite(P).all(axis=(1, 2))
+        R = P[:, :3, :3].astype(dtype, copy=True)
+        t = P[:, :3, 3].astype(dtype, copy=True)
+        if bad.any():
+            R[bad] = np.eye(3, dtype=dtype)
+            t[bad] = 0.0
+        block = v_local[idx[col]][None] @ R.transpose(0, 2, 1) + t[:, None, :]
+        if bad.any():
+            block[bad] = np.nan
+        out[:, col] = block
+    return out
 
 
 # %%==========================================================================
@@ -289,15 +375,7 @@ def _mesh_points(z, poses, frame, stride=None):
     stride = MESH_POINT_STRIDE if stride is None else stride
     v_local, seg_of = z["vertices_local"], z["vertex_segment"]
     idx = np.arange(0, len(v_local), max(1, stride))
-    out = np.full((len(idx), 3), np.nan)
-    for k in range(poses.shape[1]):
-        P = poses[frame, k]
-        if not np.isfinite(P).all():
-            continue
-        m = seg_of[idx] == k
-        if m.any():
-            out[m] = v_local[idx][m] @ P[:3, :3].T + P[:3, 3]
-    return out
+    return apply_poses_selected(poses[frame:frame + 1], v_local, seg_of, idx)[0]
 
 
 def _frame_extent(vectors, z, poses, zoom=None):
@@ -630,14 +708,13 @@ def load_binding(path=None):
 
 
 def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
-                  write_obj=None, verbose=None):
+                  verbose=None):
     trial_csv = TRIAL_METRICS_CSV if trial_csv is None else trial_csv
     save_vertices = SAVE_VERTICES if save_vertices is None else save_vertices
-    write_obj = WRITE_OBJ_SEQUENCE if write_obj is None else write_obj
     verbose = VERBOSE if verbose is None else verbose
 
     meta, z = load_binding(binding_file)
-    v_local, n_local = z["vertices_local"], z["normals_local"]
+    v_local = z["vertices_local"]
     seg_of, lm_local = z["vertex_segment"], z["landmarks_local"]
     seg_names = meta["segments"]
 
@@ -681,8 +758,11 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
                 f"{s}: the trial has neither '{sig}' nor the landmarks "
                 f"{names}. It must carry what the binding was built from.")
 
+        # The whole 4x4, not just [3, 3]: the branch above forces row 3 to
+        # (0, 0, 0, 1) on every frame, so [3, 3] is finite even where the
+        # pose is missing and counting it reports a full trial every time.
         st = dict(segment=s, source=used,
-                  n_good=int(np.isfinite(poses[:, k, 3, 3]).sum()))
+                  n_good=int(np.isfinite(poses[:, k]).all(axis=(1, 2)).sum()))
         if fitted is not None and used != "landmarks":
             ok = np.isfinite(fitted[:, 3, 3]) & np.isfinite(poses[:, k, 3, 3])
             if ok.any():
@@ -704,33 +784,31 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
                 np.array(ref_d) - np.array(trial_d))) * 1000)
         stats.append(st)
 
-    verts = norms = None
-    if save_vertices or write_obj:
-        verts = np.full((len(items), len(v_local), 3), np.nan, dtype=np.float32)
-        norms = np.full((len(items), len(n_local), 3), np.nan, dtype=np.float32)
-        for k in range(len(seg_names)):
-            m = seg_of == k
-            if not m.any():
-                continue
-            Vl, Nl = v_local[m], n_local[m]
-            for i, P in enumerate(poses[:, k]):
-                if np.isfinite(P).all():
-                    R = P[:3, :3]
-                    verts[i, m] = (Vl @ R.T + P[:3, 3]).astype(np.float32)
-                    norms[i, m] = (Nl @ R.T).astype(np.float32)
+    verts = None
+    if save_vertices:
+        verts = apply_poses(poses, v_local, segment_blocks(seg_of),
+                            dtype=np.float32)
 
     stem = os.path.splitext(os.path.basename(trial_csv))[0]
     out_npz = stem + OUT_SUFFIX + ".npz"
+    # The binding's mesh entries carry the entire .obj file text -- `lines`
+    # plus the v/vn line numbers -- so the builder can rewrite the meshes.
+    # Nothing downstream of here reads it: vertex_tracks() wants only
+    # name/start/count, and export_posed_fbx.py reads the binding file
+    # itself. It was 1.5 MB in every trial's .npz, an order of magnitude
+    # more than the poses it travelled with, so it does not get copied.
+    slim = dict(meta)
+    slim["meshes"] = [{k: v for k, v in m.items()
+                       if k not in ("lines", "v_at", "n_at")}
+                      for m in meta["meshes"]]
     payload = dict(poses=poses, segments=np.array(seg_names),
                    frames=np.array(items), vertex_segment=seg_of,
                    meta=np.array(json.dumps(dict(
-                       trial=os.path.basename(trial_csv), binding=meta,
+                       trial=os.path.basename(trial_csv), binding=slim,
                        stats=stats))))
     if save_vertices:
         payload["vertices"] = verts
     np.savez_compressed(out_npz, **payload)
-
-    n_obj = write_obj_sequence(meta, verts, norms, stem) if write_obj else 0
 
     if verbose:
         print("\n" + "-" * 74)
@@ -758,14 +836,13 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
         if save_vertices:
             print("    vertices       (frames, vertices, 3)     float32")
         else:
-            print("    vertices       not stored -- rebuild the ones you "
-                  "need with")
+            print("    vertices       not stored -- they are exactly")
+            print("                   R_seg(t) @ v_local + t_seg(t), so "
+                  "rebuild what you need:")
             print(f"                   ab.vertex_tracks({out_npz!r}"
                   ", mesh='left')")
-        if n_obj:
-            print(f"  wrote {n_obj} .obj files to {OBJ_DIR}/")
         print("-" * 74)
-    return dict(poses=poses, vertices=verts, normals=norms, stats=stats,
+    return dict(poses=poses, vertices=verts, stats=stats,
                 frames=items, out=out_npz, vectors=vectors, matrices=matrices,
                 binding_npz=z, meta=meta,
                 trial=os.path.basename(trial_csv),
@@ -775,21 +852,17 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
 def vertices_at_frame(z, poses, frame):
     """World vertices for one frame from the compact `poses` array."""
     v_local, seg_of = z["vertices_local"], z["vertex_segment"]
-    out = np.full_like(v_local, np.nan)
-    for k in range(poses.shape[1]):
-        P = poses[frame, k]
-        if np.isfinite(P).all():
-            m = seg_of == k
-            out[m] = v_local[m] @ P[:3, :3].T + P[:3, 3]
-    return out
+    return apply_poses(poses[frame:frame + 1], v_local,
+                       segment_blocks(seg_of))[0]
 
 
-def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
+def vertex_tracks(source=None, vertices=None, mesh=None, binding=None,
+                  dtype=np.float64):
     """Vertex positions over a whole trial, in Theia world metres.
 
     This is the entry point for analysis. The full array is (frames, 10208, 3)
-    -- 50 MB for a 500-frame trial -- so select what you actually need and it
-    stays small: one vertex over 484 frames is 12 kB.
+    -- 368 MB for a 3000-frame trial -- so select what you actually need and
+    it stays small: one vertex over 484 frames is 12 kB, and costs 0.5 ms.
 
         import apply_binding as ab
         V, idx = ab.vertex_tracks("D05_C01_SKS_metrics_posed.npz")
@@ -801,9 +874,12 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
     binding -- "left", "right", "both", or the full .obj filename. `vertices`
     is explicit global indices and wins over `mesh`.
 
-    Returns (V, idx): V is (frames, len(idx), 3) float64, NaN on frames whose
-    pose was missing; idx is the global vertex index of each column, so you
-    can carry a selection between trials and know what you are looking at.
+    Returns (V, idx): V is (frames, len(idx), 3) in `dtype`, NaN on frames
+    whose pose was missing; idx is the global vertex index of each column, so
+    you can carry a selection between trials and know what you are looking at.
+
+    `dtype=np.float32` halves the memory and is still ~0.1 um at metre scale,
+    which is four orders below the binding's own accuracy.
     """
     if isinstance(source, dict):                       # apply_binding() result
         poses, z = source["poses"], source["binding_npz"]
@@ -834,21 +910,20 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None):
     if idx.size and (idx.min() < 0 or idx.max() >= len(v_local)):
         raise IndexError(f"vertex index out of range 0..{len(v_local) - 1}")
 
-    Vl, seg = v_local[idx], seg_of[idx]
-    out = np.full((len(poses), len(idx), 3), np.nan)
-    for k in range(poses.shape[1]):
-        m = seg == k
-        if not m.any():
-            continue
-        for i, P in enumerate(poses[:, k]):
-            if np.isfinite(P).all():
-                out[i, m] = Vl[m] @ P[:3, :3].T + P[:3, 3]
+    if idx.size == len(v_local) and np.array_equal(idx, np.arange(len(v_local))):
+        out = apply_poses(poses, v_local, segment_blocks(seg_of), dtype=dtype)
+    else:
+        out = apply_poses_selected(poses, v_local, seg_of, idx, dtype=dtype)
     return out, idx
 
 
 def mesh_dataframe(source=None, binding=None, dtype=None):
     """Every vertex position as a DataFrame: index = frame, columns a
     MultiIndex of (segment, vertex, axis).
+
+    Built in memory on demand -- it is not written to disk, because it is a
+    view of `poses` and nothing more. Pass `source` a _posed.npz path or the
+    dict apply_binding() returned.
 
         df = ab.mesh_dataframe("TRIAL_posed.npz")
         left  = df["left_foot"]                  # (frames, vertices*3)
@@ -866,8 +941,8 @@ def mesh_dataframe(source=None, binding=None, dtype=None):
             "mesh_dataframe needs pandas -- pip install pandas, or use "
             "vertex_tracks() which is numpy only") from exc
 
-    dtype = PICKLE_DTYPE if dtype is None else dtype
-    V, idx = vertex_tracks(source, binding=binding)
+    dtype = H5_DTYPE if dtype is None else dtype
+    V, idx = vertex_tracks(source, binding=binding, dtype=np.dtype(dtype))
 
     if isinstance(source, dict):
         z, trial = source["binding_npz"], source["trial"]
@@ -880,7 +955,7 @@ def mesh_dataframe(source=None, binding=None, dtype=None):
     cols = pd.MultiIndex.from_tuples(
         [(seg_names[seg_of[v]], int(v), a) for v in idx for a in "XYZ"],
         names=["segment", "vertex", "axis"])
-    df = pd.DataFrame(V.reshape(len(V), -1).astype(dtype), columns=cols)
+    df = pd.DataFrame(V.reshape(len(V), -1), columns=cols)
     # Sort the columns so the MultiIndex is lexsorted: the global vertex
     # numbering interleaves the two feet, and without this every
     # df[("right_foot", 9000)] lookup warns and scans.
@@ -895,133 +970,113 @@ def mesh_dataframe(source=None, binding=None, dtype=None):
     return df
 
 
-def save_mesh_pickle(result, trial_csv=None, path=None, verbose=True):
-    """Pickle mesh_dataframe() beside the trial CSV.
+def save_mesh_h5(source=None, trial_csv=None, path=None, binding=None,
+                 dtype=None, compress=None, chunk_frames=256, verbose=True):
+    """Write every vertex position beside the trial CSV, as HDF5.
 
-    Beside the CSV rather than in the working directory on purpose: an
-    analysis script that already knows the trial path can then find the mesh
-    without being told where the run happened to be started from.
+    Only worth doing to hand the array to something that cannot rebuild it
+    from `poses`. It is ~1500x the size of the _posed.npz for exactly the
+    same information, so reach for vertex_tracks() first.
+
+    HDF5 rather than a pickle for four reasons that all bite in practice:
+
+      * A pickle is executable. Loading one runs whatever is inside it, so it
+        is not something to accept from anyone else or to archive for years.
+      * A pickle is Python-and-pandas-only, and a pandas pickle is tied to
+        the version that wrote it. MATLAB, R and Visual3D all read HDF5.
+      * HDF5 is chunked, so `f["vertices"][:, 9000, :]` reads one vertex
+        track in ~3 ms without touching the other 368 MB. `pd.read_pickle`
+        has to deserialise the whole file to give you one column.
+      * The units, the coordinate frame and the binding's provenance ride in
+        the file as attributes, so it says what it is on its own.
+
+    Written in frame blocks, so peak memory is the block and not the trial.
     """
-    df = mesh_dataframe(result)
+    import h5py
+
+    dt = np.dtype(H5_DTYPE if dtype is None else dtype)
+    compress = H5_COMPRESS if compress is None else compress
+
+    if isinstance(source, dict):
+        poses, z = source["poses"], source["binding_npz"]
+        trial = source.get("trial")
+        src_path = trial_csv or source.get("trial_path") or TRIAL_METRICS_CSV
+    else:
+        if source is None:
+            source = (os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
+                      + OUT_SUFFIX + ".npz")
+        poses = np.load(source, allow_pickle=False)["poses"]
+        _, z = load_binding(binding)
+        trial = os.path.basename(str(source))
+        src_path = trial_csv or TRIAL_METRICS_CSV
+
+    v_local, seg_of = z["vertices_local"], z["vertex_segment"]
+    meta = json.loads(str(z["meta"]))
+    blocks = segment_blocks(seg_of)
+    n_f, n_v = len(poses), len(v_local)
+
     if path is None:
-        src = trial_csv or result.get("trial_path") or TRIAL_METRICS_CSV
-        d = os.path.dirname(os.path.abspath(src))
-        stem = os.path.splitext(os.path.basename(src))[0]
-        path = os.path.join(d, stem + PICKLE_SUFFIX)
-    df.to_pickle(path)
+        d = os.path.dirname(os.path.abspath(src_path))
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        path = os.path.join(d, stem + H5_SUFFIX)
+
+    kw = dict(chunks=(min(chunk_frames, n_f), min(64, n_v), 3))
+    if compress:
+        kw.update(compression=compress, shuffle=True)
+        if compress == "gzip":
+            kw["compression_opts"] = 4
+
+    with h5py.File(path, "w") as fh:
+        d = fh.create_dataset("vertices", shape=(n_f, n_v, 3), dtype=dt, **kw)
+        for i0 in range(0, n_f, chunk_frames):
+            # float64 for the multiply, then one rounding on the way to disk.
+            # The block bounds the cost, so this is the accurate order for
+            # free rather than a tradeoff.
+            sl = slice(i0, min(i0 + chunk_frames, n_f))
+            d[sl] = apply_poses(poses[sl], v_local, blocks,
+                                dtype=np.float64).astype(dt, copy=False)
+        d.attrs["units"] = "m"
+        d.attrs["axes"] = "frame, vertex, xyz"
+        d.attrs["coordinate_system"] = meta.get("coordinate_system", "theia")
+        d.attrs["trial"] = str(trial)
+        d.attrs["created_by"] = "apply_binding.py"
+        fh.create_dataset("vertex_segment", data=np.asarray(seg_of))
+        fh.create_dataset("segments",
+                          data=np.array(meta["segments"], dtype="S"))
+        fh.attrs["binding"] = json.dumps(meta)
+
     if verbose:
         print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
-              f"{df.shape[0]} frames x {df.shape[1] // 3} vertices)")
+              f"{n_f} frames x {n_v} vertices, {dt.name}"
+              f"{', ' + compress if compress else ''})")
     return path
 
 
-def load_mesh_pickle(trial_csv):
-    """The other half: hand it the trial CSV path, get the DataFrame back.
+def load_mesh_h5(trial_csv, vertices=None, frames=None):
+    """The other half: hand it the trial CSV path, get the array back.
 
-        df = ab.load_mesh_pickle("D05_C01_SKS_metrics.csv")
+        V = ab.load_mesh_h5("D05_C01_SKS_metrics.csv")
+        V = ab.load_mesh_h5(trial, vertices=[9000])   # one track, no full read
+
+    `vertices` and `frames` are read straight out of the chunked dataset, so
+    a selection never pays for the rest of the file.
     """
-    import pandas as pd
+    import h5py
 
     d = os.path.dirname(os.path.abspath(trial_csv))
     stem = os.path.splitext(os.path.basename(trial_csv))[0]
-    path = os.path.join(d, stem + PICKLE_SUFFIX)
+    path = os.path.join(d, stem + H5_SUFFIX)
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} not found -- run apply_binding on {os.path.basename(trial_csv)} "
-            f"with SAVE_MESH_PICKLE = True")
-    return pd.read_pickle(path)
-
-
-def export_vertex_csv(source=None, vertices=None, mesh=None, path=None,
-                      layout=None, binding=None, force=False, verbose=True):
-    """Write selected vertex positions to CSV, in Theia world metres.
-
-        ab.export_vertex_csv("TRIAL_posed.npz", vertices=[0, 1500, 9000])
-        ab.export_vertex_csv(res, mesh="left", layout="long")
-
-    Selection is the same as vertex_tracks(). Two layouts:
-
-      "wide"  one row per frame, columns frame, V00000_X, V00000_Y, ...
-              Opens in Excel and lines up with the export row for row.
-      "long"  one row per frame per vertex: frame, vertex, x, y, z.
-              What pandas and R want, and it has no column ceiling.
-
-    The whole mesh is 30624 wide columns against Excel's 16384 limit, so a
-    selection that large raises unless force=True. Use "long", or the .npz,
-    when you really do want all of them.
-    """
-    layout = CSV_LAYOUT if layout is None else layout
-    if layout not in ("wide", "long"):
-        raise ValueError(f"layout must be 'wide' or 'long', not {layout!r}")
-
-    V, idx = vertex_tracks(source, vertices=vertices, mesh=mesh,
-                           binding=binding)
-    n_f, n_v = V.shape[0], V.shape[1]
-
-    if layout == "wide" and n_v * 3 > EXCEL_MAX_COLS and not force:
-        raise ValueError(
-            f"{n_v} vertices is {n_v * 3} columns, past Excel's "
-            f"{EXCEL_MAX_COLS}. Select fewer, use layout='long', or pass "
-            f"force=True.")
-
-    if path is None:
-        if isinstance(source, dict):
-            stem = os.path.splitext(source["out"])[0]
-        else:
-            stem = os.path.splitext(source or (
-                os.path.splitext(os.path.basename(TRIAL_METRICS_CSV))[0]
-                + OUT_SUFFIX + ".npz"))[0]
-        tag = mesh if mesh else (f"{n_v}v" if vertices is not None else "all")
-        path = f"{stem}_vertices_{tag}.csv"
-
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        if layout == "wide":
-            head = ["frame"] + [f"V{v:05d}_{a}" for v in idx for a in "XYZ"]
-            fh.write(",".join(head) + "\n")
-            flat = V.reshape(n_f, -1)
-            for i in range(n_f):
-                fh.write(str(i) + "," + ",".join(
-                    "" if not np.isfinite(x) else f"{x:.6f}"
-                    for x in flat[i]) + "\n")
-        else:
-            fh.write("frame,vertex,x,y,z\n")
-            for i in range(n_f):
-                for j in range(n_v):
-                    x, y, zc = V[i, j]
-                    if not np.isfinite(x):
-                        fh.write(f"{i},{idx[j]},,,\n")
-                    else:
-                        fh.write(f"{i},{idx[j]},{x:.6f},{y:.6f},{zc:.6f}\n")
-
-    if verbose:
-        print(f"  wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
-              f"{n_f} frames x {n_v} vertices, {layout})")
-    return path
-
-
-def write_obj_sequence(meta, verts, norms, stem):
-    """One .obj per frame, reusing each mesh's original faces and comments."""
-    os.makedirs(OBJ_DIR, exist_ok=True)
-    n = 0
-    for i in range(0, len(verts), OBJ_STRIDE):
-        if not np.isfinite(verts[i]).any():
-            continue
-        for m in meta["meshes"]:
-            lines = list(m["lines"])
-            sl = slice(m["start"], m["start"] + m["count"])
-            V = verts[i][sl]
-            for j, li in enumerate(m["v_at"]):
-                lines[li] = "v %.6f %.6f %.6f" % tuple(V[j])
-            if m["has_normals"] and norms is not None:
-                N = norms[i][sl]
-                for j, li in enumerate(m["n_at"]):
-                    lines[li] = "vn %.6f %.6f %.6f" % tuple(N[j])
-            path = os.path.join(
-                OBJ_DIR, f"{stem}_{os.path.splitext(m['name'])[0]}_{i:05d}.obj")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(lines) + "\n")
-            n += 1
-    return n
+            f"{path} not found -- run apply_binding on "
+            f"{os.path.basename(trial_csv)} with SAVE_MESH_H5 = True, or "
+            f"rebuild from the _posed.npz with vertex_tracks()")
+    with h5py.File(path, "r") as fh:
+        d = fh["vertices"]
+        fsel = slice(None) if frames is None else frames
+        if vertices is None:
+            return d[fsel]
+        return d[fsel, np.asarray(vertices, dtype=np.intp).ravel(), :]
 
 
 def _plot_frames_arg(argv):
@@ -1048,20 +1103,13 @@ def main(argv=None):
     files = [a for i, a in enumerate(argv)
              if not a.startswith("--") and i != consumed]
     res = apply_binding(files[0] if files else None,
-                        save_vertices="--vertices" in argv,
-                        write_obj="--obj" in argv)
+                        save_vertices="--vertices" in argv)
 
-    if SAVE_MESH_PICKLE or "--pickle" in argv:
+    if SAVE_MESH_H5 or "--h5" in argv:
         try:
-            save_mesh_pickle(res)
+            save_mesh_h5(res)
         except Exception as exc:                        # noqa: BLE001
-            print(f"  [mesh pickle skipped: {type(exc).__name__}: {exc}]")
-
-    if SAVE_VERTEX_CSV or "--csv" in argv:
-        try:
-            export_vertex_csv(res, vertices=CSV_VERTICES, mesh=CSV_MESH)
-        except Exception as exc:                        # noqa: BLE001
-            print(f"  [vertex CSV skipped: {type(exc).__name__}: {exc}]")
+            print(f"  [mesh HDF5 skipped: {type(exc).__name__}: {exc}]")
 
     # CONFIG decides by default; flags override it. Running the file from
     # Spyder hands us an empty argv, which is exactly the case where the
