@@ -211,6 +211,7 @@ def validate_belt_speed(true_belt=1.3, fs=100.0, stance_s=0.69, stride_s=1.11,
 
 def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
                                  com_velocity_ml=0.30, pendulum_length=1.00,
+                                 step_length=0.68,
                                  n_frames=400, fs=100.0, g=9.81):
     import pandas as pd
     import tempfile
@@ -235,10 +236,14 @@ def validate_margin_of_stability(ankle_ml=0.10, foot_lateral_edge=0.14,
     com_z = np.sqrt(pendulum_length ** 2 - ankle_ml ** 2)
 
     columns = {}
-    for side, ml in (("Right", ankle_ml), ("Left", -ankle_ml)):
+    # The swing ankle is a realistic STEP LENGTH behind the stance one. With
+    # both at AP = 0 the test cannot catch a lateral direction that has picked
+    # up an AP component, which is exactly the bug this guards against.
+    for side, ml, ap in (("Right", ankle_ml, 0.0),
+                         ("Left", -ankle_ml, -step_length)):
         for joint in ("Ankle", "Toes", "Heel", "Hip"):
             columns[f"{side}_{joint}_Position"] = np.full(n_frames, ml)
-            columns[f"{side}_{joint}_Position.1"] = np.zeros(n_frames)
+            columns[f"{side}_{joint}_Position.1"] = np.full(n_frames, ap)
             columns[f"{side}_{joint}_Position.2"] = (
                 np.full(n_frames, 0.9) if joint == "Hip" else np.zeros(n_frames))
     columns["Whole_body_COG"] = np.zeros(n_frames)

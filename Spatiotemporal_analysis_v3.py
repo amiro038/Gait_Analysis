@@ -1833,19 +1833,24 @@ if 'Left_Hip' in kinematic_positions and 'Left_Ankle' in kinematic_positions:
 def mos_lateral_unit(stance_side, frame):
     """Unit vector in the ground plane pointing laterally for the stance foot.
 
-    Defined as the direction from the contralateral foot toward the stance
-    foot, so it does not depend on whether lab +X points left or right, and it
-    follows the walker if the treadmill heading drifts.
+    PERPENDICULAR to the direction of travel, with the sign set by which side
+    the stance ankle sits on. The obvious alternative -- the raw vector from
+    the contralateral ankle to the stance ankle -- does not work: at heel
+    strike the feet are about 0.7 m apart in AP and only 0.15 m in ML, so that
+    vector points roughly 97% FORWARD and the "lateral" boundary lands on the
+    toe rather than the lateral border, inflating the margin by a foot length.
+    Taking the sign from the offset keeps it independent of whether lab +X
+    points left or right.
     """
     mos_other = 'Right' if stance_side == 'Left' else 'Left'
     mos_a = kinematic_positions[f'{mos_other}_Ankle'][frame]
     mos_b = kinematic_positions[f'{stance_side}_Ankle'][frame]
-    mos_v = np.array([mos_b[com_ml_axis] - mos_a[com_ml_axis],
-                      mos_b[com_ap_axis] - mos_a[com_ap_axis]])
-    mos_n = np.linalg.norm(mos_v)
-    if not np.isfinite(mos_n) or mos_n < 1e-6:
-        return np.array([1.0, 0.0])
-    return mos_v / mos_n
+    mos_perp = np.array([com_belt_sign, 0.0])       # horizontal, across travel
+    mos_offset = ((mos_b[com_ml_axis] - mos_a[com_ml_axis]) * mos_perp[0]
+                  + (mos_b[com_ap_axis] - mos_a[com_ap_axis]) * mos_perp[1])
+    if not np.isfinite(mos_offset) or abs(mos_offset) < 1e-6:
+        return mos_perp
+    return mos_perp * np.sign(mos_offset)
 
 
 def mos_boundary(stance_side, frame, direction_2d):
