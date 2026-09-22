@@ -2165,3 +2165,821 @@ axes[2].set_xlabel('CoP mediolateral (mm)'); axes[2].set_ylabel('CoP anteroposte
 axes[2].set_title('CoP paths, aligned to heel strike', fontsize=10)
 axes[2].grid(alpha=0.15)
 plt.tight_layout()
+
+# =============================================================================
+# %% Stride series
+# =============================================================================
+# Everything from here on is a STRIDE-TO-STRIDE metric: alpha, entropy, the
+# harmonic ratio, the goal-equivalent manifold. They all read a series indexed
+# by stride, and every one of them is N-DEPENDENT. Build them ad hoc and you
+# end up comparing alpha on 756 strides against entropy on 150, where part of
+# any difference between conditions is sample size rather than the walker.
+#
+# So the series are cut ONCE, here, and every later cell reads this table.
+# Nothing new is computed: the per-step columns are already on gait_event_data,
+# this just takes one limb's rows, drops the warm-up, and truncates.
+#
+# WHY A FIXED N MATTERS MORE THAN A LARGE N
+# alpha, sample entropy and lambda all drift with series length, so if one
+# condition ran 15 min and another 10, the longer trial gets a different alpha
+# for a reason that has nothing to do with gait. Truncate every trial in the
+# dataset to a COMMON length -- the shortest one -- and state it.
+#
+#   at 108 bpm the cadence is 54 strides/min, so
+#     15 min trial -> 810 strides, 756 after a 60 s warm-up
+#     10 min trial -> 540 strides, 486 after a 60 s warm-up
+#
+# 486 is below the 600 that Damouras recommends for a stable alpha, so on the
+# 10 min trials alpha carries a wider confidence interval. That is a reason to
+# report the interval, not a reason to use a different N per trial.
+#
+# THE METRONOME
+# It paces cadence, so it sets stride TIMING directly. alpha on stride time
+# measures how tightly the walker locks to the beat, which is a real finding
+# but a different one. The series the metronome does not constrain (step width,
+# clearance, margins, impulses) are the better primary outcomes.
+#
+# References
+#   Damouras et al. (2010) Gait Posture 31(3), 336-340.
+#   Dingwell, John & Cusumano (2010) PLoS Comput Biol 6(7), e1000856.
+# =============================================================================
+
+ss_limb     = 'R'      # which limb's steps define the series, same as lds_limb
+ss_warmup_s = 60.0     # treadmill acclimatisation, excluded
+ss_fixed_n  = None     # None = use everything. SET THIS to the shortest trial
+                       # in the dataset before comparing trials, e.g. 486.
+
+print("\n" + "-" * 74)
+print("  STRIDE SERIES")
+print("-" * 74)
+
+# one limb's rows, past the warm-up, in time order. reset_index matters: every
+# later cell indexes this table positionally as a series
+ss_keep = ((gait_event_data['support_limb'] == ss_limb)
+           & (gait_event_data['initial_contact_kinematic_frame_100hz']
+              > ss_warmup_s * kinematic_fs))
+stride_series = (gait_event_data.loc[ss_keep]
+                 .sort_values('initial_contact_kinematic_frame_100hz')
+                 .reset_index(drop=True))
+ss_all = (gait_event_data.loc[gait_event_data['support_limb'] == ss_limb]
+          .sort_values('initial_contact_kinematic_frame_100hz'))
+
+print(f"  limb {ss_limb}, {ss_warmup_s:.0f} s warm-up excluded")
+print(f"  {len(stride_series)} strides available ({len(ss_all)} before the warm-up cut)")
+
+# --- truncate to the dataset-wide length -------------------------------------
+ss_available = len(stride_series)
+if ss_fixed_n is None:
+    print(f"  using all {ss_available}. SET ss_fixed_n before comparing trials:")
+    print(f"    alpha, entropy and lambda all drift with N, so a 756-stride trial")
+    print(f"    is not comparable with a 486-stride one")
+elif ss_available < ss_fixed_n:
+    print(f"  ! only {ss_available} strides, fewer than the {ss_fixed_n} this dataset")
+    print(f"    is standardised to. This trial is NOT comparable on any N-dependent")
+    print(f"    metric -- either lower ss_fixed_n for the whole dataset, or drop it")
+else:
+    stride_series = stride_series.iloc[:ss_fixed_n].copy()
+    print(f"  truncated to the dataset-wide {ss_fixed_n} strides "
+          f"({ss_available} were available)")
+
+# --- which series are actually usable ----------------------------------------
+# A series with gaps is not a series. DFA and entropy both accept a NaN-riddled
+# array and hand back a number, so completeness is checked here, once, and only
+# the series that pass are carried forward.
+
+ss_candidates = ['stride_time', 'stance_time', 'swing_time', 'stance_percentage',
+                 'double_support_percentage', 'step_length', 'step_width',
+                 'stride_length', 'stride_velocity', 'minimum_foot_clearance',
+                 'mos_ml_contact', 'mos_ml_min', 'mos_ap_contact',
+                 'trip_risk_integral', 'propulsive_impulse_bw_s',
+                 'braking_impulse_bw_s', 'grf_peak1_bw', 'grf_peak2_bw',
+                 'loading_rate_bw_s', 'cop_ml_range_mm', 'free_moment_peak_nm']
+
+ss_complete = {}
+print(f"\n  series                       n valid   complete       mean        CV")
+stride_series_usable = []
+for ss_c in ss_candidates:
+    if ss_c not in stride_series.columns:
+        continue
+    ss_v = pd.to_numeric(stride_series[ss_c], errors='coerce').to_numpy(float)
+    ss_ok = np.isfinite(ss_v)
+    if ss_ok.sum() < 10:
+        continue
+    ss_pct = 100 * ss_ok.mean()
+    ss_mean = np.nanmean(ss_v)
+    ss_cv = 100 * np.nanstd(ss_v) / abs(ss_mean) if ss_mean else np.nan
+    ss_complete[ss_c] = (ss_pct, ss_cv)
+    # a column with no variance is not a series. Every estimator downstream
+    # will still return a number for it -- DFA fits a slope to the floating
+    # point residue, entropy finds every template matching every other -- so it
+    # is caught once, here, rather than producing a plausible-looking result
+    ss_flat = np.nanstd(ss_v) <= 1e-10 * max(abs(ss_mean), 1.0)
+    print(f"    {ss_c:27s} {ss_ok.sum():5d}    {ss_pct:5.1f}%   {ss_mean:10.4f}  "
+          f"{ss_cv:6.2f}%{'   constant, dropped' if ss_flat else ''}")
+    if ss_pct > 95 and not ss_flat:
+        stride_series_usable.append(ss_c)
+
+print(f"\n  {len(stride_series_usable)} series are over 95% complete and carry forward")
+
+# the metronome constrains timing directly, so flag those separately
+ss_cued = {'stride_time', 'stance_time', 'swing_time', 'cadence'}
+ss_uncued = [c for c in stride_series_usable if c not in ss_cued]
+print(f"  with a metronome, prefer the {len(ss_uncued)} it does not constrain:")
+print(f"    {', '.join(ss_uncued[:6])}{' ...' if len(ss_uncued) > 6 else ''}")
+
+# =============================================================================
+# ----Figures: what the series is, what is in it, and how variable each one is
+# =============================================================================
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.4))
+
+# panel 1: the cut itself, drawn on the stride time trace
+ss_x_all = np.arange(len(ss_all))
+ss_t_all = pd.to_numeric(ss_all['stride_time'], errors='coerce').to_numpy(float)
+ss_n_dropped = len(ss_all) - ss_available
+axes[0].plot(ss_x_all, ss_t_all, color='#bbbbbb', lw=0.8)
+axes[0].plot(ss_x_all[ss_n_dropped:ss_n_dropped + len(stride_series)],
+             ss_t_all[ss_n_dropped:ss_n_dropped + len(stride_series)],
+             color='#2a5d9f', lw=0.9)
+axes[0].axvspan(0, ss_n_dropped, color='#cc6633', alpha=0.12, lw=0)
+axes[0].annotate(f'{ss_warmup_s:.0f} s warm-up\n({ss_n_dropped} strides)',
+                 (ss_n_dropped / 2, np.nanmax(ss_t_all)), fontsize=7,
+                 ha='center', va='top', color='#cc6633')
+if ss_fixed_n is not None and ss_available > ss_fixed_n:
+    axes[0].axvline(ss_n_dropped + ss_fixed_n, color='k', ls='--', lw=1)
+    axes[0].annotate(f'ss_fixed_n = {ss_fixed_n}',
+                     (ss_n_dropped + ss_fixed_n, np.nanmin(ss_t_all)),
+                     fontsize=7, rotation=90, va='bottom')
+axes[0].set_xlabel(f'{ss_limb} limb step number')
+axes[0].set_ylabel('stride time (s)')
+axes[0].set_title(f'The series: {len(stride_series)} strides kept', fontsize=10)
+axes[0].grid(alpha=0.15)
+
+# panel 2: every usable series on one stride axis, z-scored and stacked, so it
+# is obvious they share an index and roughly how each one behaves
+ss_show = ss_uncued[:6] if len(ss_uncued) >= 3 else stride_series_usable[:6]
+for ss_i, ss_c in enumerate(ss_show):
+    ss_v = pd.to_numeric(stride_series[ss_c], errors='coerce').to_numpy(float)
+    ss_z = (ss_v - np.nanmean(ss_v)) / np.nanstd(ss_v)
+    axes[1].plot(np.arange(len(ss_z)), ss_z + 5 * ss_i, lw=0.6, color='#2a5d9f')
+    axes[1].annotate(ss_c, (0, 5 * ss_i + 2.0), fontsize=7, color='#444')
+axes[1].set_yticks([])
+axes[1].set_xlabel('stride number')
+axes[1].set_title('Each series, z-scored and offset', fontsize=10)
+axes[1].grid(alpha=0.15, axis='x')
+
+# panel 3: variability, with completeness written on each bar
+ss_names = list(ss_complete)
+ss_cvs = [ss_complete[c][1] for c in ss_names]
+ss_cols = ['#2a5d9f' if c in stride_series_usable else '#bbbbbb' for c in ss_names]
+axes[2].barh(np.arange(len(ss_names)), ss_cvs, color=ss_cols)
+for ss_i, ss_c in enumerate(ss_names):
+    axes[2].annotate(f"{ss_complete[ss_c][0]:.0f}%", (ss_cvs[ss_i], ss_i),
+                     fontsize=6, va='center', xytext=(3, 0),
+                     textcoords='offset points', color='#555')
+axes[2].set_yticks(np.arange(len(ss_names)))
+axes[2].set_yticklabels(ss_names, fontsize=7)
+axes[2].invert_yaxis()
+axes[2].set_xlabel('coefficient of variation (%)')
+axes[2].set_title('Variability, labelled with completeness\n'
+                  '(grey = under 95% complete, dropped)', fontsize=10)
+axes[2].grid(alpha=0.15, axis='x')
+
+plt.tight_layout()
+
+# =============================================================================
+# %% Long-range correlations
+# =============================================================================
+# Detrended fluctuation analysis asks whether a stride is statistically related
+# to strides HUNDREDS of strides earlier. Not how MUCH gait varies -- how the
+# variation is organised in time. It is blind to magnitude: shuffle a series
+# and its SD is unchanged while alpha collapses to 0.5.
+#
+#   integrate   Y(k) = sum of (x_i - mean) up to i = k, so the series becomes a
+#               random-walk-like profile
+#   segment     non-overlapping boxes of length n, forwards AND backwards so
+#               nothing is discarded when n does not divide N
+#   detrend     least squares straight line within each box (DFA-1)
+#   fluctuate   F(n) = RMS of the residuals over all boxes
+#   scale       F(n) ~ n^alpha, and alpha is the slope in log-log space
+#
+#   alpha < 0.5   anti-persistent, a long stride is corrected by a short one
+#   alpha = 0.5   uncorrelated, no memory at all
+#   0.5 < a < 1   persistent, a deviation tends to be followed by more of the
+#                 same -- the healthy range for stride time, ~0.75-0.85
+#   alpha ~ 1.0   1/f, scale free
+#   alpha > 1.0   non-stationary. Usually a drift in the trial rather than a
+#                 property of control, so check the raw trace before believing it
+#
+# THE BOX RANGE IS THE ONE CHOICE THAT REALLY MATTERS
+# Damouras examined it directly: 16 <= n <= N/9. The widely used 4 to N/4
+# inflates alpha, because small boxes are dominated by the detrending fit
+# itself and boxes past N/9 hold too few segments to average.
+#
+# TWO CHECKS RUN ON EVERY SERIES, NOT JUST IN A TEST FILE
+#   a shuffled surrogate must come back at alpha = 0.5. Shuffling destroys
+#     order and nothing else, so anything else means the estimator is
+#     misbehaving at this N.
+#   a second estimator, GPH on the periodogram, reaches the same property by a
+#     completely different route (alpha = d + 0.5). Its own scatter is ~0.15 at
+#     these N against ~0.07 for DFA, so it is a ballpark check, and only a
+#     large gap is informative.
+#
+# References
+#   Peng et al. (1994) Phys Rev E 49, 1685-1689.
+#   Hausdorff et al. (1996) J Appl Physiol 80(5), 1448-1457.
+#   Damouras et al. (2010) Gait Posture 31(3), 336-340.
+#   Geweke & Porter-Hudak (1983) J Time Ser Anal 4(4), 221-238.
+# =============================================================================
+
+dfa_order        = 1        # DFA-1, a straight line removed inside each box
+dfa_min_box      = 16       # Damouras
+dfa_max_box_frac = 1.0 / 9  # Damouras
+dfa_n_boxes      = 20       # log-spaced box sizes sampled between those limits
+dfa_n_surrogate  = 50       # shuffles per series for the surrogate check
+dfa_gph_power    = 0.5      # GPH bandwidth, m = N ** this
+dfa_rng = np.random.default_rng(0)
+
+# The one function this cell defines: it is called once per series, another 50
+# times per series for the surrogates, and again for the figures.
+def dfa_alpha(series, min_box=dfa_min_box, max_box=None):
+    """DFA scaling exponent, with the fluctuation curve it was fitted to.
+
+    Returns alpha, its standard error, the R2 of the log-log fit, and the
+    (boxes, F) curve so the figure can draw exactly what was fitted.
+    """
+    x = np.asarray(series, float)
+    x = x[np.isfinite(x)]
+    n_total = len(x)
+    max_box = int(dfa_max_box_frac * n_total) if max_box is None else int(max_box)
+    empty = dict(alpha=np.nan, se=np.nan, r2=np.nan, n=n_total,
+                 boxes=np.array([]), fluct=np.array([]), profile=np.array([]))
+    if max_box <= min_box or n_total < 4 * min_box:
+        return empty
+    # a series with no variance is all floating point residue once the mean is
+    # removed, and DFA will happily fit a slope to that residue. Refuse it
+    if np.std(x) <= 1e-10 * max(abs(x.mean()), 1.0):
+        return empty
+
+    # the integrated profile, which is what actually gets detrended
+    profile = np.cumsum(x - x.mean())
+    boxes = np.unique(np.round(np.logspace(
+        np.log10(min_box), np.log10(max_box), dfa_n_boxes)).astype(int))
+
+    fluct = np.full(len(boxes), np.nan)
+    for i, n in enumerate(boxes):
+        count = n_total // n
+        if count < 2:
+            continue
+        # forward from the start AND backward from the end, so a series whose
+        # length is not a multiple of n does not lose its tail
+        seg = np.vstack([profile[:count * n].reshape(count, n),
+                         profile[n_total - count * n:].reshape(count, n)])
+        t = np.arange(n)
+        trend = np.polyval(np.polyfit(t, seg.T, dfa_order), t[:, None]).T
+        fluct[i] = np.sqrt(np.mean((seg - trend) ** 2))
+
+    ok = np.isfinite(fluct) & (fluct > 0)
+    if ok.sum() < 4:
+        return empty
+
+    lx, ly = np.log10(boxes[ok]), np.log10(fluct[ok])
+    slope, icept = np.polyfit(lx, ly, 1)
+    resid = ly - (slope * lx + icept)
+    se = float(np.sqrt(np.sum(resid ** 2) / max(len(lx) - 2, 1)
+                       / np.sum((lx - lx.mean()) ** 2)))
+    r2 = float(1 - np.sum(resid ** 2) / np.sum((ly - ly.mean()) ** 2))
+    return dict(alpha=float(slope), se=se, r2=r2, n=n_total,
+                boxes=boxes[ok], fluct=fluct[ok], profile=profile)
+
+print("\n" + "-" * 74)
+print("  LONG-RANGE CORRELATIONS (DFA)")
+print("-" * 74)
+
+dfa_n_used = len(stride_series)
+dfa_max_box = int(dfa_max_box_frac * dfa_n_used)
+print(f"  N = {dfa_n_used} strides, boxes {dfa_min_box} to {dfa_max_box} "
+      f"(Damouras: 16 to N/9)")
+if dfa_n_used < 600:
+    print(f"  ! under the 600 strides Damouras recommends. alpha is still")
+    print(f"    estimable but its confidence interval is wider -- report it")
+if dfa_max_box <= dfa_min_box * 2:
+    print(f"  ! the box range spans less than one octave, alpha is not meaningful")
+
+# --- one alpha per usable series, each with its own surrogate and GPH check ---
+dfa_rows = []
+dfa_curves = {}
+for dfa_name in stride_series_usable:
+    dfa_x = pd.to_numeric(stride_series[dfa_name], errors='coerce').to_numpy(float)
+    dfa_res = dfa_alpha(dfa_x)
+    if not np.isfinite(dfa_res['alpha']):
+        continue
+    dfa_curves[dfa_name] = dfa_res
+
+    # surrogate: same values, order destroyed, so alpha must fall to 0.5
+    dfa_clean = dfa_x[np.isfinite(dfa_x)]
+    dfa_sur = np.array([dfa_alpha(dfa_rng.permutation(dfa_clean))['alpha']
+                        for _ in range(dfa_n_surrogate)], float)
+
+    # GPH: regress the log periodogram on log(4 sin^2(w/2)) over the lowest
+    # frequencies. alpha = d + 0.5 for fractional Gaussian noise
+    dfa_m = int(len(dfa_clean) ** dfa_gph_power)
+    dfa_per = np.abs(np.fft.rfft(dfa_clean - dfa_clean.mean())) ** 2 / (2 * np.pi * len(dfa_clean))
+    dfa_w = 2 * np.pi * np.arange(len(dfa_per)) / len(dfa_clean)
+    dfa_j = np.arange(1, min(dfa_m, len(dfa_per) - 1) + 1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dfa_reg = np.log(4 * np.sin(dfa_w[dfa_j] / 2) ** 2)
+        dfa_resp = np.log(dfa_per[dfa_j])
+    dfa_fin = np.isfinite(dfa_reg) & np.isfinite(dfa_resp)   # an ordinate can be 0
+    dfa_gph = (0.5 - np.polyfit(dfa_reg[dfa_fin], dfa_resp[dfa_fin], 1)[0]
+               if dfa_fin.sum() >= 4 else np.nan)
+
+    dfa_rows.append({'series': dfa_name, 'n': dfa_res['n'],
+                     'alpha': dfa_res['alpha'], 'alpha_se': dfa_res['se'],
+                     'r2': dfa_res['r2'], 'alpha_gph': dfa_gph,
+                     'surrogate_mean': float(np.nanmean(dfa_sur)),
+                     'surrogate_sd': float(np.nanstd(dfa_sur)),
+                     'cued_by_metronome': dfa_name in ss_cued})
+
+dfa_results = pd.DataFrame(dfa_rows)
+
+if len(dfa_results):
+    print(f"\n  series                      alpha   +-SE     R2    GPH   "
+          f"surrogate     cued")
+    for _, r in dfa_results.iterrows():
+        print(f"    {r['series']:26s} {r['alpha']:5.3f}  {r['alpha_se']:.3f}  "
+              f"{r['r2']:.3f}  {r['alpha_gph']:5.3f}  "
+              f"{r['surrogate_mean']:.3f}+-{r['surrogate_sd']:.3f}"
+              f"{'   yes' if r['cued_by_metronome'] else '    no'}")
+
+    dfa_bad = dfa_results[np.abs(dfa_results['surrogate_mean'] - 0.5) > 0.05]
+    if len(dfa_bad):
+        print(f"\n  ! {len(dfa_bad)} series have a shuffled surrogate away from 0.5:")
+        print(f"    {', '.join(dfa_bad['series'])}")
+        print(f"    A shuffle destroys order and nothing else, so alpha must go to")
+        print(f"    0.5. Anything else means the estimator misbehaves at this N")
+    else:
+        print(f"\n  surrogate check passed: every shuffled series returned alpha ~ 0.5")
+
+    dfa_gap = np.abs(dfa_results['alpha'] - dfa_results['alpha_gph'])
+    print(f"  DFA vs GPH: median gap {np.nanmedian(dfa_gap):.3f}, "
+          f"worst {np.nanmax(dfa_gap):.3f}  (GPH scatter alone is ~0.15 at this N)")
+    if np.nanmedian(dfa_gap) > 0.25:
+        print(f"    ! the two estimators disagree, which usually means the series is")
+        print(f"      not a clean fGn. Check it for a trend or a level shift")
+
+    print(f"\n  reminder: the metronome paces cadence, so alpha on the cued series")
+    print(f"  measures how tightly the walker locks to the beat. The uncued series")
+    print(f"  are the better primary outcomes")
+else:
+    print("  ! no series produced an alpha")
+
+# =============================================================================
+# ----Figures: the profile and its boxes, the log-log fit, the surrogate, alpha
+# =============================================================================
+# The primary series for the figures: the first uncued one if there is one,
+# since that is what the protocol is actually about
+# and it has to be one that actually produced an alpha, not just one that was
+# nominally usable
+dfa_show = next((c for c in dfa_curves if c not in ss_cued),
+                next(iter(dfa_curves), None))
+
+if dfa_show is not None:
+    dfa_res = dfa_curves[dfa_show]
+    dfa_x = pd.to_numeric(stride_series[dfa_show], errors='coerce').to_numpy(float)
+    dfa_clean = dfa_x[np.isfinite(dfa_x)]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8.6))
+
+    # panel 1: the integrated profile with two box sizes drawn on it, and the
+    # straight line that gets removed inside each box. This IS the algorithm
+    dfa_prof = dfa_res['profile']
+    axes[0, 0].plot(dfa_prof, color='#333', lw=0.9, label='Y(k), integrated profile')
+    for dfa_n, dfa_col, dfa_off in ((dfa_res['boxes'][0], '#2a5d9f', 0),
+                                    (dfa_res['boxes'][-1], '#cc6633', 0)):
+        dfa_count = len(dfa_prof) // dfa_n
+        for dfa_b in range(dfa_count):
+            dfa_seg = dfa_prof[dfa_b * dfa_n:(dfa_b + 1) * dfa_n]
+            dfa_t = np.arange(dfa_n)
+            dfa_fit = np.polyval(np.polyfit(dfa_t, dfa_seg, dfa_order), dfa_t)
+            axes[0, 0].plot(dfa_b * dfa_n + dfa_t, dfa_fit, color=dfa_col, lw=1.4,
+                            label=f'local fits, n = {dfa_n}' if dfa_b == 0 else None)
+        for dfa_b in range(dfa_count + 1):
+            axes[0, 0].axvline(dfa_b * dfa_n, color=dfa_col, lw=0.3, alpha=0.35)
+    axes[0, 0].set_xlabel('stride number')
+    axes[0, 0].set_ylabel('cumulative deviation from the mean')
+    axes[0, 0].set_title(f'Step 1-3: integrate {dfa_show}, box it, detrend each box',
+                         fontsize=10)
+    axes[0, 0].legend(fontsize=7, frameon=False)
+    axes[0, 0].grid(alpha=0.15)
+
+    # panel 2: F(n) against n in log-log, with the fitted slope = alpha
+    axes[0, 1].loglog(dfa_res['boxes'], dfa_res['fluct'], 'o', ms=5,
+                      color='#2a5d9f', label='F(n)')
+    dfa_lx = np.log10(dfa_res['boxes'])
+    dfa_fitline = np.polyval(np.polyfit(dfa_lx, np.log10(dfa_res['fluct']), 1), dfa_lx)
+    axes[0, 1].loglog(dfa_res['boxes'], 10 ** dfa_fitline, '-', color='#cc6633', lw=2,
+                      label=f"alpha = {dfa_res['alpha']:.3f} +- {dfa_res['se']:.3f}"
+                            f"\nR2 = {dfa_res['r2']:.3f}")
+    # the two reference slopes, anchored at the first point so they are comparable
+    for dfa_ref, dfa_lbl, dfa_ls in ((0.5, 'alpha = 0.5, no memory', ':'),
+                                     (1.0, 'alpha = 1.0, 1/f', '--')):
+        axes[0, 1].loglog(dfa_res['boxes'],
+                          dfa_res['fluct'][0] * (dfa_res['boxes'] / dfa_res['boxes'][0]) ** dfa_ref,
+                          dfa_ls, color='#888', lw=1, label=dfa_lbl)
+    axes[0, 1].set_xlabel('box size n (strides)')
+    axes[0, 1].set_ylabel('fluctuation F(n)')
+    axes[0, 1].set_title('Step 4-5: F(n) ~ n^alpha, alpha is the slope', fontsize=10)
+    axes[0, 1].legend(fontsize=7, frameon=False)
+    axes[0, 1].grid(alpha=0.15, which='both')
+
+    # panel 3: the real series against a shuffled copy. Same values, same SD,
+    # different alpha -- which is the whole point of the measure
+    dfa_shuf = dfa_rng.permutation(dfa_clean)
+    dfa_sres = dfa_alpha(dfa_shuf)
+    axes[1, 0].plot(dfa_clean, lw=0.6, color='#2a5d9f',
+                    label=f"as walked, alpha = {dfa_res['alpha']:.3f}")
+    axes[1, 0].plot(dfa_shuf, lw=0.6, color='#cc6633', alpha=0.65,
+                    label=f"shuffled, alpha = {dfa_sres['alpha']:.3f}")
+    axes[1, 0].set_xlabel('stride number')
+    axes[1, 0].set_ylabel(dfa_show)
+    axes[1, 0].set_title(f'Identical values, identical SD '
+                         f'({np.nanstd(dfa_clean):.4f}), different order',
+                         fontsize=10)
+    axes[1, 0].legend(fontsize=7, frameon=False)
+    axes[1, 0].grid(alpha=0.15)
+
+    # panel 4: alpha for every series, with the surrogate beside it
+    dfa_ord = dfa_results.sort_values('alpha')
+    dfa_y = np.arange(len(dfa_ord))
+    axes[1, 1].barh(dfa_y, dfa_ord['alpha'], xerr=dfa_ord['alpha_se'],
+                    color=['#bbbbbb' if c else '#2a5d9f'
+                           for c in dfa_ord['cued_by_metronome']],
+                    error_kw=dict(lw=0.8))
+    axes[1, 1].plot(dfa_ord['surrogate_mean'], dfa_y, 'kx', ms=5,
+                    label='shuffled surrogate')
+    axes[1, 1].axvline(0.5, color='#888', ls=':', lw=1)
+    axes[1, 1].axvline(1.0, color='#888', ls='--', lw=1)
+    axes[1, 1].annotate('no memory', (0.5, -0.4), fontsize=6, rotation=90,
+                        ha='right', va='bottom', color='#666')
+    axes[1, 1].annotate('1/f', (1.0, -0.4), fontsize=6, rotation=90,
+                        ha='right', va='bottom', color='#666')
+    axes[1, 1].set_yticks(dfa_y)
+    axes[1, 1].set_yticklabels(dfa_ord['series'], fontsize=7)
+    axes[1, 1].set_xlabel('alpha')
+    axes[1, 1].set_title('alpha per series (grey = paced by the metronome)',
+                         fontsize=10)
+    axes[1, 1].legend(fontsize=7, frameon=False, loc='lower right')
+    axes[1, 1].grid(alpha=0.15, axis='x')
+
+    plt.tight_layout()
+
+# =============================================================================
+# %% Entropy
+# =============================================================================
+# Sample entropy asks how PREDICTABLE a series is. Take every template of m
+# consecutive points; count how many other templates match it within a
+# tolerance r; then count how many of those still match when the template is
+# extended by one point. The negative log of that ratio is the entropy.
+#
+#     SampEn(m, r, N) = -ln( A / B )
+#
+#   B   pairs of length-m templates within Chebyshev distance r of each other
+#   A   pairs that are STILL within r when extended to length m+1
+#
+# So a low SampEn means that knowing m points tells you the next one: the
+# series is regular. A high SampEn means it does not. Self-matches are
+# excluded, which is the difference from approximate entropy and removes
+# ApEn's bias toward calling everything regular.
+#
+# THE INTERPRETATION TRAP
+# High entropy gets called "complex", but white noise has MAXIMAL sample
+# entropy and no complexity whatsoever. That is why multiscale entropy exists:
+# coarse-grain the series over longer and longer windows and recompute. White
+# noise starts high and falls away steeply; a genuinely structured signal holds
+# its entropy across scales. The CURVE, or the area under it, is the complexity
+# measure -- never the single-scale value.
+#
+# The refined composite variant used below sums the match COUNTS over all tau
+# coarse-graining phases before taking the logarithm, rather than averaging tau
+# separate entropies. Far steadier at long scales, where any one phase has few
+# points left.
+#
+# THERE ARE NO TRANSFERABLE NORMATIVE VALUES
+# SampEn is defined only relative to its m, r, N and preprocessing, and those
+# vary across the literature. Compare conditions analysed identically; never
+# compare an absolute value against another paper. Yentes & Raffalt require m,
+# r and N to be reported every time and warn that one r does not transfer
+# between conditions -- so r is SWEPT here rather than fixed at 0.2 SD and hoped
+# for, and what matters is whether the ranking of the series survives the sweep.
+#
+# References
+#   Richman & Moorman (2000) Am J Physiol Heart Circ Physiol 278(6), H2039-H2049.
+#   Costa, Goldberger & Peng (2002) Phys Rev Lett 89, 068102.
+#   Yentes et al. (2013) Ann Biomed Eng 41(2), 349-365.
+#   Wu et al. (2014) Phys Lett A 378(20), 1369-1374.
+#   Yentes & Raffalt (2021) Ann Biomed Eng 49(3), 979-990.
+# =============================================================================
+
+ent_m          = 2       # template length
+ent_r          = 0.2     # tolerance, as a fraction of the series SD
+ent_r_sweep    = [0.10, 0.15, 0.20, 0.25, 0.30]    # Yentes & Raffalt
+ent_m_sweep    = [2, 3]
+ent_mse_scales = 10      # coarse-graining scales for the multiscale curve
+ent_min_n      = 200     # Yentes 2013: below this both algorithms get fragile
+ent_mse_max_s  = 300     # seconds of the continuous signal used for the curve.
+                         # 300 s at 100 Hz leaves 3000 points at scale 10, well
+                         # past the ~750 the curve needs to settle, and keeps
+                         # the cell to seconds rather than minutes
+
+# Two functions, both used far more than three times: the counter runs once per
+# scale per phase per series, and the entropy runs across the whole r and m sweep.
+def ent_match_counts(series, m, r):
+    """Matching template pairs at lengths m and m+1, as raw COUNTS.
+
+    Counts rather than the entropy itself, because the refined composite
+    multiscale variant has to sum them across coarse-graining phases BEFORE
+    taking the logarithm.
+
+    A KD-tree under the Chebyshev metric does the counting. The obvious double
+    loop is O(N^2), fine for a few hundred strides but hopeless on the
+    continuous signal, where the multiscale curve needs tens of thousands of
+    points at every scale and phase.
+
+    A length-(m+1) match implies a length-m match, because the Chebyshev
+    distance over m+1 coordinates is never smaller than over the first m. So A
+    is just the pair count in the (m+1)-dimensional tree.
+    """
+    x = np.asarray(series, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < m + 2:
+        return 0, 0
+    # the SAME n-m start indices at both lengths, so the counts are comparable
+    k = n - m
+    starts = np.arange(k)
+    tree_m = cKDTree(x[starts[:, None] + np.arange(m)[None, :]])
+    tree_m1 = cKDTree(x[starts[:, None] + np.arange(m + 1)[None, :]])
+    # count_neighbors counts ORDERED pairs and includes i == j, so take off the
+    # k self-matches and halve to get unordered distinct pairs
+    b = int((tree_m.count_neighbors(tree_m, r, p=np.inf) - k) // 2)
+    a = int((tree_m1.count_neighbors(tree_m1, r, p=np.inf) - k) // 2)
+    return a, b
+
+
+def ent_sampen(series, m=ent_m, r=ent_r):
+    """Sample entropy. The series is z-scored, so r is directly in SD units."""
+    x = np.asarray(series, float)
+    x = x[np.isfinite(x)]
+    if len(x) < m + 2:
+        return np.nan
+    sd = np.std(x)
+    if sd <= 1e-10 * max(abs(x.mean()), 1.0):
+        return np.nan      # a constant series: every template matches, A == B
+    a, b = ent_match_counts((x - x.mean()) / sd, m, r)
+    if a == 0 or b == 0:
+        return np.nan        # no matches: undefined, NOT zero
+    return float(-np.log(a / b))
+
+print("\n" + "-" * 74)
+print("  ENTROPY")
+print("-" * 74)
+print(f"  m = {ent_m}, r = {ent_r} x SD, N = {len(stride_series)}, z-scored")
+if len(stride_series) < ent_min_n:
+    print(f"  ! N is under {ent_min_n}. Yentes 2013 shows both algorithms become")
+    print(f"    extremely parameter sensitive below that")
+
+# a white-noise series of the same length: the ceiling SampEn can reach here.
+# It has a closed form, -ln(2*Phi(r/sqrt(2)) - 1), but the empirical value at
+# THIS N is the one worth comparing against
+ent_ceiling = ent_sampen(np.random.default_rng(0).normal(size=len(stride_series)))
+
+# --- one row per series, swept over r and m ----------------------------------
+ent_rows = []
+for ent_name in stride_series_usable:
+    ent_x = pd.to_numeric(stride_series[ent_name], errors='coerce').to_numpy(float)
+    ent_row = {'series': ent_name, 'n': int(np.isfinite(ent_x).sum()),
+               'm': ent_m, 'r': ent_r, 'sampen': ent_sampen(ent_x)}
+    for ent_rv in ent_r_sweep:
+        ent_row[f'sampen_r{ent_rv:.2f}'] = ent_sampen(ent_x, r=ent_rv)
+    for ent_mv in ent_m_sweep:
+        ent_row[f'sampen_m{ent_mv}'] = ent_sampen(ent_x, m=ent_mv)
+    ent_rows.append(ent_row)
+
+entropy_results = pd.DataFrame(ent_rows)
+
+if len(entropy_results):
+    print(f"\n  white noise at this N reaches {ent_ceiling:.3f} -- that is the ceiling")
+    print(f"\n    series                     SampEn   "
+          + "".join(f"r={v:.2f} " for v in ent_r_sweep))
+    for _, ent_row in entropy_results.iterrows():
+        ent_txt = f"    {ent_row['series']:26s} {ent_row['sampen']:6.3f}   "
+        for ent_rv in ent_r_sweep:
+            ent_txt += f"{ent_row[f'sampen_r{ent_rv:.2f}']:5.3f}  "
+        print(ent_txt)
+
+    # Does the ORDERING of the series survive the sweep? If it does not, no
+    # single r says anything durable about them and only the sweep is reportable
+    ent_ranks = {v: entropy_results[f'sampen_r{v:.2f}'].rank().to_numpy()
+                 for v in ent_r_sweep
+                 if entropy_results[f'sampen_r{v:.2f}'].notna().sum() > 2}
+    ent_keys = list(ent_ranks)
+    if len(ent_keys) > 1:
+        ent_corrs = [np.corrcoef(ent_ranks[ent_keys[0]], ent_ranks[k])[0, 1]
+                     for k in ent_keys[1:]]
+        print(f"\n  rank correlation with the r = {ent_keys[0]:.2f} ordering: "
+              f"{np.round(ent_corrs, 3)}")
+        if np.nanmin(ent_corrs) < 0.8:
+            print(f"    ! the ordering changes with r. Report the sweep, not a single")
+            print(f"      value, and do not read much into any one of them")
+        else:
+            print(f"    the ordering is stable across r, so a single-r value is")
+            print(f"    reporting something about the series and not about r")
+
+# --- the multiscale curve, on the continuous trunk acceleration --------------
+# A stride series has a few hundred points, so coarse-graining runs out after
+# two or three scales. The continuous signal has enough samples for the curve
+# to mean something.
+
+ent_signal = None
+for ent_col in ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
+    if ent_col in kinematic_data.columns:
+        ent_signal = np.column_stack([kinematic_data[ent_col].to_numpy(),
+                                      kinematic_data[f'{ent_col}.1'].to_numpy(),
+                                      kinematic_data[f'{ent_col}.2'].to_numpy()])
+        ent_signal_name = ent_col
+        break
+
+multiscale_entropy = None
+if ent_signal is not None:
+    ent_seg = ent_signal[int(ss_warmup_s * kinematic_fs):][
+        :int(ent_mse_max_s * kinematic_fs)]
+    # white noise goes through the IDENTICAL loop as a reference column rather
+    # than being computed separately, so the two cannot drift apart. This is
+    # the whole argument for multiscale entropy: noise starts at the ceiling
+    # and falls away, structure holds up
+    ent_inputs = {'ML': ent_seg[:, 0], 'AP': ent_seg[:, 1], 'VT': ent_seg[:, 2],
+                  'white noise': np.random.default_rng(1).normal(size=len(ent_seg))}
+
+    ent_curves = {}
+    for ent_label, ent_x in ent_inputs.items():
+        ent_x = ent_x[np.isfinite(ent_x)]
+        # the tolerance is fixed on the ORIGINAL series and never recomputed per
+        # scale: coarse-graining shrinks the SD, so re-normalising would ask a
+        # different question at every scale and the curve would stay flat at the
+        # ceiling instead of showing anything
+        ent_x = (ent_x - ent_x.mean()) / np.std(ent_x)
+        ent_out = np.full(ent_mse_scales, np.nan)
+        for ent_s in range(1, ent_mse_scales + 1):
+            ent_a_sum = ent_b_sum = 0
+            for ent_p in range(ent_s):          # every coarse-graining phase
+                ent_cut = ent_x[ent_p:]
+                ent_k = len(ent_cut) // ent_s
+                if ent_k < ent_m + 2:
+                    continue
+                ent_cg = ent_cut[:ent_k * ent_s].reshape(ent_k, ent_s).mean(axis=1)
+                ent_a, ent_b = ent_match_counts(ent_cg, ent_m, ent_r)
+                ent_a_sum += ent_a
+                ent_b_sum += ent_b
+            if ent_a_sum > 0 and ent_b_sum > 0:
+                ent_out[ent_s - 1] = float(-np.log(ent_a_sum / ent_b_sum))
+        ent_curves[ent_label] = ent_out
+
+    multiscale_entropy = pd.DataFrame(ent_curves,
+                                      index=np.arange(1, ent_mse_scales + 1))
+    multiscale_entropy.index.name = 'scale'
+
+    print(f"\n  refined composite MSE on {ent_signal_name}, "
+          f"{len(ent_seg)} samples ({len(ent_seg)/kinematic_fs:.0f} s) after the warm-up")
+    print(f"    scale   ML     AP     VT     white noise")
+    for ent_s, ent_row in multiscale_entropy.iterrows():
+        print(f"    {ent_s:5d}  {ent_row['ML']:5.3f}  {ent_row['AP']:5.3f}  "
+              f"{ent_row['VT']:5.3f}     {ent_row['white noise']:5.3f}")
+    ent_area = multiscale_entropy.sum()
+    print(f"    area under the curve: ML {ent_area['ML']:.2f}  "
+          f"AP {ent_area['AP']:.2f}  VT {ent_area['VT']:.2f}  "
+          f"(white noise {ent_area['white noise']:.2f})")
+    print(f"    The AREA is the complexity measure, not the scale-1 value. A curve")
+    print(f"    that falls away as steeply as the noise reference is noise-like;")
+    print(f"    one that holds up across scales has structure at several time")
+    print(f"    scales at once")
+else:
+    print("\n  ! no trunk acceleration column found, the multiscale curve is skipped")
+
+# =============================================================================
+# ----Figures: what a match IS, the r sweep, the multiscale curve, the ranking
+# =============================================================================
+ent_show = next((c for c in stride_series_usable if c not in ss_cued),
+                stride_series_usable[0] if stride_series_usable else None)
+
+if ent_show is not None:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8.6))
+
+    # panel 1: the actual counting. Pick one template, draw every length-m
+    # series that matches it within r, then show which of those SURVIVE being
+    # extended to m+1. The ratio of the two counts is the entropy
+    ent_x = pd.to_numeric(stride_series[ent_show], errors='coerce').to_numpy(float)
+    ent_x = ent_x[np.isfinite(ent_x)]
+    ent_z = (ent_x - ent_x.mean()) / np.std(ent_x)
+    ent_k = len(ent_z) - ent_m
+    ent_tpl = ent_z[np.arange(ent_k)[:, None] + np.arange(ent_m + 1)[None, :]]
+
+    # a representative template: the one with the median number of matches
+    ent_d_m = np.max(np.abs(ent_tpl[:, None, :ent_m] - ent_tpl[None, :, :ent_m]), axis=2)
+    ent_hits = (ent_d_m <= ent_r).sum(axis=1) - 1
+    ent_i = int(np.argsort(ent_hits)[len(ent_hits) // 2])
+
+    ent_match_m = np.where((ent_d_m[ent_i] <= ent_r))[0]
+    ent_match_m = ent_match_m[ent_match_m != ent_i]
+    ent_d_m1 = np.max(np.abs(ent_tpl[ent_match_m] - ent_tpl[ent_i]), axis=1)
+    ent_match_m1 = ent_match_m[ent_d_m1 <= ent_r]
+
+    ent_t = np.arange(ent_m + 1)
+    for ent_j in ent_match_m:
+        axes[0, 0].plot(ent_t[:ent_m], ent_tpl[ent_j, :ent_m], color='#bbbbbb',
+                        lw=0.7, alpha=0.7)
+        axes[0, 0].plot(ent_t[ent_m - 1:], ent_tpl[ent_j, ent_m - 1:], color='#bbbbbb',
+                        lw=0.5, alpha=0.35, ls=':')
+    for ent_j in ent_match_m1:
+        axes[0, 0].plot(ent_t, ent_tpl[ent_j], color='#2a5d9f', lw=0.8, alpha=0.75)
+    axes[0, 0].plot(ent_t, ent_tpl[ent_i], color='#cc6633', lw=2.6, marker='o',
+                    label=f'the template (stride {ent_i})')
+    axes[0, 0].fill_between(ent_t, ent_tpl[ent_i] - ent_r, ent_tpl[ent_i] + ent_r,
+                            color='#cc6633', alpha=0.12, lw=0,
+                            label=f'tolerance +- r = {ent_r} SD')
+    axes[0, 0].axvline(ent_m - 0.5, color='k', lw=0.6, ls='--')
+    axes[0, 0].annotate(f'grey + blue: {len(ent_match_m)} match over m = {ent_m}  (B)',
+                        (0.03, 0.97), xycoords='axes fraction', fontsize=8,
+                        va='top', color='#555')
+    axes[0, 0].annotate(f'blue only: {len(ent_match_m1)} survive to m+1 = {ent_m + 1}  (A)',
+                        (0.03, 0.91), xycoords='axes fraction', fontsize=8,
+                        va='top', color='#2a5d9f')
+    axes[0, 0].annotate(f'one template: -ln(A/B) = '
+                        f'{-np.log(max(len(ent_match_m1), 1) / max(len(ent_match_m), 1)):.3f}\n'
+                        f'over all templates: SampEn = '
+                        f'{ent_sampen(ent_x):.3f}',
+                        (0.03, 0.83), xycoords='axes fraction', fontsize=8,
+                        va='top', color='#333')
+    axes[0, 0].set_xticks(ent_t)
+    axes[0, 0].set_xlabel('position within the template (strides)')
+    axes[0, 0].set_ylabel(f'{ent_show} (SD units)')
+    axes[0, 0].set_title('What a "match" is: templates within r, before and after\n'
+                         'the extension to m+1', fontsize=10)
+    axes[0, 0].legend(fontsize=7, frameon=False, loc='lower right')
+    axes[0, 0].grid(alpha=0.15)
+
+    # panel 2: the r sweep. Parallel lines mean the ranking is r-independent;
+    # crossing lines mean no single r is reportable
+    for _, ent_row in entropy_results.iterrows():
+        ent_vals = [ent_row[f'sampen_r{v:.2f}'] for v in ent_r_sweep]
+        axes[0, 1].plot(ent_r_sweep, ent_vals, 'o-', ms=3, lw=1,
+                        color='#cc6633' if ent_row['series'] == ent_show else '#2a5d9f',
+                        alpha=1.0 if ent_row['series'] == ent_show else 0.35,
+                        label=ent_show if ent_row['series'] == ent_show else None)
+    axes[0, 1].axvline(ent_r, color='k', ls='--', lw=0.8)
+    axes[0, 1].annotate(f'r = {ent_r} reported', (ent_r, axes[0, 1].get_ylim()[1]),
+                        fontsize=7, rotation=90, ha='right', va='top')
+    axes[0, 1].set_xlabel('tolerance r (fraction of SD)')
+    axes[0, 1].set_ylabel('sample entropy')
+    axes[0, 1].set_title('Every series across the r sweep\n'
+                         '(crossing lines = no single r is reportable)', fontsize=10)
+    axes[0, 1].legend(fontsize=7, frameon=False)
+    axes[0, 1].grid(alpha=0.15)
+
+    # panel 3: the multiscale curve against white noise, which is the whole
+    # argument for multiscale entropy in the first place
+    if multiscale_entropy is not None:
+        ent_scales = multiscale_entropy.index.to_numpy()
+        for ent_label, ent_colour in (('ML', '#2a5d9f'), ('AP', '#cc6633'),
+                                      ('VT', '#4a8f4a')):
+            axes[1, 0].plot(ent_scales, multiscale_entropy[ent_label], 'o-', ms=4,
+                            color=ent_colour,
+                            label=f"{ent_label}, area {multiscale_entropy[ent_label].sum():.2f}")
+        axes[1, 0].plot(ent_scales, multiscale_entropy['white noise'], 's--', ms=3,
+                        color='#999',
+                        label=f"white noise, area "
+                              f"{multiscale_entropy['white noise'].sum():.2f}")
+        axes[1, 0].set_xlabel('coarse-graining scale (samples averaged)')
+        axes[1, 0].set_ylabel('sample entropy')
+        axes[1, 0].set_title(f'Refined composite MSE, {ent_signal_name}\n'
+                             'the AREA is the complexity, not scale 1', fontsize=10)
+        axes[1, 0].legend(fontsize=7, frameon=False)
+        axes[1, 0].grid(alpha=0.15)
+    else:
+        axes[1, 0].axis('off')
+
+    # panel 4: the ranking at the reported r, against the white-noise ceiling
+    ent_ord = entropy_results.dropna(subset=['sampen']).sort_values('sampen')
+    axes[1, 1].barh(np.arange(len(ent_ord)), ent_ord['sampen'],
+                    color=['#bbbbbb' if s in ss_cued else '#2a5d9f'
+                           for s in ent_ord['series']])
+    axes[1, 1].axvline(ent_ceiling, color='#cc6633', ls='--', lw=1.2)
+    axes[1, 1].annotate('white noise at this N', (ent_ceiling, -0.4), fontsize=6,
+                        rotation=90, ha='right', va='bottom', color='#cc6633')
+    axes[1, 1].set_yticks(np.arange(len(ent_ord)))
+    axes[1, 1].set_yticklabels(ent_ord['series'], fontsize=7)
+    axes[1, 1].set_xlabel(f'sample entropy (m = {ent_m}, r = {ent_r} SD)')
+    axes[1, 1].set_title('Regular at the bottom, unpredictable at the top\n'
+                         '(grey = paced by the metronome)', fontsize=10)
+    axes[1, 1].grid(alpha=0.15, axis='x')
+
+    plt.tight_layout()
