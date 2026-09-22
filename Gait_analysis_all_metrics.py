@@ -2983,3 +2983,597 @@ if ent_show is not None:
     axes[1, 1].grid(alpha=0.15, axis='x')
 
     plt.tight_layout()
+
+# =============================================================================
+# %% Harmonic ratio
+# =============================================================================
+# Smoothness and rhythmic regularity of the trunk WITHIN a stride. That makes
+# it independent of everything in the stride series cells, which are about
+# variation BETWEEN strides -- a walker can be perfectly smooth stride by
+# stride and still wander from stride to stride, or the reverse.
+#
+# WHY ODD AND EVEN HARMONICS
+# One stride is two steps. If the two steps produce the same trunk
+# acceleration, the signal repeats TWICE per stride, so its energy lands on the
+# even harmonics of stride frequency. Asymmetry, jerkiness or an irregular
+# event leaks energy into the odd harmonics.
+#
+#     HR(AP, vertical) = sum(even harmonics) / sum(odd harmonics)
+#
+# Mediolateral is the exception, and it is the part that gets coded backwards.
+# You sway left over one step and right over the other, so ML completes ONE
+# cycle per stride, not two. ML is odd-dominant and the ratio flips:
+#
+#     HR(ML) = sum(odd harmonics) / sum(even harmonics)
+#
+# HR IS NOT A SYMMETRY MEASURE
+# It is constantly described as one. Pasciuto showed that is wrong: a perfectly
+# symmetric but jerky gait scores low, and HR is unbounded above, so one stride
+# with a small denominator drags a group mean anywhere. Their improved harmonic
+# ratio relates the intrinsic harmonic power to the TOTAL power, giving a
+# bounded 0-100% index, and is reported beside it.
+#
+# THE FRAME
+# A single yaw from the mean travel direction, not the instantaneous pelvis
+# orientation. Rotating frame by frame would mix pelvis rotation into the
+# acceleration, which is a different signal from the one being measured.
+#
+# NO WINDOW
+# The segment is exactly one stride, so DFT bin k IS the k-th harmonic. A
+# window would smear energy between the odd and even bins the ratio is built
+# on, which is the one thing that must not happen here.
+#
+# References
+#   Menz, Lord & Fitzpatrick (2003) Gait Posture 18(1), 35-46.
+#   Bellanca et al. (2013) J Biomech 46(4), 828-831.
+#   Pasciuto et al. (2017) J Biomech 53, 84-89.
+# =============================================================================
+
+hr_n_harmonics = 20      # the established convention
+hr_min_samples = 40      # a stride shorter than this cannot carry 20 harmonics
+
+print("\n" + "-" * 74)
+print("  HARMONIC RATIO")
+print("-" * 74)
+
+hr_signal = None
+for hr_col in ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
+    if hr_col in kinematic_data.columns:
+        hr_signal = np.column_stack([kinematic_data[hr_col].to_numpy(),
+                                     kinematic_data[f'{hr_col}.1'].to_numpy(),
+                                     kinematic_data[f'{hr_col}.2'].to_numpy()])
+        hr_signal_name = hr_col
+        break
+
+harmonic_ratio = pd.DataFrame()
+if hr_signal is None:
+    print("  ! no trunk acceleration column, the harmonic ratio is skipped")
+else:
+    print(f"  signal: {hr_signal_name}, "
+          f"{100 * np.isfinite(hr_signal).all(axis=1).mean():.1f}% finite")
+
+    # one yaw for the whole trial, from the travel direction. On a treadmill
+    # the heading is fixed, so this is near identity -- it exists to remove a
+    # lab-to-walker misalignment, not to track the pelvis
+    hr_yaw = np.arctan2(0.0, mos_travel_sign)
+    hr_rot = np.array([[np.cos(hr_yaw), -np.sin(hr_yaw)],
+                       [np.sin(hr_yaw), np.cos(hr_yaw)]])
+    hr_acc = hr_signal.copy()
+    hr_acc[:, :2] = hr_signal[:, :2] @ hr_rot.T
+    print(f"  heading yaw applied: {np.degrees(hr_yaw):+.1f} deg")
+
+    # (axis index, label, is the axis odd-dominant?)
+    hr_axes = [(1, 'AP', False), (2, 'VT', False), (0, 'ML', True)]
+
+    hr_rows = []
+    hr_waveforms = {lbl: [] for _, lbl, _ in hr_axes}
+    hr_spectra = {lbl: [] for _, lbl, _ in hr_axes}
+    for x in range(len(stride_series)):
+        hr_a = stride_series['initial_contact_kinematic_frame_100hz'][x]
+        hr_b = stride_series['next_ipsi_heelstrike'][x]
+        if np.isnan(hr_a) or np.isnan(hr_b):
+            continue
+        hr_a, hr_b = int(hr_a) - 1, int(hr_b) - 1
+        if hr_b - hr_a < hr_min_samples or hr_b > len(hr_acc):
+            continue
+        hr_seg = hr_acc[hr_a:hr_b]
+        if not np.isfinite(hr_seg).all():
+            continue
+
+        hr_row = {'stride': x, 'n_samples': hr_b - hr_a}
+        for hr_ax, hr_label, hr_odd_dom in hr_axes:
+            # bin 1 is the stride fundamental, bin k the k-th harmonic
+            hr_amp = np.abs(np.fft.rfft(hr_seg[:, hr_ax] - hr_seg[:, hr_ax].mean()))
+            if len(hr_amp) <= hr_n_harmonics:
+                hr_row = None
+                break
+            hr_amp = hr_amp[1:hr_n_harmonics + 1]
+            hr_k = np.arange(1, hr_n_harmonics + 1)
+            hr_odd, hr_even = hr_amp[hr_k % 2 == 1], hr_amp[hr_k % 2 == 0]
+            # the intrinsic set is the one the axis is SUPPOSED to live on
+            hr_in, hr_out = ((hr_odd, hr_even) if hr_odd_dom else (hr_even, hr_odd))
+            hr_row[f'hr_{hr_label}'] = (hr_in.sum() / hr_out.sum()
+                                        if hr_out.sum() > 0 else np.nan)
+            # Pasciuto: intrinsic power as a share of the TOTAL, so it is
+            # bounded 0-100% and a small denominator cannot blow it up
+            hr_row[f'ihr_{hr_label}'] = (100.0 * np.sum(hr_in ** 2) / np.sum(hr_amp ** 2)
+                                         if np.sum(hr_amp ** 2) > 0 else np.nan)
+            hr_spectra[hr_label].append(hr_amp)
+            hr_waveforms[hr_label].append(normalize(hr_seg[:, hr_ax], 101))
+        if hr_row is not None:
+            hr_rows.append(hr_row)
+
+    harmonic_ratio = pd.DataFrame(hr_rows)
+
+if len(harmonic_ratio):
+    print(f"\n  {len(harmonic_ratio)} strides")
+    print(f"    axis   HR median (IQR)                iHR median (IQR)")
+    for _, hr_label, hr_odd_dom in hr_axes:
+        hr_v, hr_ih = harmonic_ratio[f'hr_{hr_label}'], harmonic_ratio[f'ihr_{hr_label}']
+        print(f"    {hr_label}    {hr_v.median():5.2f} "
+              f"({hr_v.quantile(0.25):.2f}-{hr_v.quantile(0.75):.2f})  "
+              f"{'odd/even' if hr_odd_dom else 'even/odd'}      "
+              f"{hr_ih.median():5.1f}% "
+              f"({hr_ih.quantile(0.25):.1f}-{hr_ih.quantile(0.75):.1f})")
+
+    # the median is reported, not the mean, because HR is an unbounded ratio.
+    # This says how far apart the two are, which is the Pasciuto point made on
+    # this walker's own data rather than in the abstract
+    for _, hr_label, _ in hr_axes:
+        hr_v = harmonic_ratio[f'hr_{hr_label}']
+        if hr_v.median() > 0 and abs(hr_v.mean() - hr_v.median()) > 0.3 * hr_v.median():
+            print(f"    ! {hr_label} HR mean {hr_v.mean():.2f} is far from its median "
+                  f"{hr_v.median():.2f}: the tail is doing the work.")
+            print(f"      That is the unboundedness Pasciuto describes -- use iHR")
+
+    # =========================================================================
+    # ----Figures: why odd vs even, the spectra that make the ratio, the spread
+    # =========================================================================
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8.6))
+
+    # panel 1: the whole reason for the odd/even split. AP and VT go through
+    # two cycles per stride, ML through one
+    hr_pct = np.linspace(0, 100, 101)
+    for hr_label, hr_colour in (('AP', '#2a5d9f'), ('VT', '#4a8f4a'), ('ML', '#cc6633')):
+        hr_w = np.vstack(hr_waveforms[hr_label])
+        hr_mean = hr_w.mean(axis=0)
+        axes[0, 0].plot(hr_pct, hr_mean, color=hr_colour, lw=2, label=hr_label)
+        axes[0, 0].fill_between(hr_pct, np.percentile(hr_w, 25, axis=0),
+                                np.percentile(hr_w, 75, axis=0),
+                                color=hr_colour, alpha=0.15, lw=0)
+    axes[0, 0].axvline(50, color='k', lw=0.8, ls='--')
+    axes[0, 0].annotate('contralateral contact', (50, axes[0, 0].get_ylim()[1]),
+                        fontsize=7, rotation=90, ha='right', va='top')
+    axes[0, 0].set_xlabel('% of stride (ipsilateral heel strike to heel strike)')
+    axes[0, 0].set_ylabel('trunk acceleration (m/s^2)')
+    axes[0, 0].set_title('AP and VT repeat twice per stride -> even harmonics\n'
+                         'ML once per stride -> odd harmonics', fontsize=10)
+    axes[0, 0].legend(fontsize=8, frameon=False)
+    axes[0, 0].grid(alpha=0.15)
+
+    # panels 2 and 3: the actual sums the ratio is made of, for one even
+    # dominant axis and the odd dominant one
+    hr_k = np.arange(1, hr_n_harmonics + 1)
+    for hr_pos, (hr_label, hr_odd_dom) in ((axes[0, 1], ('AP', False)),
+                                           (axes[1, 0], ('ML', True))):
+        hr_mean_amp = np.vstack(hr_spectra[hr_label]).mean(axis=0)
+        hr_is_intrinsic = (hr_k % 2 == 1) if hr_odd_dom else (hr_k % 2 == 0)
+        hr_pos.bar(hr_k[hr_is_intrinsic], hr_mean_amp[hr_is_intrinsic],
+                   color='#2a5d9f',
+                   label=f"{'odd' if hr_odd_dom else 'even'} (intrinsic), "
+                         f"sum {hr_mean_amp[hr_is_intrinsic].sum():.1f}")
+        hr_pos.bar(hr_k[~hr_is_intrinsic], hr_mean_amp[~hr_is_intrinsic],
+                   color='#cc6633',
+                   label=f"{'even' if hr_odd_dom else 'odd'}, "
+                         f"sum {hr_mean_amp[~hr_is_intrinsic].sum():.1f}")
+        hr_pos.annotate(f"HR = {hr_mean_amp[hr_is_intrinsic].sum() / hr_mean_amp[~hr_is_intrinsic].sum():.2f}"
+                        f"   (median over strides "
+                        f"{harmonic_ratio[f'hr_{hr_label}'].median():.2f})\n"
+                        f"iHR = {100 * np.sum(hr_mean_amp[hr_is_intrinsic] ** 2) / np.sum(hr_mean_amp ** 2):.1f}%"
+                        f"  bounded 0-100%",
+                        (0.97, 0.80), xycoords='axes fraction', fontsize=8,
+                        ha='right', va='top', color='#333')
+        hr_pos.set_xticks(hr_k[::2])
+        hr_pos.set_xlabel('harmonic of stride frequency')
+        hr_pos.set_ylabel('mean amplitude')
+        hr_pos.set_title(f'{hr_label}: the two sums the ratio divides', fontsize=10)
+        hr_pos.legend(fontsize=7, frameon=False)
+        hr_pos.grid(alpha=0.15, axis='y')
+
+    # panel 4: the spread across strides. HR has a long right tail by
+    # construction; iHR does not, which is the reason to report it
+    hr_box = axes[1, 1].boxplot([harmonic_ratio[f'hr_{l}'].dropna()
+                                 for _, l, _ in hr_axes],
+                                positions=[1, 2, 3], widths=0.5, showfliers=True,
+                                patch_artist=True,
+                                flierprops=dict(marker='.', ms=2, alpha=0.4))
+    for hr_patch in hr_box['boxes']:
+        hr_patch.set_facecolor('#2a5d9f')
+        hr_patch.set_alpha(0.5)
+    axes[1, 1].set_xticks([1, 2, 3])
+    axes[1, 1].set_xticklabels([l for _, l, _ in hr_axes])
+    axes[1, 1].set_ylabel('harmonic ratio (unbounded)', color='#2a5d9f')
+    axes[1, 1].set_xlabel('axis')
+    hr_twin = axes[1, 1].twinx()
+    hr_twin.plot([1, 2, 3], [harmonic_ratio[f'ihr_{l}'].median() for _, l, _ in hr_axes],
+                 'D', ms=7, color='#cc6633')
+    for hr_i, (_, hr_label, _) in enumerate(hr_axes):
+        hr_q = harmonic_ratio[f'ihr_{hr_label}']
+        hr_twin.plot([hr_i + 1, hr_i + 1], [hr_q.quantile(0.25), hr_q.quantile(0.75)],
+                     '-', lw=2, color='#cc6633')
+    hr_twin.set_ylabel('improved harmonic ratio (%)', color='#cc6633')
+    hr_twin.set_ylim(0, 100)
+    axes[1, 1].set_title('Per-stride spread: HR boxes, iHR diamonds\n'
+                         'HR has the tail, iHR is bounded', fontsize=10)
+    axes[1, 1].grid(alpha=0.15, axis='y')
+
+    plt.tight_layout()
+
+# =============================================================================
+# %% Supplementary metrics
+# =============================================================================
+# Five measures that each answer something the main set does not.
+#
+# GOAL-EQUIVALENT MANIFOLD
+# The one that changes how everything else is read. At a fixed belt speed the
+# task goal is unambiguous: keep stride length over stride time equal to belt
+# speed. In the (T, L) plane that goal is a LINE, L = v* T, and every stride's
+# deviation splits into a component ALONG the line, which does not threaten the
+# goal at all, and one ACROSS it, which does.
+#
+#     d_parallel = (  dT + v* dL ) / sqrt(1 + v*^2)     goal-equivalent
+#     d_perp     = (-v* dT +   dL ) / sqrt(1 + v*^2)     goal-relevant
+#
+# Two walkers with identical total variability can have completely different
+# goal-relevant error. The lag-1 autocorrelation of each component says how
+# hard the controller works on it: strongly negative means corrected stride to
+# stride, near zero means left alone. Healthy treadmill walking corrects the
+# goal-relevant component much more strongly -- that is the signature of a
+# controller exploiting the redundancy instead of fighting all variability.
+#
+# FOOT PLACEMENT CONTROL
+# Regress where the foot lands on the CoM state at midstance. The R^2 IS the
+# measure: it says how much of foot placement is driven by body state, which is
+# a statement about the CONTROLLER rather than about the margin it produces.
+# Both sides are taken relative to the stance foot, not in the lab frame: a
+# slow lateral drift along the belt would otherwise appear in the predictor and
+# the response together and inflate R^2 for no reason. Healthy ML is above 0.8.
+#
+# AUTOCORRELATION REGULARITY AND SYMMETRY
+# From the unbiased autocorrelation of trunk acceleration: the coefficient at
+# the one-step lag is step regularity, at the one-stride lag is stride
+# regularity, and their ratio is symmetry. Cheaper and more robust than the
+# harmonic ratio, and a genuine cross-check on it.
+#
+# SYMMETRY ANGLE
+# Bounded and reference-free, unlike the classic symmetry index, which divides
+# by one limb and so depends on which limb you picked and diverges as that
+# denominator approaches zero.
+#
+# WALK RATIO
+# Step length over cadence, nearly constant within a person across speeds. With
+# BOTH speed and cadence fixed by this protocol it is largely set by the
+# protocol, so it is reported but is not a free control variable here.
+#
+# References
+#   Dingwell, John & Cusumano (2010) PLoS Comput Biol 6(7), e1000856.
+#   Wang & Srinivasan (2014) Biol Lett 10(9), 20140405.
+#   Moe-Nilssen & Helbostad (2004) J Biomech 37, 121-126.
+#   Zifchock et al. (2008) Gait Posture 27(4), 622-627.
+# =============================================================================
+
+sup_midstance_fraction = 0.5     # point in stance where the CoM state is read
+sup_autocorr_max_lag_s = 3.0
+
+print("\n" + "-" * 74)
+print("  SUPPLEMENTARY METRICS")
+print("-" * 74)
+
+# --- goal-equivalent manifold ------------------------------------------------
+sup_gem_t = pd.to_numeric(stride_series['stride_time'], errors='coerce').to_numpy(float)
+sup_gem_l = pd.to_numeric(stride_series['stride_length'], errors='coerce').to_numpy(float)
+sup_gem_ok = np.isfinite(sup_gem_t) & np.isfinite(sup_gem_l)
+
+goal_equivalent = None
+if sup_gem_ok.sum() >= 10:
+    sup_gem_t, sup_gem_l = sup_gem_t[sup_gem_ok], sup_gem_l[sup_gem_ok]
+    sup_gem_vstar = sup_gem_l.mean() / sup_gem_t.mean()
+    sup_gem_dt, sup_gem_dl = sup_gem_t - sup_gem_t.mean(), sup_gem_l - sup_gem_l.mean()
+    sup_gem_norm = np.sqrt(1.0 + sup_gem_vstar ** 2)
+    goal_equivalent = {
+        'v_star': float(sup_gem_vstar), 'n': int(sup_gem_ok.sum()),
+        'parallel': (sup_gem_dt + sup_gem_vstar * sup_gem_dl) / sup_gem_norm,
+        'perpendicular': (-sup_gem_vstar * sup_gem_dt + sup_gem_dl) / sup_gem_norm}
+
+    # lag-1 autocorrelation of each component
+    for sup_key in ('parallel', 'perpendicular'):
+        sup_c = goal_equivalent[sup_key] - goal_equivalent[sup_key].mean()
+        goal_equivalent[sup_key + '_sd'] = float(np.std(sup_c))
+        goal_equivalent[sup_key + '_lag1'] = (
+            float(np.sum(sup_c[:-1] * sup_c[1:]) / np.sum(sup_c ** 2))
+            if np.sum(sup_c ** 2) > 0 else np.nan)
+
+    print(f"\n  goal-equivalent manifold  (v* = {goal_equivalent['v_star']:.3f} m/s, "
+          f"n = {goal_equivalent['n']})")
+    print(f"    goal-equivalent (along the manifold)  SD "
+          f"{1000*goal_equivalent['parallel_sd']:6.1f} mm   "
+          f"lag-1 autocorr {goal_equivalent['parallel_lag1']:+.3f}")
+    print(f"    goal-relevant  (across it)            SD "
+          f"{1000*goal_equivalent['perpendicular_sd']:6.1f} mm   "
+          f"lag-1 autocorr {goal_equivalent['perpendicular_lag1']:+.3f}")
+    print(f"    goal-relevant SD as a fraction of goal-equivalent: "
+          f"{goal_equivalent['perpendicular_sd']/goal_equivalent['parallel_sd']:.3f}")
+    if goal_equivalent['perpendicular_lag1'] < goal_equivalent['parallel_lag1'] - 0.1:
+        print(f"    The goal-relevant component is corrected more strongly, which is")
+        print(f"    a controller exploiting the redundancy rather than fighting all")
+        print(f"    variability -- what Dingwell reports for healthy walking")
+    else:
+        print(f"    The two are corrected about equally, which is NOT what Dingwell")
+        print(f"    reports for healthy treadmill walking. Worth a second look")
+
+# --- mediolateral foot placement on CoM state --------------------------------
+sup_other = 'Left' if ss_limb == 'R' else 'Right'
+sup_stance = 'Right' if ss_limb == 'R' else 'Left'
+
+sup_com_ml, sup_com_v, sup_foot_ml = [], [], []
+for x in range(len(stride_series)):
+    sup_hs = stride_series['initial_contact_kinematic_frame_100hz'][x]
+    sup_to = stride_series['toe_off_kinematic_frame_100hz'][x]
+    sup_land = stride_series['next_contra_heelstrike'][x]
+    if np.isnan(sup_hs) or np.isnan(sup_to) or np.isnan(sup_land):
+        continue
+    sup_mid = int(sup_hs + sup_midstance_fraction * (sup_to - sup_hs)) - 1
+    sup_land = int(sup_land) - 1
+    if sup_mid < 0 or sup_land >= len(mos_com) or sup_mid >= len(mos_com):
+        continue
+    # everything relative to the stance foot, so a lateral drift on the belt
+    # cannot appear on both sides of the regression
+    sup_ref = mos_ankle[sup_stance][sup_mid, 0]
+    sup_com_ml.append(mos_com[sup_mid, 0] - sup_ref)
+    sup_com_v.append(mos_com_velocity[sup_mid, 0])
+    sup_foot_ml.append(kinematic_data[f'{sup_other}_Heel_Position'][sup_land] - sup_ref)
+
+foot_placement = None
+sup_com_ml = np.array(sup_com_ml)
+sup_com_v = np.array(sup_com_v)
+sup_foot_ml = np.array(sup_foot_ml)
+sup_fit = np.isfinite(sup_com_ml) & np.isfinite(sup_com_v) & np.isfinite(sup_foot_ml)
+
+if sup_fit.sum() >= 20:
+    sup_X = np.column_stack([np.ones(sup_fit.sum()), sup_com_ml[sup_fit],
+                             sup_com_v[sup_fit]])
+    sup_y = sup_foot_ml[sup_fit]
+    sup_beta = np.linalg.lstsq(sup_X, sup_y, rcond=None)[0]
+    sup_pred = sup_X @ sup_beta
+    sup_ss_tot = np.sum((sup_y - sup_y.mean()) ** 2)
+    foot_placement = {
+        'r2': float(1 - np.sum((sup_y - sup_pred) ** 2) / sup_ss_tot)
+              if sup_ss_tot > 0 else np.nan,
+        'intercept': float(sup_beta[0]), 'gain_position': float(sup_beta[1]),
+        'gain_velocity': float(sup_beta[2]), 'n': int(sup_fit.sum()),
+        'actual': sup_y, 'predicted': sup_pred}
+
+    print(f"\n  mediolateral foot placement on CoM state at midstance "
+          f"(n = {foot_placement['n']})")
+    print(f"    R^2 = {foot_placement['r2']:.3f}   "
+          f"position gain {foot_placement['gain_position']:+.3f}, "
+          f"velocity gain {foot_placement['gain_velocity']:+.3f} s")
+    print(f"    Wang & Srinivasan report over 0.8 for healthy ML placement")
+    if not np.isfinite(foot_placement['r2']):
+        print(f"    ! R^2 is undefined: the foot placement being predicted has no")
+        print(f"      variance at all, so check the heel column before reading the gains")
+    elif foot_placement['r2'] < 0.5:
+        print(f"    ! well under that. Either foot placement is not being driven by")
+        print(f"      CoM state here, or the midstance timing needs checking")
+
+# --- autocorrelation regularity and symmetry ---------------------------------
+gait_regularity = None
+if hr_signal is not None and len(stride_series) > 10:
+    sup_stride_s = float(np.nanmedian(stride_series['stride_time']))
+    sup_step_lag = int(round(0.5 * sup_stride_s * kinematic_fs))
+    sup_stride_lag = int(round(sup_stride_s * kinematic_fs))
+    sup_max_lag = int(sup_autocorr_max_lag_s * kinematic_fs)
+
+    sup_rows = []
+    sup_curves = {}
+    for sup_ax, sup_label in ((0, 'ML'), (1, 'AP'), (2, 'VT')):
+        sup_x = hr_acc[int(ss_warmup_s * kinematic_fs):, sup_ax]
+        sup_x = sup_x[np.isfinite(sup_x)]
+        sup_x = sup_x - sup_x.mean()
+        sup_n = len(sup_x)
+        # UNBIASED: divide by the overlap at each lag, not by n. The biased form
+        # tapers toward zero with lag, which would make stride regularity look
+        # worse than step regularity purely because its lag is longer
+        sup_ac = np.full(sup_max_lag + 1, np.nan)
+        for sup_k in range(sup_max_lag + 1):
+            if sup_n - sup_k >= 10:
+                sup_ac[sup_k] = np.sum(sup_x[:sup_n - sup_k] * sup_x[sup_k:]) / (sup_n - sup_k)
+        if not np.isfinite(sup_ac[0]) or sup_ac[0] == 0:
+            continue
+        sup_ac = sup_ac / sup_ac[0]
+        sup_curves[sup_label] = sup_ac
+        sup_d1, sup_d2 = float(sup_ac[sup_step_lag]), float(sup_ac[sup_stride_lag])
+        sup_rows.append({'axis': sup_label, 'step_regularity': sup_d1,
+                         'stride_regularity': sup_d2,
+                         'symmetry': sup_d1 / sup_d2 if sup_d2 else np.nan})
+    gait_regularity = pd.DataFrame(sup_rows)
+
+    print(f"\n  autocorrelation regularity (step lag {sup_step_lag}, "
+          f"stride lag {sup_stride_lag} samples)")
+    print(f"    axis   step reg   stride reg   symmetry")
+    for _, sup_row in gait_regularity.iterrows():
+        print(f"    {sup_row['axis']:5s}  {sup_row['step_regularity']:8.3f}  "
+              f"{sup_row['stride_regularity']:10.3f}  {sup_row['symmetry']:9.3f}")
+    print(f"    Coefficients near 1 mean each step or stride closely repeats the")
+    print(f"    last; a symmetry ratio near 1 means the two steps are equivalent")
+
+# --- symmetry angle, from the per-step table ---------------------------------
+sup_warm = gait_event_data['initial_contact_kinematic_frame_100hz'] > ss_warmup_s * kinematic_fs
+sup_sym_rows = []
+for sup_var in ('stance_time', 'swing_time', 'step_length', 'minimum_foot_clearance',
+                'mos_ml_contact', 'propulsive_impulse_bw_s', 'grf_peak1_bw',
+                'trip_risk_integral'):
+    if sup_var not in gait_event_data.columns:
+        continue
+    sup_side_l = gait_event_data.loc[sup_warm & (gait_event_data['support_limb'] == 'L'),
+                                     sup_var].mean()
+    sup_side_r = gait_event_data.loc[sup_warm & (gait_event_data['support_limb'] == 'R'),
+                                     sup_var].mean()
+    if not (np.isfinite(sup_side_l) and np.isfinite(sup_side_r)) or sup_side_r == 0:
+        continue
+    # Zifchock: 0% is symmetric, the sign gives the direction, and it is bounded
+    sup_sa = (45.0 - np.degrees(np.arctan2(sup_side_l, sup_side_r))) / 90.0 * 100.0
+    sup_sym_rows.append({'variable': sup_var, 'left': sup_side_l, 'right': sup_side_r,
+                         'symmetry_angle_pct': sup_sa - 200.0 if sup_sa > 100.0 else sup_sa})
+
+symmetry_angles = pd.DataFrame(sup_sym_rows)
+if len(symmetry_angles):
+    print(f"\n  symmetry angle (0% symmetric, bounded, reference-free)")
+    for _, sup_row in symmetry_angles.iterrows():
+        print(f"    {sup_row['variable']:26s} L {sup_row['left']:+9.4f}  "
+              f"R {sup_row['right']:+9.4f}   SA {sup_row['symmetry_angle_pct']:+6.2f}%")
+
+# --- walk ratio, over both limbs ---------------------------------------------
+sup_step_len = gait_event_data.loc[sup_warm, 'step_length']
+sup_cadence = gait_event_data.loc[sup_warm, 'cadence']
+walk_ratio = float(np.nanmedian(sup_step_len / sup_cadence))
+print(f"\n  walk ratio {walk_ratio:.5f} m per step/min "
+      f"(step length {np.nanmedian(sup_step_len):.3f} m, "
+      f"cadence {np.nanmedian(sup_cadence):.1f} steps/min)")
+print(f"    Both speed and cadence are fixed by this protocol, so the walk ratio")
+print(f"    is largely set by the protocol rather than by the walker")
+
+print(f"\n  note: whole-body angular momentum is NOT computed here. It needs")
+print(f"  segment masses and inertia tensors mapped onto Theia's segment")
+print(f"  definitions, an anthropometric table this script does not have. Supply")
+print(f"  it and WBAM is a natural addition, with the GRF moment about the CoM")
+print(f"  as an independent check through dH/dt = M_ext")
+
+# =============================================================================
+# ----Figures: the manifold, the controller, the regularity, the symmetry
+# =============================================================================
+fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+
+# panel 1: the manifold itself. Every stride as a point, the goal line through
+# them, and the two directions the deviation is split along
+if goal_equivalent is not None:
+    axes[0, 0].scatter(sup_gem_t, sup_gem_l, s=8, alpha=0.35, color='#2a5d9f', lw=0)
+    sup_gem_tl = np.array([sup_gem_t.min(), sup_gem_t.max()])
+    axes[0, 0].plot(sup_gem_tl, goal_equivalent['v_star'] * sup_gem_tl, color='#cc6633', lw=2,
+                    label=f"goal: L = v* T,  v* = {goal_equivalent['v_star']:.3f} m/s")
+    # the two axes, drawn from the mean stride, scaled to 3 SD so they are visible
+    sup_centre = np.array([sup_gem_t.mean(), sup_gem_l.mean()])
+    sup_u_par = np.array([1.0, goal_equivalent['v_star']]) / np.sqrt(1 + goal_equivalent['v_star'] ** 2)
+    sup_u_perp = np.array([-goal_equivalent['v_star'], 1.0]) / np.sqrt(1 + goal_equivalent['v_star'] ** 2)
+    for sup_u, sup_sd, sup_col, sup_lbl in (
+            (sup_u_par, goal_equivalent['parallel_sd'], '#4a8f4a', 'goal-equivalent'),
+            (sup_u_perp, goal_equivalent['perpendicular_sd'], '#a8442a', 'goal-relevant')):
+        sup_e = np.vstack([sup_centre - 2 * sup_sd * sup_u,
+                           sup_centre + 2 * sup_sd * sup_u])
+        # plotted, not annotated, so the axes expand to hold the whole arm
+        axes[0, 0].plot(sup_e[:, 0], sup_e[:, 1], '-', color=sup_col, lw=2.4,
+                        marker='|' if sup_lbl == 'goal-relevant' else '_', ms=9)
+        axes[0, 0].annotate(f'{sup_lbl}\n+-2 SD = {2000*sup_sd:.0f} mm', sup_e[1],
+                            fontsize=7, color=sup_col, ha='center', va='bottom')
+    axes[0, 0].set_xlabel('stride time T (s)')
+    axes[0, 0].set_ylabel('stride length L (m)')
+    axes[0, 0].set_title('The goal-equivalent manifold\n'
+                         'deviation along the line is free, across it is not',
+                         fontsize=10)
+    axes[0, 0].legend(fontsize=7, frameon=False, loc='upper left')
+    axes[0, 0].grid(alpha=0.15)
+
+    # panel 2: the two components stride by stride, with what the controller
+    # does to each of them written on
+    axes[0, 1].plot(1000 * goal_equivalent['parallel'], lw=0.6, color='#4a8f4a',
+                    label=f"goal-equivalent, SD {1000*goal_equivalent['parallel_sd']:.0f} mm, "
+                          f"lag-1 {goal_equivalent['parallel_lag1']:+.2f}")
+    axes[0, 1].plot(1000 * goal_equivalent['perpendicular'], lw=0.6, color='#a8442a',
+                    label=f"goal-relevant, SD {1000*goal_equivalent['perpendicular_sd']:.0f} mm, "
+                          f"lag-1 {goal_equivalent['perpendicular_lag1']:+.2f}")
+    axes[0, 1].axhline(0, color='k', lw=0.6)
+    axes[0, 1].set_xlabel('stride number')
+    axes[0, 1].set_ylabel('deviation (mm)')
+    axes[0, 1].set_title('A more negative lag-1 means corrected harder\n'
+                         'stride to stride', fontsize=10)
+    axes[0, 1].legend(fontsize=7, frameon=False)
+    axes[0, 1].grid(alpha=0.15)
+else:
+    axes[0, 0].axis('off')
+    axes[0, 1].axis('off')
+
+# panel 3: does CoM state predict where the foot goes?
+if foot_placement is not None:
+    axes[0, 2].scatter(1000 * foot_placement['predicted'], 1000 * foot_placement['actual'],
+                       s=9, alpha=0.4, color='#2a5d9f', lw=0)
+    sup_lim = np.array([1000 * min(foot_placement['predicted'].min(),
+                                   foot_placement['actual'].min()),
+                        1000 * max(foot_placement['predicted'].max(),
+                                   foot_placement['actual'].max())])
+    axes[0, 2].plot(sup_lim, sup_lim, 'k--', lw=1, label='perfect prediction')
+    axes[0, 2].annotate(f"R^2 = {foot_placement['r2']:.3f}   (healthy ML > 0.8)\n"
+                        f"position gain {foot_placement['gain_position']:+.2f}\n"
+                        f"velocity gain {foot_placement['gain_velocity']:+.2f} s",
+                        (0.03, 0.97), xycoords='axes fraction', fontsize=8, va='top')
+    axes[0, 2].set_xlabel('predicted ML foot placement (mm)')
+    axes[0, 2].set_ylabel('actual ML foot placement (mm)')
+    axes[0, 2].set_title('Foot placement from CoM position and velocity\n'
+                         'at midstance, both relative to the stance foot', fontsize=10)
+    axes[0, 2].legend(fontsize=7, frameon=False, loc='lower right')
+    axes[0, 2].grid(alpha=0.15)
+else:
+    axes[0, 2].axis('off')
+
+# panel 4: the autocorrelation, with the two lags the measure reads off it
+if gait_regularity is not None and len(gait_regularity):
+    sup_lags = np.arange(sup_max_lag + 1) / kinematic_fs
+    for sup_label, sup_colour in (('ML', '#cc6633'), ('AP', '#2a5d9f'), ('VT', '#4a8f4a')):
+        if sup_label in sup_curves:
+            axes[1, 0].plot(sup_lags, sup_curves[sup_label], color=sup_colour, lw=1.2,
+                            label=sup_label)
+    for sup_lag, sup_name in ((sup_step_lag, 'one step'), (sup_stride_lag, 'one stride')):
+        axes[1, 0].axvline(sup_lag / kinematic_fs, color='k', ls='--', lw=0.9)
+        axes[1, 0].annotate(sup_name, (sup_lag / kinematic_fs, 1.0), fontsize=7,
+                            rotation=90, ha='right', va='top')
+    axes[1, 0].axhline(0, color='k', lw=0.6)
+    axes[1, 0].set_xlabel('lag (s)')
+    axes[1, 0].set_ylabel('unbiased autocorrelation')
+    axes[1, 0].set_title('Regularity is read at the step and stride lags\n'
+                         'their ratio is the symmetry', fontsize=10)
+    axes[1, 0].legend(fontsize=8, frameon=False)
+    axes[1, 0].grid(alpha=0.15)
+else:
+    axes[1, 0].axis('off')
+
+# panel 5: symmetry angle, one bar per variable, signed
+if len(symmetry_angles):
+    sup_y = np.arange(len(symmetry_angles))
+    axes[1, 1].barh(sup_y, symmetry_angles['symmetry_angle_pct'],
+                    color=['#a8442a' if v > 0 else '#2a5d9f'
+                           for v in symmetry_angles['symmetry_angle_pct']])
+    axes[1, 1].axvline(0, color='k', lw=1)
+    axes[1, 1].set_yticks(sup_y)
+    axes[1, 1].set_yticklabels(symmetry_angles['variable'], fontsize=7)
+    axes[1, 1].invert_yaxis()
+    axes[1, 1].set_xlabel('symmetry angle (%)   negative = right larger')
+    axes[1, 1].set_title('Symmetry angle: 0% is symmetric, bounded,\n'
+                         'and does not depend on which limb is the reference',
+                         fontsize=10)
+    axes[1, 1].grid(alpha=0.15, axis='x')
+else:
+    axes[1, 1].axis('off')
+
+# panel 6: the walk ratio as the slope it actually is
+axes[1, 2].scatter(sup_cadence, sup_step_len, s=8, alpha=0.3, color='#2a5d9f', lw=0)
+sup_cl = np.array([np.nanmin(sup_cadence), np.nanmax(sup_cadence)])
+axes[1, 2].plot(sup_cl, walk_ratio * sup_cl, color='#cc6633', lw=2,
+                label=f'walk ratio = {walk_ratio:.5f} m per step/min')
+axes[1, 2].set_xlabel('cadence (steps/min)')
+axes[1, 2].set_ylabel('step length (m)')
+axes[1, 2].set_title('Walk ratio is the slope through the origin.\n'
+                     'This protocol fixes both axes, so it is largely set',
+                     fontsize=10)
+axes[1, 2].legend(fontsize=7, frameon=False)
+axes[1, 2].grid(alpha=0.15)
+
+plt.tight_layout()
