@@ -2633,6 +2633,155 @@ if dfa_show is not None:
 
     plt.tight_layout()
 
+
+# =============================================================================
+# %% Trunk acceleration signal
+# =============================================================================
+# Three metrics stand on a trunk acceleration: the multiscale entropy curve,
+# the harmonic ratio and the autocorrelation regularity. The literature
+# standard is a tri-axial accelerometer at the lower back, which Theia does not
+# give, so it has to be derived -- and derived ONCE, here, so all three read
+# the same signal.
+#
+# WHICH COLUMN. NOT THE ONE WITH "Acc" IN THE NAME
+# This export names things in triplets: Trunk_Joint_Angle,
+# Trunk_Joint_Velocity, Trunk_Joint_Acceleration. Those are ANGULAR -- the
+# derivatives of a joint ANGLE. The same goes for the whole *_Joint_Acc family
+# (Left_Hip_Joint_Acc and the rest), which pairs with *_Joint_Vel and
+# *_Joint_Angle. Only Trunk_Linear_Velocity says "Linear", and it says it to
+# distinguish itself from exactly these.
+#
+# Feeding an angular acceleration into a harmonic ratio produces a number, in
+# the right ballpark, that means nothing. So the source is chosen from an
+# explicit list of LINEAR quantities and the choice is printed, rather than
+# matching whatever column happens to contain "Acc".
+#
+# HOW MANY DIFFERENTIATIONS, AND WHY IT MATTERS HERE MORE THAN USUAL
+# The harmonic ratio sums the first 20 harmonics of stride frequency. At a
+# stride time near 1.1 s that is up to about 18 Hz, and a Savitzky-Golay
+# differentiator is only accurate over a narrow band:
+#
+#     window 5, order 3   within 5% to 18.3 Hz      <- what is used below
+#     window 7, order 3   within 5% to 11.6 Hz
+#     window 11, order 3  within 5% to  7.0 Hz
+#
+# A window of 7 would attenuate the 20th harmonic by 23% and quietly bias every
+# harmonic ratio. So the time-domain signal is built with the short window, and
+# the harmonic ratio does not use it at all -- see below.
+#
+# EXACT DIFFERENTIATION IN THE FREQUENCY DOMAIN
+# The harmonic ratio already takes the DFT of one stride. Differentiation is
+# exact there: if velocity harmonic k has amplitude A_k, the acceleration
+# harmonic has amplitude k * w0 * A_k. So the harmonic ratio can be computed
+# from the VELOCITY spectrum by weighting harmonic k by k, with no numerical
+# differentiation at all -- no noise amplification, no high-frequency roll-off.
+# The stride frequency w0 is a common factor in both sums and cancels.
+#
+# That is why this cell hands on two things: a time-domain acceleration for the
+# entropy and autocorrelation, and the raw source plus the exponent needed to
+# reach acceleration spectrally, for the harmonic ratio.
+# =============================================================================
+
+trunk_lowpass_hz   = 20.0   # above the 20th harmonic, which is where the noise
+                            # that differentiation amplifies lives
+trunk_deriv_window = 5      # see the table above
+trunk_deriv_poly   = 3
+
+# (column, how many differentiations reach a LINEAR acceleration). Ordered by
+# how little differentiation is needed, since each one amplifies noise
+trunk_sources = [('Trunk_Linear_Acceleration', 0),
+                 ('Low_Back_Linear_Acceleration', 0),
+                 ('Trunk_Linear_Velocity', 1),
+                 ('Low_Back_Linear_Velocity', 1),
+                 ('Low_Back_Position', 2),
+                 ('Trunk_Position', 2),
+                 ('Pelvis_Position', 2)]
+
+print("\n" + "-" * 74)
+print("  TRUNK ACCELERATION")
+print("-" * 74)
+
+trunk_acc = None
+trunk_raw = None
+trunk_name = None
+trunk_spec_signal = None
+trunk_spec_power = 0
+for trunk_col, trunk_order in trunk_sources:
+    if trunk_col not in kinematic_data.columns:
+        continue
+    trunk_raw = np.column_stack([kinematic_data[trunk_col].to_numpy(),
+                                 kinematic_data[f'{trunk_col}.1'].to_numpy(),
+                                 kinematic_data[f'{trunk_col}.2'].to_numpy()])
+    trunk_name, trunk_deriv_order = trunk_col, trunk_order
+    break
+
+if trunk_raw is None:
+    print("  ! no linear trunk column found. Tried:")
+    for trunk_col, _ in trunk_sources:
+        print(f"      {trunk_col}")
+    print("    The entropy curve, harmonic ratio and regularity will be skipped")
+else:
+    print(f"  source: {trunk_name}, differentiated {trunk_deriv_order} time(s)")
+
+    # low-pass FIRST, so differentiation does not amplify what is about to be
+    # thrown away anyway
+    trunk_b, trunk_a = butter(4, trunk_lowpass_hz / (kinematic_fs / 2), 'low')
+    trunk_acc = filtfilt(trunk_b, trunk_a, trunk_raw, axis=0)
+    for _ in range(trunk_deriv_order):
+        trunk_acc = savgol_filter(trunk_acc, trunk_deriv_window, trunk_deriv_poly,
+                                  deriv=1, delta=1.0 / kinematic_fs, axis=0)
+
+    trunk_rms = np.sqrt(np.nanmean(trunk_acc ** 2, axis=0))
+    print(f"  RMS  ML {trunk_rms[0]:.2f}   AP {trunk_rms[1]:.2f}   "
+          f"VT {trunk_rms[2]:.2f}  m/s^2")
+
+    # a walker at 1.3 m/s puts roughly 1-4 m/s^2 RMS through the trunk. Well
+    # outside that and the units or the column are wrong, which is worth
+    # catching here rather than in a harmonic ratio three cells later
+    if np.nanmax(trunk_rms) > 20 or np.nanmax(trunk_rms) < 0.2:
+        print(f"  ! that is not a walking trunk acceleration. Expect 1-4 m/s^2 RMS")
+        print(f"    per axis -- check that {trunk_name} is linear and in metres")
+
+    # show that the similarly-named angular column is a different signal, so
+    # the choice above is evidenced rather than asserted
+    for trunk_other in ('Trunk_Joint_Acceleration', 'Trunk_Joint_Acc',
+                        'Low_Back_Joint_Acc'):
+        if trunk_other in kinematic_data.columns:
+            trunk_o = np.column_stack([kinematic_data[trunk_other].to_numpy(),
+                                       kinematic_data[f'{trunk_other}.1'].to_numpy(),
+                                       kinematic_data[f'{trunk_other}.2'].to_numpy()])
+            trunk_o_rms = np.sqrt(np.nanmean(trunk_o ** 2, axis=0))
+            trunk_corr = [np.corrcoef(trunk_acc[:, k], trunk_o[:, k])[0, 1]
+                          for k in range(3)]
+            print(f"  not used: {trunk_other}, RMS "
+                  f"{trunk_o_rms[0]:.1f}/{trunk_o_rms[1]:.1f}/{trunk_o_rms[2]:.1f}, "
+                  f"correlation with the above "
+                  f"{trunk_corr[0]:+.2f}/{trunk_corr[1]:+.2f}/{trunk_corr[2]:+.2f}")
+            if np.nanmax(trunk_o_rms) > 5 * np.nanmax(trunk_rms):
+                print(f"    {np.nanmax(trunk_o_rms)/np.nanmax(trunk_rms):.0f}x larger, "
+                      f"so it is not in m/s^2: that is the ANGULAR acceleration,")
+                print(f"    in deg/s^2. It can correlate strongly with the linear one")
+                print(f"    -- both follow the same stride rhythm -- so the magnitude")
+                print(f"    is the evidence here, not the correlation")
+
+    # what the harmonic ratio needs to differentiate exactly, in the frequency
+    # domain, instead of using trunk_acc
+    trunk_spec_signal = filtfilt(trunk_b, trunk_a, trunk_raw, axis=0)
+    trunk_spec_power = trunk_deriv_order
+
+    # One yaw for the whole trial, from the travel direction, applied to BOTH
+    # outputs here so they cannot end up in different frames. On a treadmill
+    # the heading is fixed, so this is near identity -- it exists to remove a
+    # lab-to-walker misalignment, not to track the pelvis. Rotating frame by
+    # frame would mix pelvis rotation into the signal, which is not what any of
+    # these metrics are about
+    trunk_yaw = np.arctan2(0.0, mos_travel_sign)
+    trunk_rot = np.array([[np.cos(trunk_yaw), -np.sin(trunk_yaw)],
+                          [np.sin(trunk_yaw), np.cos(trunk_yaw)]])
+    trunk_acc[:, :2] = trunk_acc[:, :2] @ trunk_rot.T
+    trunk_spec_signal[:, :2] = trunk_spec_signal[:, :2] @ trunk_rot.T
+    print(f"  heading yaw applied to both: {np.degrees(trunk_yaw):+.1f} deg")
+
 # =============================================================================
 # %% Entropy
 # =============================================================================
@@ -2800,14 +2949,10 @@ if len(entropy_results):
 # two or three scales. The continuous signal has enough samples for the curve
 # to mean something.
 
-ent_signal = None
-for ent_col in ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
-    if ent_col in kinematic_data.columns:
-        ent_signal = np.column_stack([kinematic_data[ent_col].to_numpy(),
-                                      kinematic_data[f'{ent_col}.1'].to_numpy(),
-                                      kinematic_data[f'{ent_col}.2'].to_numpy()])
-        ent_signal_name = ent_col
-        break
+# the shared signal built in the trunk acceleration cell, so the entropy, the
+# harmonic ratio and the regularity all read the same thing
+ent_signal = trunk_acc
+ent_signal_name = f"{trunk_name} -> acceleration" if trunk_acc is not None else None
 
 multiscale_entropy = None
 if ent_signal is not None:
@@ -3036,31 +3181,21 @@ print("\n" + "-" * 74)
 print("  HARMONIC RATIO")
 print("-" * 74)
 
-hr_signal = None
-for hr_col in ('Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
-    if hr_col in kinematic_data.columns:
-        hr_signal = np.column_stack([kinematic_data[hr_col].to_numpy(),
-                                     kinematic_data[f'{hr_col}.1'].to_numpy(),
-                                     kinematic_data[f'{hr_col}.2'].to_numpy()])
-        hr_signal_name = hr_col
-        break
+# The SOURCE signal, not the differentiated one. Differentiation is exact in
+# the frequency domain -- acceleration harmonic k is k * w0 times the velocity
+# harmonic -- so weighting harmonic k by k**trunk_spec_power below gives the
+# acceleration harmonics with no numerical differentiation at all. w0 is a
+# common factor in both sums of the ratio and cancels, so it is never needed.
+hr_signal = trunk_spec_signal if trunk_acc is not None else None
 
 harmonic_ratio = pd.DataFrame()
 if hr_signal is None:
-    print("  ! no trunk acceleration column, the harmonic ratio is skipped")
+    print("  ! no trunk signal, the harmonic ratio is skipped")
 else:
-    print(f"  signal: {hr_signal_name}, "
+    print(f"  signal: {trunk_name}, "
           f"{100 * np.isfinite(hr_signal).all(axis=1).mean():.1f}% finite")
-
-    # one yaw for the whole trial, from the travel direction. On a treadmill
-    # the heading is fixed, so this is near identity -- it exists to remove a
-    # lab-to-walker misalignment, not to track the pelvis
-    hr_yaw = np.arctan2(0.0, mos_travel_sign)
-    hr_rot = np.array([[np.cos(hr_yaw), -np.sin(hr_yaw)],
-                       [np.sin(hr_yaw), np.cos(hr_yaw)]])
-    hr_acc = hr_signal.copy()
-    hr_acc[:, :2] = hr_signal[:, :2] @ hr_rot.T
-    print(f"  heading yaw applied: {np.degrees(hr_yaw):+.1f} deg")
+    print(f"  harmonic k weighted by k^{trunk_spec_power} to reach acceleration "
+          f"exactly, rather than differentiating in time")
 
     # (axis index, label, is the axis odd-dominant?)
     hr_axes = [(1, 'AP', False), (2, 'VT', False), (0, 'ML', True)]
@@ -3074,9 +3209,9 @@ else:
         if np.isnan(hr_a) or np.isnan(hr_b):
             continue
         hr_a, hr_b = int(hr_a) - 1, int(hr_b) - 1
-        if hr_b - hr_a < hr_min_samples or hr_b > len(hr_acc):
+        if hr_b - hr_a < hr_min_samples or hr_b > len(hr_signal):
             continue
-        hr_seg = hr_acc[hr_a:hr_b]
+        hr_seg = hr_signal[hr_a:hr_b]
         if not np.isfinite(hr_seg).all():
             continue
 
@@ -3087,8 +3222,10 @@ else:
             if len(hr_amp) <= hr_n_harmonics:
                 hr_row = None
                 break
-            hr_amp = hr_amp[1:hr_n_harmonics + 1]
             hr_k = np.arange(1, hr_n_harmonics + 1)
+            # k**0 when the source already is an acceleration, k**1 from a
+            # velocity, k**2 from a position
+            hr_amp = hr_amp[1:hr_n_harmonics + 1] * hr_k.astype(float) ** trunk_spec_power
             hr_odd, hr_even = hr_amp[hr_k % 2 == 1], hr_amp[hr_k % 2 == 0]
             # the intrinsic set is the one the axis is SUPPOSED to live on
             hr_in, hr_out = ((hr_odd, hr_even) if hr_odd_dom else (hr_even, hr_odd))
@@ -3099,7 +3236,20 @@ else:
             hr_row[f'ihr_{hr_label}'] = (100.0 * np.sum(hr_in ** 2) / np.sum(hr_amp ** 2)
                                          if np.sum(hr_amp ** 2) > 0 else np.nan)
             hr_spectra[hr_label].append(hr_amp)
-            hr_waveforms[hr_label].append(normalize(hr_seg[:, hr_ax], 101))
+            hr_waveforms[hr_label].append(
+                normalize(trunk_acc[hr_a:hr_b, hr_ax], 101))
+
+            # the same ratio taken the obvious way, off the time-domain
+            # acceleration, purely so the cost of numerical differentiation is
+            # visible rather than argued. Not used for anything downstream
+            hr_td = np.abs(np.fft.rfft(trunk_acc[hr_a:hr_b, hr_ax]
+                                       - trunk_acc[hr_a:hr_b, hr_ax].mean()))
+            hr_td = hr_td[1:hr_n_harmonics + 1]
+            hr_td_in, hr_td_out = ((hr_td[hr_k % 2 == 1], hr_td[hr_k % 2 == 0])
+                                   if hr_odd_dom else
+                                   (hr_td[hr_k % 2 == 0], hr_td[hr_k % 2 == 1]))
+            hr_row[f'hr_{hr_label}_timedomain'] = (hr_td_in.sum() / hr_td_out.sum()
+                                                   if hr_td_out.sum() > 0 else np.nan)
         if hr_row is not None:
             hr_rows.append(hr_row)
 
@@ -3115,6 +3265,20 @@ if len(harmonic_ratio):
               f"{'odd/even' if hr_odd_dom else 'even/odd'}      "
               f"{hr_ih.median():5.1f}% "
               f"({hr_ih.quantile(0.25):.1f}-{hr_ih.quantile(0.75):.1f})")
+
+    # What numerical differentiation would have cost. A Savitzky-Golay
+    # differentiator rolls off before the 20th harmonic, and since the even
+    # harmonics sit at higher k than the odd ones they are attenuated more, so
+    # the bias has a direction rather than averaging out.
+    print(f"\n    axis   spectral (used)   time domain   difference")
+    for _, hr_label, _ in hr_axes:
+        hr_a_val = harmonic_ratio[f'hr_{hr_label}'].median()
+        hr_b_val = harmonic_ratio[f'hr_{hr_label}_timedomain'].median()
+        print(f"    {hr_label}    {hr_a_val:13.3f}   {hr_b_val:11.3f}   "
+              f"{100*(hr_b_val-hr_a_val)/hr_a_val:+7.1f}%")
+    print(f"    The spectral values are the exact ones: harmonic k of the")
+    print(f"    acceleration IS k*w0 times harmonic k of the velocity, with no")
+    print(f"    filter in between. Any gap is the differentiator's roll-off")
 
     # the median is reported, not the mean, because HR is an unbounded ratio.
     # This says how far apart the two are, which is the Pasciuto point made on
@@ -3368,7 +3532,7 @@ if sup_fit.sum() >= 20:
 
 # --- autocorrelation regularity and symmetry ---------------------------------
 gait_regularity = None
-if hr_signal is not None and len(stride_series) > 10:
+if trunk_acc is not None and len(stride_series) > 10:
     sup_stride_s = float(np.nanmedian(stride_series['stride_time']))
     sup_step_lag = int(round(0.5 * sup_stride_s * kinematic_fs))
     sup_stride_lag = int(round(sup_stride_s * kinematic_fs))
@@ -3377,7 +3541,7 @@ if hr_signal is not None and len(stride_series) > 10:
     sup_rows = []
     sup_curves = {}
     for sup_ax, sup_label in ((0, 'ML'), (1, 'AP'), (2, 'VT')):
-        sup_x = hr_acc[int(ss_warmup_s * kinematic_fs):, sup_ax]
+        sup_x = trunk_acc[int(ss_warmup_s * kinematic_fs):, sup_ax]
         sup_x = sup_x[np.isfinite(sup_x)]
         sup_x = sup_x - sup_x.mean()
         sup_n = len(sup_x)

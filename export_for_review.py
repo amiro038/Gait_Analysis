@@ -126,7 +126,14 @@ if exp_window_s > 0:
     for exp_base in ('Left_Heel_Position', 'Right_Heel_Position',
                      'Left_Ankle_Position', 'Right_Ankle_Position',
                      'Left_Toes_Position', 'Right_Toes_Position',
-                     'Whole_body_COG', 'Low_Back_Joint_Acc', 'Trunk_Joint_Acc'):
+                     'Whole_body_COG',
+                     # the trunk signals: the linear one the metrics use, and
+                     # the angular one they must not, so the distinction can be
+                     # checked off-machine rather than taken on trust
+                     'Trunk_Linear_Velocity', 'Trunk_Linear_Acceleration',
+                     'Low_Back_Linear_Velocity', 'Low_Back_Position',
+                     'Trunk_Position', 'Pelvis_Position',
+                     'Trunk_Joint_Acceleration', 'Trunk_Joint_Velocity'):
         exp_cols += [c for c in (exp_base, exp_base + '.1', exp_base + '.2')
                      if c in kinematic_data.columns]
     exp_pack['kinematic_columns'] = np.array(exp_cols)
