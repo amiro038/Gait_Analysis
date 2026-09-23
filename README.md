@@ -594,77 +594,75 @@ pipeline before them. They are superseded, nothing depends on them, and
 `build_foot_binding.py` reproduces their output bit for bit. Kept only so the
 history is inspectable without digging through git.
 
-## Gait events — `gait_events.py`
+## Gait events — `detect_gait_events.py`
 
-Heel strikes and toe-offs for the split-belt treadmill, GRF first. It replaces
-the four-script chain (GRF detection, velocity at GRF events, kinematic
-detection, merge) and writes `{trial}_merged_events.csv` with the same four
-columns `Gait_analysis_all_metrics.py` reads.
+One self-contained script, numpy and scipy only. It writes
+`{trial}_merged_events.csv` with the four columns `Gait_analysis_all_metrics.py`
+reads. Set the paths in its CONFIG cell and press F5, or:
 
 ```bash
-python gait_events_grf_zeni.py           # trusted GRF, then Zeni: the one to use
-python gait_events.py                    # every trial in FORCE_FOLDER
-python gait_events.py "D05_C1_Treadmill_1.3mpers 108bpm"
-python test_gait_events.py               # synthetic end-to-end check
+python detect_gait_events.py                       # every trial
+python detect_gait_events.py "D05_C1_Treadmill_1.3mpers 108bpm"
+python test_detect_gait_events.py                  # synthetic end-to-end check
 ```
 
-**A GRF event is trusted only when the mesh says the belt was carrying one
-foot, all of it, and nothing else.** The boot soles are posed on the Theia feet
-through `foot_mesh_binding.npz`. Over ±50 ms around each belt event the checks
-are, in order:
+It needs `foot_mesh_binding.npz` (the boot meshes) and
+`force_plates_DICE_treadmill.txt` (the C3D plate parameters) next to it.
 
-| reason not trusted | meaning |
+1. **GRF first, where it can be trusted.** Each belt contact's heel strike and
+   toe-off is judged separately, over ±50 ms. It is kept only if all of these
+   hold:
+   - the force rises or falls like a foot landing or leaving;
+   - the posed boot mesh shows that belt carrying one boot, clear of the gap
+     by 10 mm plus the plate outline's uncertainty;
+   - the other boot is off the belt;
+   - the centre of pressure is under the boot.
+
+   The limb comes from the mesh, so a clean crossover step is kept with the
+   right limb.
+2. **Zeni for the rest**: heel strike where the heel is furthest in front of
+   the pelvis, toe-off where the toe is furthest behind it. Each event is
+   searched for only in the gap the L HS → R TO → R HS → L TO sequence leaves
+   for it. It is then shifted by Zeni's median offset from the trial's trusted
+   GRF events. Across 11 D05 trials Zeni had the smallest worst-trial error of
+   seven candidate methods.
+3. **Only where Zeni finds nothing** (a tracking dropout): a clean-looking
+   contact the mesh could not check (`GRF_unverified`), then interpolation.
+
+Why a GRF event was not trusted, as written in `{trial}_grf_contacts.csv`:
+
+| reason | meaning |
 |---|---|
 | `incomplete` | the contact runs off the start or end of the recording |
-| `slow_loading` / `slow_unloading` | the force does not rise / fall like a foot landing / leaving (D05's left belt sometimes holds 100–200 N for up to 300 ms after push-off, well lateral of the foot) |
-| `no_mesh` | tracking dropped out; a clean-looking contact is kept as `GRF_unverified` |
-| `other_foot_on_belt` | the other boot's contact patch is on, or within 10 mm of, this belt |
-| `foot_not_in_contact` | the mesh has this foot in the air at the event |
-| `foot_over_belt_edge` | part of this foot's contact patch is within 10 mm of the gap or across it |
-| `cop_outside_foot` | the centre of pressure is not under the foot |
+| `slow_loading` / `slow_unloading` | the force does not rise / fall like a foot landing / leaving (D05's left belt sometimes holds 100–200 N for up to 300 ms after push-off) |
+| `no_mesh` | tracking dropped out at the event |
+| `other_foot_on_belt` | the other boot's contact patch is on, or within the margin of, this belt |
+| `foot_not_in_contact` | the mesh has this boot in the air at the event |
+| `foot_over_belt_edge` | part of this boot's contact patch is within the margin of the gap, or across it |
+| `cop_outside_foot` | the centre of pressure is not under the boot |
 
-The limb comes from the mesh, not from the belt's name, so a clean crossover
-step is kept with the right limb.
+`source` is `GRF`, `kinematic` (Zeni), `GRF_unverified` or `interpolated`. The
+other outputs:
+- `{trial}_event_qa.csv`: how each event was found, plus stance and stride
+  outlier flags.
+- `{trial}_grf_contacts.csv`: every contact's label and why each of its events
+  was or was not trusted.
+- `{trial}_event_summary.json`: the plate fit, the lab → Theia registration,
+  the belt surface, and Zeni's error against GRF.
 
-**`gait_events_grf_zeni.py` is the production run.** It uses trusted GRF,
-and Zeni et al. (2008) for everything else: heel strike where the heel is
-furthest in front of the pelvis, toe-off where the toe is furthest behind
-it. Across 11 D05 trials Zeni had the smallest worst-trial error of all the
-candidates, with MAE 5.6 ms at heel strike and 2.5 ms at toe-off. An
-unverifiable GRF contact is used only where Zeni finds nothing. It writes
-the same files, with `zeni_benchmark` in place of `fallback_benchmark`.
+**Plates.** The measured corners don't quite match the plate's stated size:
+568 × 1768 mm against 559 × 1778. So the nominal rectangle is fitted rigidly to
+them, and the worst corner miss (8 mm) is added to the belt-edge margin.
 
-**Everything else is found by a fallback**, searched for only in the window the
-gait sequence (L HS → R TO → R HS → L TO) puts it in. The candidate variables
-live in `fallback_detectors.py`. Each is calibrated on the trusted events of
-the same limb in the same trial, and scored on trusted events it was not
-calibrated on (`{trial}_fallback_benchmark.csv`,
-`fallback_benchmark_all_trials.csv`). To try a new variable, add a function
-there. `FALLBACK_ORDER` picks which ones are used; set it to `"auto"` to rank
-them by each trial's own benchmark.
-
-**Belts.** `FORCE_PLATE_FILE` points at the C3D force-plate parameters,
-exported as `name<tab>value` lines (`force_plates_DICE_treadmill.txt` is the
-DICE treadmill). The measured corners don't quite match the plate's stated
-size: 568 × 1768 mm against 559 × 1778. So the nominal rectangle is fitted
-rigidly to them. The worst corner miss (8 mm) is added to the 10 mm
-belt-edge margin, so uncertainty in the outline only ever makes the trust
-test stricter.
-
-In this export each belt's CoP is in that plate's own frame: origin at the
-plate centre, X pointing along lab −X. That holds exactly on D05, where
-COP = (−My/Fz, Mx/Fz) − OFFSET. `COP_FRAME = "plate"` moves it into the lab
-frame through the same fit.
+In this export each belt's CoP is in that plate's own frame. That holds exactly
+on D05, where COP = (−My/Fz, Mx/Fz) − OFFSET. `COP_FRAME = "plate"` moves it
+into the lab frame through the same fit.
 
 The plates are pitched about 0.8°, so the belt surface is fitted as a plane
-rising along the walking direction, not as one floor height. That is 13 mm
-over one stance, too much to ignore against a 15 mm contact threshold.
+rising along the walking direction. The lab → Theia transform is estimated per
+trial and printed with its distance from the identity. If Theia shares the
+mocap lab frame, set `LAB_TO_THEIA = "identity"`.
 
-The lab → Theia transform is estimated per trial, and the script prints how
-far it is from the identity. If Theia shares the mocap lab frame, set
-`FP_TO_THEIA = "identity"`.
-
-`source` in the merged file is `GRF`, `GRF_unverified`, `kinematic` or
-`interpolated`. `{trial}_event_qa.csv` says which variable found each event
-and flags stance and stride outliers. `{trial}_grf_contacts.csv` gives every
-belt contact's label and the reason for each untrusted event.
+`archive/gait_events_multifile/` has the earlier multi-file version. It
+benchmarks seven fallback variables against the trusted GRF events, which is
+how Zeni was chosen. To rerun it, put it back beside `apply_binding.py`.
