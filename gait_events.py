@@ -93,20 +93,27 @@ KINEMATIC_RATE = 100
 # --- belts -----------------------------------------------------------------
 BELT_CHANNEL = {"L": "Left belt", "R": "Right belt"}
 
-# The four corners of each belt's plate in the force-plate frame, millimetres,
-# any order -- FORCE_PLATFORM:CORNERS in the C3D. None puts the gap halfway
-# between the two belts' centre-of-pressure clouds with BELT_GAP_MM between
-# them and prints a warning; enter the real corners as soon as you have them.
-BELT_CORNERS_MM = None
-# BELT_CORNERS_MM = {
-#     "L": [(-850, -1000), (-5, -1000), (-5, 1000), (-850, 1000)],
-#     "R": [(5, -1000), (850, -1000), (850, 1000), (5, 1000)],
-# }
-BELT_GAP_MM = 10.0
+# The belts' force-plate parameters as exported from the C3D: one block per
+# plate, a FORCE_PLATE_NAME line then FORCE_PLATE_CORNER_*, _OFFSET_*,
+# _LENGTH and _WIDTH, "name<tab>value". The nominal LENGTH x WIDTH rectangle
+# is fitted rigidly to the four measured corners -- they are 6-8 mm off it on
+# DICE, the plates measuring 568 x 1768 mm against 559 x 1778 -- and the
+# worst corner miss is added to BELT_MARGIN_MM, so the uncertainty in the
+# outline only ever makes the trust test stricter. None guesses the gap from
+# the centre of pressure instead, and says so.
+FORCE_PLATE_FILE = HERE / "force_plates_DICE_treadmill.txt"
+# The frame COP_X / COP_Y are in. "plate": each belt's own frame, origin at
+# the plate centre, axes as named by its corners -- the DICE export, where
+# COP = (-My/Fz, Mx/Fz) - OFFSET to the micrometre on D05. "lab": already in
+# the frame the corners are given in.
+COP_FRAME = "plate"
+BELT_GAP_MM = 10.0             # only used without FORCE_PLATE_FILE
 
-# Force-plate metres -> Theia metres, as a 2x3 matrix [[a, b, tx], [c, d, ty]]
-# on (x, y, 1). None estimates it per trial and prints the estimate in this
-# form, so a registration you trust can be pasted back here.
+# Lab (plate-corner) metres -> Theia metres, as a 2x3 matrix
+# [[a, b, tx], [c, d, ty]] on (x, y, 1). None estimates it per trial and
+# prints it in this form, along with how far it is from the identity.
+# "identity" says Theia shares the mocap lab frame, which is worth setting
+# once the estimate agrees with it to a few mm.
 FP_TO_THEIA = None
 ALLOW_MIRROR = False           # True only if the two frames differ in handedness
 
@@ -128,7 +135,7 @@ MAX_UNLOADING_S = 0.080        # D05 sample: 34-45 ms, tails up to 315 ms
 # --- feet ------------------------------------------------------------------
 SOLE_CELL_MM = 10.0            # sole = lowest mesh vertex in each cell
 SOLE_MAX_RISE_MM = 35.0        # ... up to this far above the lowest (toe spring)
-FLOOR_PERCENTILE = 25          # of each foot's lowest sole point = belt surface
+FLOOR_PERCENTILE = 25          # starting guess for the belt surface height
 CONTACT_HEIGHT_MM = 15.0
 MIN_CONTACT_VERTICES = 3
 
@@ -446,21 +453,6 @@ class Feet:
                                     poses[f]) for f in LIMBS}
         self.h = CONTACT_HEIGHT_MM / 1000
 
-        # pass 1: how low each sole gets, and where the belt surface is
-        self.min_z, self.rear_z, self.fore_z = {}, {}, {}
-        for f in LIMBS:
-            sole, rear = self.model[f]["vertices"], self.model[f]["rear"]
-            mz, rz, fz = (np.full(self.n, np.nan) for _ in range(3))
-            for sl, W in sole_chunks(poses[f], sole):
-                z = W[..., 2]
-                mz[sl], rz[sl], fz[sl] = (z.min(1), z[:, rear].min(1),
-                                          z[:, ~rear].min(1))
-            self.min_z[f], self.rear_z[f], self.fore_z[f] = mz, rz, fz
-        self.floor = {f: float(np.nanpercentile(self.min_z[f],
-                                                FLOOR_PERCENTILE))
-                      for f in LIMBS}
-        self.height = {f: self.min_z[f] - self.floor[f] for f in LIMBS}
-
         # forward = the feet's long axis, horizontal, median over the trial
         fwd = np.zeros(3)
         for f in LIMBS:
@@ -470,18 +462,71 @@ class Feet:
             fwd += np.median(d / np.linalg.norm(d, axis=1, keepdims=True), 0)
         self.forward = fwd / np.linalg.norm(fwd)
 
-        # pass 2: the contact patch, for registration
+        # pass 1: the lowest sole point of every frame, and where it is
+        low_z, low_s = {}, {}
+        for f in LIMBS:
+            z_min = np.full(self.n, np.nan)
+            s_min = np.full(self.n, np.nan)
+            for sl, W in sole_chunks(poses[f], self.model[f]["vertices"]):
+                z = np.where(np.isfinite(W[..., 2]), W[..., 2], np.inf)
+                i = z.argmin(1)
+                pick = W[np.arange(len(W)), i]
+                z_min[sl] = pick[:, 2]
+                s_min[sl] = pick[:, :2] @ self.forward[:2]
+            low_z[f], low_s[f] = z_min, s_min
+        self.fit_belt_surface(low_z, low_s)
+
+        # pass 2: heights above the belt, and the contact patch
+        self.height, self.rear_h, self.fore_h = {}, {}, {}
         self.n_contact, self.centroid = {}, {}
         for f in LIMBS:
+            rear = self.model[f]["rear"]
+            hh, rh, fh = (np.full(self.n, np.nan) for _ in range(3))
             nc = np.zeros(self.n, int)
             cen = np.full((self.n, 2), np.nan)
             for sl, W in sole_chunks(poses[f], self.model[f]["vertices"]):
-                touch = W[..., 2] < self.floor[f] + self.h
+                hz = self.above_belt(f, W)
+                hh[sl], rh[sl], fh[sl] = (hz.min(1), hz[:, rear].min(1),
+                                          hz[:, ~rear].min(1))
+                touch = hz < self.h
                 nc[sl] = touch.sum(1)
                 with np.errstate(invalid="ignore", divide="ignore"):
                     cen[sl] = ((W[..., :2] * touch[..., None]).sum(1)
                                / touch.sum(1)[:, None])
+            self.height[f], self.rear_h[f], self.fore_h[f] = hh, rh, fh
             self.n_contact[f], self.centroid[f] = nc, cen
+
+    def fit_belt_surface(self, low_z, low_s):
+        """Belt height under a point: floor[foot] + slope * (distance along
+        the walking direction). The DICE plates are pitched ~0.8 deg, 13 mm
+        over one stance, which a flat floor would turn into early or late
+        contact at either end of it. Fitted to the lowest sole point of the
+        frames that sit on the surface; one slope for both feet, and one
+        offset per foot so a bias in either boot's Theia pose is absorbed.
+        """
+        floor = {f: float(np.nanpercentile(low_z[f], FLOOR_PERCENTILE))
+                 for f in LIMBS}
+        slope, keep = 0.0, 0.020
+        for _ in range(4):
+            rows, target = [], []
+            for k, f in enumerate(LIMBS):
+                h = low_z[f] - floor[f] - slope * low_s[f]
+                m = np.isfinite(h) & (np.abs(h) < keep)
+                cols = np.zeros((m.sum(), 3))
+                cols[:, k] = 1
+                cols[:, 2] = low_s[f][m]
+                rows.append(cols)
+                target.append(low_z[f][m])
+            A, z = np.vstack(rows), np.concatenate(target)
+            a_l, a_r, slope = np.linalg.lstsq(A, z, rcond=None)[0]
+            floor = {"L": float(a_l), "R": float(a_r)}
+            keep = 0.008
+        self.floor, self.slope = floor, float(slope)
+
+    def above_belt(self, f, W):
+        """Height of world points W (..., 3) above the belt surface."""
+        s = W[..., :2] @ self.forward[:2]
+        return W[..., 2] - self.floor[f] - self.slope * s
 
     def belt_membership(self, belts, cop_theia, margin):
         """Pass 3: per foot, per belt, how many contact vertices touch it
@@ -496,7 +541,7 @@ class Feet:
                 self.n_strict[f][b] = np.zeros(self.n, int)
                 self.cop_dist[f][b] = np.full(self.n, np.inf)
             for sl, W in sole_chunks(self.poses[f], self.model[f]["vertices"]):
-                touch = W[..., 2] < self.floor[f] + self.h
+                touch = self.above_belt(f, W) < self.h
                 xy = W[..., :2]
                 for b, poly in belts.items():
                     d = inside_distance(poly, xy)
@@ -594,11 +639,94 @@ def estimate_registration(force100, cop100, feet, belts_fp):
                    median_along_residual_mm=float(np.median(along)))
 
 
-def belt_polygons_fp(forces):
-    """Belt corners in FP metres, either given or guessed from the CoP."""
-    if BELT_CORNERS_MM is not None:
-        return {b: polygon_ccw(np.asarray(BELT_CORNERS_MM[b], float) / 1000)
-                for b in LIMBS}, False
+PLATE_CORNERS = ("POSX_POSY", "NEGX_POSY", "NEGX_NEGY", "POSX_NEGY")
+
+
+def load_force_plates(path):
+    """{limb: {parameter: value}} from the C3D FORCE_PLATE_* export."""
+    blocks, name = {}, None
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2:
+                continue
+            key, value = parts[0], parts[1].strip()
+            if key == "FORCE_PLATE_NAME":
+                name = value
+                blocks[name] = {}
+            elif name is not None:
+                blocks[name][key] = float(value)
+    plates = {}
+    for limb, belt in BELT_CHANNEL.items():
+        if belt not in blocks:
+            raise KeyError(f"{path}: no FORCE_PLATE_NAME {belt!r}; "
+                           f"found {sorted(blocks)}")
+        plates[limb] = blocks[belt]
+    return plates
+
+
+def fit_plate(p):
+    """The nominal plate rectangle placed on its measured corners.
+
+    Least-squares rigid fit (rotation + translation, no scaling) of the
+    LENGTH x WIDTH rectangle, centred on the plate origin with axes as the
+    corner names say, onto the four corners. -> R, t with
+    lab = R @ (x_plate, y_plate, 0) + t, in mm, and how far each measured
+    corner is from the fitted one, in the horizontal plane.
+    """
+    L, W = p["FORCE_PLATE_LENGTH"], p["FORCE_PLATE_WIDTH"]
+    measured = np.array([[p[f"FORCE_PLATE_CORNER_{c}_{a}"] for a in "XYZ"]
+                         for c in PLATE_CORNERS])
+    nominal = np.array([[W / 2 if c.startswith("POSX") else -W / 2,
+                         L / 2 if c.endswith("POSY") else -L / 2, 0.0]
+                        for c in PLATE_CORNERS])
+    R, t = ab.kabsch(nominal, measured)
+    fitted = nominal @ R.T + t
+    miss = np.linalg.norm((measured - fitted)[:, :2], axis=1)
+    edges = np.linalg.norm(measured - np.roll(measured, -1, axis=0), axis=1)
+    return dict(R=R, t=t, length=L, width=W, outline=fitted[:, :2],
+                corner_miss_mm=miss, measured_edges_mm=edges,
+                pitch_deg=float(np.degrees(np.arcsin(R[2, 1]))))
+
+
+def belt_geometry(forces):
+    """Belt outlines in lab metres, and every CoP moved into the lab frame.
+
+    -> ({limb: CCW polygon (4, 2) in m}, extra margin in m, info). The CoP in
+    `forces` is replaced by its lab position, in mm, in place.
+    """
+    if FORCE_PLATE_FILE is None:
+        return (*_guess_belts(forces), dict(source="guessed from the CoP"))
+    plates = {b: fit_plate(p) for b, p in
+              load_force_plates(FORCE_PLATE_FILE).items()}
+    info = dict(source=str(FORCE_PLATE_FILE), plates={})
+    for b, pl in plates.items():
+        cop = forces[b]["cop"]
+        loaded = forces[b]["fz"] > COP_MIN_FORCE_N + 20
+        if COP_FRAME == "plate":
+            inside = ((np.abs(cop[loaded, 0]) <= pl["width"] / 2)
+                      & (np.abs(cop[loaded, 1]) <= pl["length"] / 2))
+            lab = (np.column_stack([cop, np.zeros(len(cop))]) @ pl["R"].T
+                   + pl["t"])[:, :2]
+            lab[~np.isfinite(cop).all(axis=1)] = np.nan
+            forces[b]["cop"] = lab
+        else:
+            inside = inside_distance(polygon_ccw(pl["outline"]),
+                                     cop[loaded]) >= 0
+        info["plates"][b] = dict(
+            nominal_mm=[pl["width"], pl["length"]],
+            corner_miss_mm=pl["corner_miss_mm"].round(1).tolist(),
+            measured_edges_mm=pl["measured_edges_mm"].round(1).tolist(),
+            pitch_deg=round(pl["pitch_deg"], 2),
+            loaded_cop_on_plate=float(inside.mean()) if inside.size else None)
+    extra = max(pl["corner_miss_mm"].max() for pl in plates.values()) / 1000
+    info["outline_uncertainty_mm"] = round(extra * 1000, 1)
+    polys = {b: polygon_ccw(pl["outline"] / 1000) for b, pl in plates.items()}
+    return polys, extra, info
+
+
+def _guess_belts(forces):
+    """Without plate parameters: the gap halfway between the CoP clouds."""
     x = {}
     for b in LIMBS:
         m = forces[b]["fz"] > COP_MIN_FORCE_N
@@ -611,7 +739,7 @@ def belt_polygons_fp(forces):
                   (centre - w, ap)],
              hi: [(centre + g, -ap), (centre + w, -ap), (centre + w, ap),
                   (centre + g, ap)]}
-    return {b: polygon_ccw(boxes[b]) for b in LIMBS}, True
+    return {b: polygon_ccw(boxes[b]) for b in LIMBS}, 0.0
 
 
 # %%==========================================================================
@@ -747,10 +875,8 @@ class Kinematics:
         self.toe = {k: f(vectors[f"{side[k]}_Toes_Position"]) for k in LIMBS}
         self.pelvis = f(vectors["Pelvis_Position"])
         self.sole_height = {k: f(feet.height[k]) for k in LIMBS}
-        self.rear_height = {k: f(feet.rear_z[k] - feet.floor[k])
-                            for k in LIMBS}
-        self.fore_height = {k: f(feet.fore_z[k] - feet.floor[k])
-                            for k in LIMBS}
+        self.rear_height = {k: f(feet.rear_h[k]) for k in LIMBS}
+        self.fore_height = {k: f(feet.fore_h[k]) for k in LIMBS}
 
     def ap(self, x):
         return x @ self.forward
@@ -1081,6 +1207,7 @@ def process_trial(force_path, meta, binding, verbose=True):
 
     forces = load_forces(force_path)
     n_samples = len(forces["L"]["fz"])
+    belts_fp, extra_margin, plate_info = belt_geometry(forces)
     frames, vectors, poses, seg_of_limb, landmarks = load_kinematics(
         kin_path, meta)
     for limb, P in poses.items():
@@ -1115,13 +1242,28 @@ def process_trial(force_path, meta, binding, verbose=True):
 
     # 2. feet
     feet = Feet(poses, binding, seg_of_limb)
-    say(f"  belt surface at z = {feet.floor['L'] * 1000:.1f} / "
-        f"{feet.floor['R'] * 1000:.1f} mm (left / right sole)")
+    say(f"  belt surface: z = {feet.floor['L'] * 1000:.1f} / "
+        f"{feet.floor['R'] * 1000:.1f} mm under the left / right sole, "
+        f"rising {np.degrees(np.arctan(feet.slope)):+.2f} deg in the walking "
+        f"direction")
 
-    belts_fp, guessed = belt_polygons_fp(forces)
-    if guessed:
-        say("  ! BELT_CORNERS_MM not set: belts guessed from the CoP")
-    if FP_TO_THEIA is not None:
+    if FORCE_PLATE_FILE is None:
+        say("  ! FORCE_PLATE_FILE not set: belts guessed from the CoP")
+    else:
+        for b, pl in plate_info["plates"].items():
+            w, l = pl["nominal_mm"]
+            say(f"  {BELT_CHANNEL[b]} plate: corners {pl['corner_miss_mm']} mm"
+                f" off the {w:g} x {l:g} mm rectangle, pitch "
+                f"{pl['pitch_deg']:+.2f} deg, loaded CoP on the plate "
+                f"{100 * pl['loaded_cop_on_plate']:.2f}%")
+            if pl["loaded_cop_on_plate"] < 0.99:
+                say(f"  ! the {BELT_CHANNEL[b]} CoP is not where the plate is;"
+                    f" check COP_FRAME")
+    margin = BELT_MARGIN_MM / 1000 + extra_margin
+    if isinstance(FP_TO_THEIA, str) and FP_TO_THEIA == "identity":
+        A = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        reg = dict(source="identity")
+    elif FP_TO_THEIA is not None:
         A = np.asarray(FP_TO_THEIA, float)
         reg = dict(source="config")
     else:
@@ -1137,10 +1279,15 @@ def process_trial(force_path, meta, binding, verbose=True):
             f"track {reg['belt_axis_vs_cop_track_deg']:.1f} deg")
         if reg["p90_side_residual_mm"] > MAX_REGISTRATION_ERROR_MM:
             say("  ! registration is poor; trust labels will be unreliable")
+        turn = np.degrees(np.arctan2(A[1, 0], A[0, 0]))
+        say(f"    vs the identity (Theia in the mocap lab frame): "
+            f"{turn:+.2f} deg, {np.linalg.norm(A[:, 2]) * 1000:.0f} mm")
 
     belts = {b: apply_2d(A, poly) for b, poly in belts_fp.items()}
     cop_theia = {b: apply_2d(A, cop100[b] / 1000) for b in LIMBS}
-    feet.belt_membership(belts, cop_theia, BELT_MARGIN_MM / 1000)
+    feet.belt_membership(belts, cop_theia, margin)
+    say(f"  belt-edge margin {margin * 1000:.1f} mm ({BELT_MARGIN_MM:.0f} + "
+        f"{extra_margin * 1000:.1f} for the plate outline)")
 
     # 3. trust
     anchors, unverified = label_contacts(contacts, feet, force100)
@@ -1237,7 +1384,10 @@ def process_trial(force_path, meta, binding, verbose=True):
     with open(OUTPUT_FOLDER / f"{stem}_event_registration.json", "w") as fh:
         json.dump(dict(fp_to_theia=A.tolist(), registration=reg,
                        belts_theia={b: p.tolist() for b, p in belts.items()},
-                       belts_guessed=guessed, floor_m=feet.floor,
+                       plates=plate_info, margin_mm=margin * 1000,
+                       belt_surface=dict(floor_m=feet.floor,
+                                         slope_deg=float(np.degrees(
+                                             np.arctan(feet.slope)))),
                        forward=feet.forward.tolist(),
                        expected_intervals_frames={
                            f"{SEQUENCE[p][0]} {SEQUENCE[p][1]} -> next": v

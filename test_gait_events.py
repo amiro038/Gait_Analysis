@@ -5,6 +5,10 @@ treadmill whose forces are computed from where each sole actually touches:
 
   * the force-plate frame is rotated 90 deg and shifted from Theia's, and the
     registration has to find that from the data alone,
+  * as in the DICE export, each belt's CoP is in that plate's own frame (X
+    flipped, origin at the plate centre), the plates are described by
+    measured corners a few mm off their nominal rectangle, and the treadmill
+    is pitched 0.84 deg,
   * step L12 crosses onto the right belt, L20 and R30 straddle the gap and
     R40 crosses onto the left belt -- every belt contact they touch is wrong
     about something,
@@ -15,7 +19,7 @@ treadmill whose forces are computed from where each sole actually touches:
 
 It checks that
 
-  * the registration is recovered,
+  * the registration and the belt's pitch are recovered,
   * no event the pipeline calls GRF is more than a frame from the truth, and
     none of them comes from a step that was crossed or straddled,
   * every true event in the covered range comes out once, with the right
@@ -46,6 +50,9 @@ Y_AT_HS = 0.30
 GAP = 0.010                                   # m, belts at |x| > 5 mm
 FLOOR_T = 0.012                               # Theia z of the belt surface
 YAW = np.radians(90.0)
+INCLINE = np.radians(0.84)                    # treadmill pitch, front up
+PLATE_W, PLATE_L = 559.0, 1778.0              # mm
+PLATE_CX = {"L": -(GAP * 1000 + PLATE_W) / 2, "R": (GAP * 1000 + PLATE_W) / 2}
 SHIFT = np.array([0.40, -0.20])
 A_TRUE = np.array([[np.cos(YAW), -np.sin(YAW), SHIFT[0]],
                    [np.sin(YAW), np.cos(YAW), SHIFT[1]]])
@@ -117,10 +124,12 @@ def rot_x(a):
 
 RZ = np.array([[np.cos(YAW), -np.sin(YAW), 0], [np.sin(YAW), np.cos(YAW), 0],
                [0, 0, 1]])
+RI = rot_x(np.array([INCLINE]))[0]           # treadmill -> lab
 
 
 def to_theia(p):
-    q = p @ RZ.T
+    """Treadmill frame -> Theia, through the pitched lab frame."""
+    q = p @ RI.T @ RZ.T
     q[..., :2] += SHIFT
     q[..., 2] += FLOOR_T
     return q
@@ -149,7 +158,7 @@ for limb in ("L", "R"):
     split[limb], cop_xy[limb] = frac, cen
 
     P = np.zeros((len(t_k), 4, 4))
-    P[:, :3, :3] = RZ @ R_t
+    P[:, :3, :3] = RZ @ RI @ R_t
     P[:, :3, 3] = to_theia(origin) + rng.normal(0, 0.001, origin.shape)
     P[:, 3, 3] = 1
     poses[limb] = P
@@ -188,15 +197,29 @@ force_dir, kin_dir = WORK / "FP_renamed", WORK / "Theia_csv_outputs"
 force_dir.mkdir()
 kin_dir.mkdir()
 cols = {}
+plate_lines = []
 for b, belt, base in (("L", "Left belt", 8.0), ("R", "Right belt", 7.0)):
     true = fz[b].copy()
     with np.errstate(invalid="ignore", divide="ignore"):
         cop = cop_num[b] / true[:, None] * 1000
+    # into the plate's own frame: origin at its centre, X pointing to -x
+    cop = np.column_stack([PLATE_CX[b] - cop[:, 0], cop[:, 1]])
     cop[true < 20] = 0
     cop += rng.normal(0, 1.0, cop.shape)
+    plate_lines.append(f"FORCE_PLATE_NAME\t{belt}")
+    for corner in ("POSX_POSY", "NEGX_POSY", "NEGX_NEGY", "POSX_NEGY"):
+        xl = PLATE_W / 2 * (1 if corner.startswith("POSX") else -1)
+        yl = PLATE_L / 2 * (1 if corner.endswith("POSY") else -1)
+        lab = RI @ np.array([PLATE_CX[b] - xl, yl, 0.0])
+        lab[:2] += rng.normal(0, 4.0, 2)            # measured, not nominal
+        plate_lines += [f"FORCE_PLATE_CORNER_{corner}_{a}\t{v:.6f}"
+                        for a, v in zip("XYZ", lab)]
+    plate_lines += [f"FORCE_PLATE_LENGTH\t{PLATE_L:g}",
+                    f"FORCE_PLATE_WIDTH\t{PLATE_W:g}", ""]
     cols[f"{belt}_Force_Z"] = (true + base + 2 * np.sin(2 * np.pi * t_f / 40)
                                + rng.normal(0, 3.0, len(t_f)))
     cols[f"{belt}_COP_X"], cols[f"{belt}_COP_Y"] = cop[:, 0], cop[:, 1]
+(WORK / "plates.txt").write_text("\n".join(plate_lines))
 trial = "S01_Treadmill_1.3mpers 108bpm"
 with open(force_dir / f"{trial}.csv", "w", newline="") as fh:
     w = csv.writer(fh)
@@ -243,10 +266,7 @@ with open(kin_dir / f"{trial}_metrics.csv", "w") as fh:
 # --- run ---------------------------------------------------------------------
 ge.FORCE_FOLDER, ge.KINEMATIC_FOLDER = force_dir, kin_dir
 ge.OUTPUT_FOLDER = WORK / "out"
-ge.BELT_CORNERS_MM = {"L": [(-800, -1500), (-5, -1500), (-5, 1500),
-                            (-800, 1500)],
-                      "R": [(5, -1500), (800, -1500), (800, 1500),
-                            (5, 1500)]}
+ge.FORCE_PLATE_FILE = WORK / "plates.txt"
 res = ge.process_trial(force_dir / f"{trial}.csv", meta, binding)
 
 failures = []
@@ -264,6 +284,9 @@ rot_err = np.degrees(abs(np.arctan2(A[1, 0], A[0, 0]) - YAW))
 shift_err = np.linalg.norm(A[:, 2] - A_TRUE[:, 2]) * 1000
 check(rot_err < 1.0 and shift_err < 15,
       f"registration: {rot_err:.2f} deg, {shift_err:.1f} mm from the truth")
+pitch = np.degrees(np.arctan(res["feet"].slope))
+check(abs(pitch - np.degrees(INCLINE)) < 0.1,
+      f"belt pitch {pitch:.2f} deg (true {np.degrees(INCLINE):.2f})")
 
 truth = []
 for limb in ("L", "R"):

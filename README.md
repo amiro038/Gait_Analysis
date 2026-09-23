@@ -634,11 +634,26 @@ calibrated on (`{trial}_fallback_benchmark.csv`,
 there. `FALLBACK_ORDER` picks which ones are used; set it to `"auto"` to rank
 them by each trial's own benchmark.
 
-**Set before the first real run.** `BELT_CORNERS_MM` takes the belt corners
-from the C3D (`FORCE_PLATFORM:CORNERS`). Without them the gap is guessed from
-the centre of pressure, and the script warns. The force-plate → Theia transform
-is estimated per trial and printed. Once you trust it, paste it into
-`FP_TO_THEIA`.
+**Belts.** `FORCE_PLATE_FILE` points at the C3D force-plate parameters,
+exported as `name<tab>value` lines (`force_plates_DICE_treadmill.txt` is the
+DICE treadmill). The measured corners don't quite match the plate's stated
+size: 568 × 1768 mm against 559 × 1778. So the nominal rectangle is fitted
+rigidly to them. The worst corner miss (8 mm) is added to the 10 mm
+belt-edge margin, so uncertainty in the outline only ever makes the trust
+test stricter.
+
+In this export each belt's CoP is in that plate's own frame: origin at the
+plate centre, X pointing along lab −X. That holds exactly on D05, where
+COP = (−My/Fz, Mx/Fz) − OFFSET. `COP_FRAME = "plate"` moves it into the lab
+frame through the same fit.
+
+The plates are pitched about 0.8°, so the belt surface is fitted as a plane
+rising along the walking direction, not as one floor height. That is 13 mm
+over one stance, too much to ignore against a 15 mm contact threshold.
+
+The lab → Theia transform is estimated per trial, and the script prints how
+far it is from the identity. If Theia shares the mocap lab frame, set
+`FP_TO_THEIA = "identity"`.
 
 `source` in the merged file is `GRF`, `GRF_unverified`, `kinematic` or
 `interpolated`. `{trial}_event_qa.csv` says which variable found each event
