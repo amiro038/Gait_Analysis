@@ -593,3 +593,54 @@ locks the *translation's* vertical component to zero.
 pipeline before them. They are superseded, nothing depends on them, and
 `build_foot_binding.py` reproduces their output bit for bit. Kept only so the
 history is inspectable without digging through git.
+
+## Gait events — `gait_events.py`
+
+Heel strikes and toe-offs for the split-belt treadmill, GRF first. It replaces
+the four-script chain (GRF detection, velocity at GRF events, kinematic
+detection, merge) and writes `{trial}_merged_events.csv` with the same four
+columns `Gait_analysis_all_metrics.py` reads.
+
+```bash
+python gait_events.py                    # every trial in FORCE_FOLDER
+python gait_events.py "D05_C1_Treadmill_1.3mpers 108bpm"
+python test_gait_events.py               # synthetic end-to-end check
+```
+
+**A GRF event is trusted only when the mesh says the belt was carrying one
+foot, all of it, and nothing else.** The boot soles are posed on the Theia feet
+through `foot_mesh_binding.npz`. Over ±50 ms around each belt event the checks
+are, in order:
+
+| reason not trusted | meaning |
+|---|---|
+| `incomplete` | the contact runs off the start or end of the recording |
+| `slow_loading` / `slow_unloading` | the force does not rise / fall like a foot landing / leaving (D05's left belt sometimes holds 100–200 N for up to 300 ms after push-off, well lateral of the foot) |
+| `no_mesh` | tracking dropped out; a clean-looking contact is kept as `GRF_unverified` |
+| `other_foot_on_belt` | the other boot's contact patch is on, or within 10 mm of, this belt |
+| `foot_not_in_contact` | the mesh has this foot in the air at the event |
+| `foot_over_belt_edge` | part of this foot's contact patch is within 10 mm of the gap or across it |
+| `cop_outside_foot` | the centre of pressure is not under the foot |
+
+The limb comes from the mesh, not from the belt's name, so a clean crossover
+step is kept with the right limb.
+
+**Everything else is found by a fallback**, searched for only in the window the
+gait sequence (L HS → R TO → R HS → L TO) puts it in. The candidate variables
+live in `fallback_detectors.py`. Each is calibrated on the trusted events of
+the same limb in the same trial, and scored on trusted events it was not
+calibrated on (`{trial}_fallback_benchmark.csv`,
+`fallback_benchmark_all_trials.csv`). To try a new variable, add a function
+there. `FALLBACK_ORDER` picks which ones are used; set it to `"auto"` to rank
+them by each trial's own benchmark.
+
+**Set before the first real run.** `BELT_CORNERS_MM` takes the belt corners
+from the C3D (`FORCE_PLATFORM:CORNERS`). Without them the gap is guessed from
+the centre of pressure, and the script warns. The force-plate → Theia transform
+is estimated per trial and printed. Once you trust it, paste it into
+`FP_TO_THEIA`.
+
+`source` in the merged file is `GRF`, `GRF_unverified`, `kinematic` or
+`interpolated`. `{trial}_event_qa.csv` says which variable found each event
+and flags stance and stride outliers. `{trial}_grf_contacts.csv` gives every
+belt contact's label and the reason for each untrusted event.
