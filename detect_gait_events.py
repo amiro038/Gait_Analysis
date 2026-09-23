@@ -66,7 +66,12 @@ DATA_FOLDER = Path(
 FORCE_FOLDER = DATA_FOLDER / "FP_renamed"            # {trial}.csv, 1000 Hz
 KINEMATIC_FOLDER = DATA_FOLDER / "Theia_csv_outputs"  # {trial}_metrics.csv
 OUTPUT_FOLDER = DATA_FOLDER / "gait_event_outputs"
-BINDING_FILE = HERE / "foot_mesh_binding.npz"
+# The participant's foot binding from build_foot_binding.py -- the boot mesh
+# itself -- NOT a trial's _posed.npz (that holds poses only, and this script
+# reads the poses from the Theia export anyway). {participant} is replaced
+# by the start of each trial's name up to the first "_" (D05_C1_... -> D05),
+# so each participant gets their own boots. A plain path is used for all.
+BINDING_FILE = DATA_FOLDER / "Foot bindings" / "{participant}_foot_mesh_binding.npz"
 PLATE_FILE = HERE / "force_plates_DICE_treadmill.txt"
 TRIALS = None                  # None = every .csv in FORCE_FOLDER, or a list
 
@@ -244,10 +249,24 @@ def read_theia(path, pose_names):
     return frames, out, pose, toes
 
 
+def binding_for(stem):
+    """The binding file for a trial: BINDING_FILE with {participant} filled."""
+    return Path(str(BINDING_FILE).replace("{participant}", stem.split("_")[0]))
+
+
 def read_binding(path):
     """-> boot mesh vertices per limb, in the foot frame, and the name of the
     pose signal that carries each foot."""
+    if not Path(path).exists():
+        raise FileNotFoundError(f"no foot binding at {path}")
     z = np.load(path, allow_pickle=False)
+    if "vertices_local" not in z.files:
+        raise KeyError(
+            f"{Path(path).name} is not a foot binding -- "
+            + ("it is a trial's _posed.npz, which holds poses only. "
+               if "poses" in z.files else "")
+            + "Set BINDING_FILE to the participant's *_foot_mesh_binding.npz "
+            "from build_foot_binding.py")
     meta = json.loads(str(z["meta"]))
     seg = {"L": meta["segments"].index("left_foot"),
            "R": meta["segments"].index("right_foot")}
@@ -1163,13 +1182,17 @@ def fmt(x):
 # =============================================================================
 
 def main(stems=None):
-    boots, pose_names = read_binding(BINDING_FILE)
     plates = {b: fit_plate(p) for b, p in read_plates(PLATE_FILE).items()}
     stems = stems or TRIALS
     paths = ([find_file(FORCE_FOLDER, s, ".csv") for s in stems] if stems
              else sorted(Path(FORCE_FOLDER).glob("*.csv")))
+    bindings = {}                     # one read per participant
     for path in paths:
         try:
+            where = binding_for(path.stem)
+            if where not in bindings:
+                bindings[where] = read_binding(where)
+            boots, pose_names = bindings[where]
             process_trial(path, boots, pose_names, plates)
         except (FileNotFoundError, KeyError, RuntimeError) as exc:
             print(f"\n{path.stem}: SKIPPED -- {exc}")

@@ -67,7 +67,7 @@ LATERAL = {"L": -0.10, "R": 0.10}
 SPECIAL = {("L", 12): 0.07, ("L", 20): -0.02,        # crossover, straddle
            ("R", 30): 0.015, ("R", 40): -0.075}      # straddle, crossover
 
-MESH, POSE_NAMES = dg.read_binding(dg.BINDING_FILE)
+MESH, POSE_NAMES = dg.read_binding(dg.HERE / "foot_mesh_binding.npz")
 # L33: the boot's inner edge 20 mm out over the gap, 20 mm short of the
 # right belt
 OVERHANG = ("L", 33)
