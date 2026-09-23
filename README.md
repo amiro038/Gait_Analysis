@@ -602,6 +602,7 @@ detection, merge) and writes `{trial}_merged_events.csv` with the same four
 columns `Gait_analysis_all_metrics.py` reads.
 
 ```bash
+python gait_events_grf_zeni.py           # trusted GRF, then Zeni: the one to use
 python gait_events.py                    # every trial in FORCE_FOLDER
 python gait_events.py "D05_C1_Treadmill_1.3mpers 108bpm"
 python test_gait_events.py               # synthetic end-to-end check
@@ -624,6 +625,14 @@ are, in order:
 
 The limb comes from the mesh, not from the belt's name, so a clean crossover
 step is kept with the right limb.
+
+**`gait_events_grf_zeni.py` is the production run.** It uses trusted GRF,
+and Zeni et al. (2008) for everything else: heel strike where the heel is
+furthest in front of the pelvis, toe-off where the toe is furthest behind
+it. Across 11 D05 trials Zeni had the smallest worst-trial error of all the
+candidates, with MAE 5.6 ms at heel strike and 2.5 ms at toe-off. An
+unverifiable GRF contact is used only where Zeni finds nothing. It writes
+the same files, with `zeni_benchmark` in place of `fallback_benchmark`.
 
 **Everything else is found by a fallback**, searched for only in the window the
 gait sequence (L HS → R TO → R HS → L TO) puts it in. The candidate variables

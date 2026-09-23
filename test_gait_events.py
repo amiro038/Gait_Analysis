@@ -24,7 +24,10 @@ It checks that
     none of them comes from a step that was crossed or straddled,
   * every true event in the covered range comes out once, with the right
     limb and type, within 3 frames, and the sequence alternates,
-  * the merged file has exactly the four columns the metrics script reads.
+  * the merged file has exactly the four columns the metrics script reads,
+  * and, run again through gait_events_grf_zeni.py, that every event is
+    trusted GRF or Zeni (GRF_unverified only in the dropout) and all of them
+    still come out, in order.
 
 Run it with `python test_gait_events.py` from anywhere.
 """
@@ -354,6 +357,42 @@ check(all(v and set(v) <= set(ge.fd.DETECTORS) for v in auto.values()),
       f"L TO {auto[('L', ge.TO)][:2]}")
 check(len(bench) == 2 * 2 * len(ge.fd.DETECTORS),
       f"benchmark rows for all {len(ge.fd.DETECTORS)} detectors")
+
+# --- the same trial through gait_events_grf_zeni.py --------------------------
+import gait_events_grf_zeni as gz  # noqa: E402
+
+gz.FORCE_FOLDER, gz.KINEMATIC_FOLDER = force_dir, kin_dir
+gz.OUTPUT_FOLDER = WORK / "out_zeni"
+gz.main()
+res_z = ge.process_trial(force_dir / f"{trial}.csv", meta, binding,
+                         verbose=False)
+ev_z = res_z["untrimmed"]
+print("\nchecks, GRF then Zeni")
+methods = {e["method"] for e in ev_z}
+check(methods <= {"GRF", "zeni_position", "GRF_unverified"},
+      f"events found by: {sorted(methods)}")
+zeni = [e for e in ev_z if e["method"] == "zeni_position"]
+check(zeni and all(e["source"] == "kinematic" for e in zeni),
+      f"{len(zeni)} events filled by Zeni, all with source 'kinematic'")
+errors, missing = [], []
+for x in truth:
+    same = [e for e in ev_z if e["limb"] == x[1] and e["event"] == x[2]]
+    d = min((abs(e["t"] - x[0]) for e in same), default=np.inf)
+    (errors if d <= 3 else missing).append(d)
+check(not missing and len(ev_z) == len(truth),
+      f"{len(truth)} true events recovered, {len(missing)} missed, "
+      f"{len(ev_z)} out; worst {max(errors):.2f} frames")
+worst = max(abs(nearest_truth(e)[0] - e["t"]) for e in zeni)
+check(worst <= 3, f"Zeni-filled events worst {worst:.2f} frames off")
+order = [ge.POSITION[(e["limb"], e["event"])] for e in ev_z]
+check(all((b - a) % 4 == 1 for a, b in zip(order[:-1], order[1:])),
+      "events alternate L HS, R TO, R HS, L TO")
+check({r["detector"] for r in res_z["benchmark"]} == {"zeni_position"},
+      "benchmark is Zeni only")
+out_z = gz.OUTPUT_FOLDER
+check((out_z / f"{trial}_merged_events.csv").exists()
+      and (out_z / "zeni_benchmark_all_trials.csv").exists(),
+      "wrote merged events and zeni_benchmark_all_trials.csv")
 
 print(f"\n{'ALL PASSED' if not failures else f'{len(failures)} FAILED'}"
       f"  (work dir {WORK})")

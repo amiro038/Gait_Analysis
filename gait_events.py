@@ -51,7 +51,8 @@ Per trial, in OUTPUT_FOLDER:
                                     and stance / stride outlier flags
     {trial}_grf_contacts.csv        every belt contact, its label and why each
                                     of its events was or was not trusted
-    {trial}_fallback_benchmark.csv  every fallback variable scored
+    {trial}_fallback_benchmark.csv  every fallback variable scored (the name
+                                    follows BENCHMARK_NAME)
     {trial}_event_registration.json the FP -> Theia registration and floor
 
 and fallback_benchmark_all_trials.csv across everything processed.
@@ -163,11 +164,17 @@ MAX_GAP_FILL_FRAMES = 10       # tracking gaps bridged before filtering
 CALIBRATE_PER_LIMB = True
 MIN_CALIBRATION_EVENTS = 10
 INTERPOLATE_MISSING = True     # last resort between two trusted events only
+# A clean-looking belt contact the mesh could not check (tracking dropped
+# out) -- used "first", before the fallback; "last", only where the fallback
+# finds nothing (in a dropout the kinematics are usually gone too); or
+# "never".
+USE_UNVERIFIED_GRF = "first"
 
 # --- output ----------------------------------------------------------------
 TRIM_TO_COMPLETE_STANCES = True   # each limb starts on HS and ends on TO
 FLAG_RATIO = (0.75, 1.25)         # stance / stride outside this x median
 WRITE_BENCHMARK = True
+BENCHMARK_NAME = "fallback_benchmark"   # {trial}_{name}.csv, {name}_all_trials
 
 
 LIMBS = ("L", "R")
@@ -982,12 +989,14 @@ def fallback_order(bench):
 
 
 def search(specs, params, order, limb, kind, lo, hi, p, unverified=()):
-    """The event in (lo, hi): an unverifiable GRF event if there is one,
-    else the first detector in the fallback order that finds it."""
+    """The event in (lo, hi): the first detector in the fallback order that
+    finds it, with an unverifiable GRF event before or after the detectors
+    as USE_UNVERIFIED_GRF says."""
     grf = [e for e in unverified if e["limb"] == limb and e["event"] == kind
-           and lo < e["t"] < hi]
-    if grf:
-        return min(grf, key=lambda e: abs(e["t"] - p)), "GRF_unverified"
+           and lo < e["t"] < hi] if USE_UNVERIFIED_GRF != "never" else []
+    grf = min(grf, key=lambda e: abs(e["t"] - p)) if grf else None
+    if grf is not None and USE_UNVERIFIED_GRF == "first":
+        return grf, "GRF_unverified"
     for name in order[(limb, kind)]:
         par = params.get((name, limb, kind))
         if par is None:
@@ -998,6 +1007,8 @@ def search(specs, params, order, limb, kind, lo, hi, p, unverified=()):
         found = found[(found > lo) & (found < hi)]
         if len(found):
             return float(found[np.argmin(abs(found - p))]), name
+    if grf is not None:
+        return grf, "GRF_unverified"
     return None, None
 
 
@@ -1378,7 +1389,7 @@ def process_trial(force_path, meta, binding, verbose=True):
                         _fmt(c["cop_inside"])])
 
     if bench:
-        _write_rows(OUTPUT_FOLDER / f"{stem}_fallback_benchmark.csv",
+        _write_rows(OUTPUT_FOLDER / f"{stem}_{BENCHMARK_NAME}.csv",
                     [dict(trial=stem, **r) for r in bench])
 
     with open(OUTPUT_FOLDER / f"{stem}_event_registration.json", "w") as fh:
@@ -1455,9 +1466,9 @@ def main(stems=None):
         everything += [dict(trial=path.stem, **r)
                        for r in result["benchmark"]]
     if everything:
-        _write_rows(OUTPUT_FOLDER / "fallback_benchmark_all_trials.csv",
-                    everything)
-        print(f"\nsaved {OUTPUT_FOLDER / 'fallback_benchmark_all_trials.csv'}")
+        summary = OUTPUT_FOLDER / f"{BENCHMARK_NAME}_all_trials.csv"
+        _write_rows(summary, everything)
+        print(f"\nsaved {summary}")
 
 
 if __name__ == "__main__":
