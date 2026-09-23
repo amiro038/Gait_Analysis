@@ -11,7 +11,8 @@ treadmill whose forces are computed from where each sole actually touches:
     is pitched 0.84 deg,
   * step L12 crosses onto the right belt, L20 and R30 straddle the gap and
     R40 crosses onto the left belt -- every belt contact they touch is wrong
-    about something,
+    about something -- while L33 hangs 20 mm over the 40 mm gap without
+    reaching the other belt, which costs nothing,
   * after step L25's toe-off the left belt keeps a decaying 150 N load for
     250 ms well lateral of the foot, as seen on D05's left belt,
   * both belts have their own baseline, slow drift and noise,
@@ -20,8 +21,9 @@ treadmill whose forces are computed from where each sole actually touches:
 It checks that
 
   * the registration and the belt's pitch are recovered,
-  * no event the pipeline calls GRF is more than a frame from the truth, and
-    none of them comes from a step that was crossed or straddled,
+  * no event the pipeline calls GRF is more than a frame from the truth,
+    none of them comes from a step that was crossed or straddled, and the
+    overhanging step keeps its GRF events,
   * every true event in the covered range comes out once, with the right
     limb and type, within 3 frames, and the sequence alternates,
   * every event is trusted GRF or Zeni (GRF_unverified only in the
@@ -49,7 +51,7 @@ DURATION = 60.0
 CYCLE, STANCE = 1.10, 0.682
 BELT_SPEED = 1.3
 Y_AT_HS = 0.30
-GAP = 0.010                                   # m, belts at |x| > 5 mm
+GAP = 0.040                                   # m, as the DICE plates
 FLOOR_T = 0.012                               # Theia z of the belt surface
 YAW = np.radians(90.0)
 INCLINE = np.radians(0.84)                    # treadmill pitch, front up
@@ -63,6 +65,10 @@ SPECIAL = {("L", 12): 0.07, ("L", 20): -0.02,        # crossover, straddle
            ("R", 30): 0.015, ("R", 40): -0.075}      # straddle, crossover
 
 MESH, POSE_NAMES = dg.read_binding(dg.BINDING_FILE)
+# L33: the boot's inner edge 20 mm out over the gap, 20 mm short of the
+# right belt
+OVERHANG = ("L", 33)
+X_OVERHANG = -GAP / 2 + 0.020 - MESH["L"][:, 0].max()
 
 
 def smooth(s):
@@ -77,8 +83,10 @@ for limb, lag in (("L", 0.0), ("R", CYCLE / 2)):
     for n in range(-3, int(DURATION / CYCLE) + 4):
         hs = n * CYCLE + lag + 1.0 + rng.normal(0, 0.012)
         to = hs + STANCE + rng.normal(0, 0.010)
-        out.append(dict(n=n, hs=hs, to=to,
-                        x=SPECIAL.get((limb, n), LATERAL[limb])))
+        x = SPECIAL.get((limb, n), LATERAL[limb])
+        if (limb, n) == OVERHANG:
+            x = X_OVERHANG
+        out.append(dict(n=n, hs=hs, to=to, x=x))
     stances[limb] = out
 
 t_k = np.arange(int(DURATION * FS_K)) / FS_K
@@ -147,9 +155,9 @@ for limb in ("L", "R"):
                  + origin[sl, None, :])
         touch = (world[..., 2] < 0.002) & on[sl, None]
         wx = world[..., 0]
-        tot = touch.sum(1)
+        tot = (touch & (abs(wx) > GAP / 2)).sum(1)     # the gap carries nothing
         for b, m in (("L", wx < -GAP / 2), ("R", wx > GAP / 2)):
-            w = (touch & (m | (abs(wx) <= GAP / 2))) * np.where(m, 1.0, 0.5)
+            w = (touch & m) * 1.0
             with np.errstate(invalid="ignore", divide="ignore"):
                 frac[b][sl] = np.where(tot > 0, w.sum(1) / tot, 0.0)
                 cen[b][sl] = ((world[..., :2] * w[..., None]).sum(1)
@@ -313,6 +321,9 @@ check(unv and worst <= 1.0, f"{len(unv)} GRF events used through the "
 tail_to = [e for e in grf if e["limb"] == "L" and e["event"] == dg.TO
            and nearest_truth(e)[3] == 25]
 check(not tail_to, "the toe-off with the slow unloading tail is not GRF")
+over = [e for e in grf if (e["limb"], nearest_truth(e)[3]) == OVERHANG]
+check(len(over) == 2, f"the step hanging over the gap keeps {len(over)} of "
+      f"its 2 GRF events")
 special_grf = [e for e in grf if (e["limb"], nearest_truth(e)[3]) in SPECIAL]
 check(not special_grf,
       f"no GRF event from a crossed / straddled step ({len(special_grf)})")

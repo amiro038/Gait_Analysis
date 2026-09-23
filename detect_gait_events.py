@@ -5,11 +5,11 @@ Heel strikes and toe-offs on the DICE split-belt treadmill.
     1. GRF first. Every belt contact is found from the vertical force. Each
        of its two events (heel strike, toe-off) is kept only if, around that
        event, the MOVE4D boot meshes posed on the Theia feet show that belt
-       carrying one foot -- all of it, clear of the gap -- with the other foot
-       off the belt, the centre of pressure under the foot, and a force that
-       rises or falls like a foot landing or leaving. The limb comes from the
-       mesh, not from the belt's name, so a clean crossover step is kept with
-       the right limb.
+       carrying one boot, that boot not also standing on the other belt, the
+       other boot off this belt, the centre of pressure under the boot, and a
+       force that rises or falls like a foot landing or leaving. Hanging over
+       the gap or the edge is fine. The limb comes from the mesh, not from
+       the belt's name, so a clean crossover step is kept with the right limb.
 
     2. Zeni for the rest. Every event the GRF cannot vouch for is taken from
        Zeni et al. (2008): heel strike where the heel is furthest in front of
@@ -104,7 +104,12 @@ MIN_CONTACT_VERTICES = 3       # this many touching = the boot is down
 
 # Trust
 TRUST_WINDOW_S = 0.050         # checked over +/- this around each event
-BELT_MARGIN_MM = 10.0          # + the plate outline's uncertainty
+# A boot is on a plate when at least MIN_CONTACT_VERTICES of its touching
+# sole vertices are inside the plate's fitted outline, grown by the outline's
+# own uncertainty (the worst corner miss, 8 mm on DICE) plus this. Hanging
+# over the gap or the outer edge is fine -- it moves no force anywhere -- so
+# only a boot on the wrong plate costs an event.
+EXTRA_MARGIN_MM = 0.0
 SHARED_MIN_FRAMES = 2
 STRADDLE_MIN_FRAMES = 2
 COP_TOLERANCE_MM = 30.0        # CoP this close to the contact patch = under it
@@ -542,15 +547,15 @@ def register_lab_to_theia(force100, cop100, pose, height, n_touch, patch,
 
 
 def boot_on_belts(pose, soles, surface, belts, cop_theia, margin):
-    """Per frame, boot and belt: touching vertices on or within `margin` of
-    the belt (on), touching vertices inside it with `margin` to spare
-    (clear), and the distance from the belt's CoP to the touching patch."""
+    """Per frame, boot and belt: how many touching sole vertices are on the
+    belt (inside its outline grown by `margin`), and the distance from the
+    belt's CoP to the boot's touching patch."""
     h = CONTACT_HEIGHT_MM / 1000
-    on, clear, cop_gap = ({f: {} for f in LIMBS} for _ in range(3))
+    on, cop_gap = {f: {} for f in LIMBS}, {f: {} for f in LIMBS}
     for f in LIMBS:
         n = len(pose[f])
         for b in LIMBS:
-            on[f][b], clear[f][b] = np.zeros(n, int), np.zeros(n, int)
+            on[f][b] = np.zeros(n, int)
             cop_gap[f][b] = np.full(n, np.inf)
         for sl, W in sole_chunks(pose[f], soles[f]):
             touch = above_belt(W, surface, f) < h
@@ -558,20 +563,19 @@ def boot_on_belts(pose, soles, surface, belts, cop_theia, margin):
             for b, poly in belts.items():
                 d = inside_distance(poly, xy)
                 on[f][b][sl] = (touch & (d >= -margin)).sum(1)
-                clear[f][b][sl] = (touch & (d >= margin)).sum(1)
                 c = cop_theia[b][sl]
                 gap = np.where(touch, np.linalg.norm(xy - c[:, None, :],
                                                      axis=2), np.inf).min(1)
                 cop_gap[f][b][sl] = np.where(np.isfinite(c[:, 0]), gap,
                                              np.inf)
-    return on, clear, cop_gap
+    return on, cop_gap
 
 
 # %% ==========================================================================
 #  3. WHICH GRF EVENTS TO TRUST
 # =============================================================================
 
-def judge_contacts(contacts, valid, n_touch, on, clear, cop_gap, force100):
+def judge_contacts(contacts, valid, n_touch, on, cop_gap, force100):
     """Label every contact and decide, per event, whether to trust it.
 
     -> trusted events, and 'unverified' ones: a clean-looking contact whose
@@ -607,17 +611,18 @@ def judge_contacts(contacts, valid, n_touch, on, clear, cop_gap, force100):
                            if force_ok[k]]
             continue
 
-        # which boot is on this belt, and was it alone and clear of the gap
+        # which boot is on this belt, and is it also on the other one
+        o = OTHER[b]
         touching = {f: on[f][b][rows] >= MIN_CONTACT_VERTICES for f in LIMBS}
         f = max(LIMBS, key=lambda k: touching[k].sum())
         g = OTHER[f]
         if not touching[f].any():
             c["label"] = c["hs_reason"] = c["to_reason"] = "no_foot_on_belt"
             continue
-        over_edge = down[f][rows] & (clear[f][b][rows] < n_touch[f][rows])
+        on_both = on[f][o][rows] >= MIN_CONTACT_VERTICES
         if touching[g].sum() >= SHARED_MIN_FRAMES:
             label = "shared"
-        elif over_edge.sum() >= STRADDLE_MIN_FRAMES:
+        elif on_both.sum() >= STRADDLE_MIN_FRAMES:
             label = "straddle"
         elif f != b:
             label = "crossover"
@@ -646,8 +651,8 @@ def judge_contacts(contacts, valid, n_touch, on, clear, cop_gap, force100):
                 reason = "other_foot_on_belt"
             elif not down[f][close].any():
                 reason = "foot_not_in_contact"
-            elif (down[f][win] & (clear[f][b][win] < n_touch[f][win])).any():
-                reason = "foot_over_belt_edge"
+            elif (on[f][o][win] >= MIN_CONTACT_VERTICES).any():
+                reason = "foot_on_other_belt"
             elif (np.isfinite(c["cop_inside"])
                   and c["cop_inside"] < COP_MIN_INSIDE):
                 reason = "cop_outside_foot"
@@ -932,7 +937,7 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
         if on_plate.mean() < 0.99:
             say(f"  ! the {BELT[b]} CoP is not where the plate is; check "
                 f"COP_FRAME")
-    margin = (BELT_MARGIN_MM + max(pl["corner_miss_mm"].max()
+    margin = (EXTRA_MARGIN_MM + max(pl["corner_miss_mm"].max()
                                    for pl in plates.values())) / 1000
 
     # --- 1. belt contacts ------------------------------------------------
@@ -977,11 +982,11 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
         A, reg = np.asarray(LAB_TO_THEIA, float), {}
     belts = {b: apply_2d(A, poly) for b, poly in belts_lab.items()}
     cop_theia = {b: apply_2d(A, cop100[b]) for b in LIMBS}
-    on, clear, cop_gap = boot_on_belts(pose, soles, surface, belts,
-                                       cop_theia, margin)
+    on, cop_gap = boot_on_belts(pose, soles, surface, belts, cop_theia,
+                                margin)
 
     # --- 3. trust ---------------------------------------------------------
-    anchors, unverified = judge_contacts(contacts, valid, n_touch, on, clear,
+    anchors, unverified = judge_contacts(contacts, valid, n_touch, on,
                                          cop_gap, force100)
     why = {}
     for c in contacts:

@@ -613,8 +613,8 @@ It needs `foot_mesh_binding.npz` (the boot meshes) and
    toe-off is judged separately, over ±50 ms. It is kept only if all of these
    hold:
    - the force rises or falls like a foot landing or leaving;
-   - the posed boot mesh shows that belt carrying one boot, clear of the gap
-     by 10 mm plus the plate outline's uncertainty;
+   - the posed boot mesh shows that belt carrying one boot, and that boot
+     not also standing on the other belt;
    - the other boot is off the belt;
    - the centre of pressure is under the boot.
 
@@ -636,9 +636,9 @@ Why a GRF event was not trusted, as written in `{trial}_grf_contacts.csv`:
 | `incomplete` | the contact runs off the start or end of the recording |
 | `slow_loading` / `slow_unloading` | the force does not rise / fall like a foot landing / leaving (D05's left belt sometimes holds 100–200 N for up to 300 ms after push-off) |
 | `no_mesh` | tracking dropped out at the event |
-| `other_foot_on_belt` | the other boot's contact patch is on, or within the margin of, this belt |
+| `other_foot_on_belt` | at least 3 touching sole vertices of the other boot are on this belt |
 | `foot_not_in_contact` | the mesh has this boot in the air at the event |
-| `foot_over_belt_edge` | part of this boot's contact patch is within the margin of the gap, or across it |
+| `foot_on_other_belt` | at least 3 touching sole vertices of this boot are on the other belt |
 | `cop_outside_foot` | the centre of pressure is not under the boot |
 
 `source` is `GRF`, `kinematic` (Zeni), `GRF_unverified` or `interpolated`. The
@@ -650,9 +650,15 @@ other outputs:
 - `{trial}_event_summary.json`: the plate fit, the lab → Theia registration,
   the belt surface, and Zeni's error against GRF.
 
+"On a belt" means inside the belt's fitted outline, grown by the outline's own
+uncertainty (8 mm) plus `EXTRA_MARGIN_MM` (0 by default). Hanging over the gap
+or the outer edge costs nothing, because it moves no force onto the other
+plate. The DICE gap is about 43 mm, so a boot can reach about 35 mm past its
+own edge before it counts as on the other belt.
+
 **Plates.** The measured corners don't quite match the plate's stated size:
 568 × 1768 mm against 559 × 1778. So the nominal rectangle is fitted rigidly to
-them, and the worst corner miss (8 mm) is added to the belt-edge margin.
+them, and the worst corner miss (8 mm) is the outline's uncertainty.
 
 In this export each belt's CoP is in that plate's own frame. That holds exactly
 on D05, where COP = (−My/Fz, Mx/Fz) − OFFSET. `COP_FRAME = "plate"` moves it
