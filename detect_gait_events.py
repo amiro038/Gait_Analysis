@@ -101,6 +101,13 @@ SOLE_CELL_MM = 10.0            # sole = lowest mesh vertex in each cell
 SOLE_MAX_RISE_MM = 35.0        # ... up to this far above the lowest one
 CONTACT_HEIGHT_MM = 15.0       # a sole vertex this close to the belt touches
 MIN_CONTACT_VERTICES = 3       # this many touching = the boot is down
+# Bend each boot at the MTP by Theia's toe angle (a hinge about the foot's
+# X axis through <Side>_Toes_Position). Without it the rigid toe cap swings
+# 30-40 mm through the belt at every push-off. A positive angle is extension
+# with TOE_SIGN = 1 (checked on D05: the toes then lie flat on the floor).
+TOE_HINGE = True
+TOE_SIGN = 1
+TOE_REFERENCE_DEG = 0.0        # toe angle in the static scan (D05: +0.4/-1.4)
 
 # Trust
 TRUST_WINDOW_S = 0.050         # checked over +/- this around each event
@@ -195,6 +202,12 @@ def read_theia(path, pose_names):
         missing = [w for w in want if w not in where]
         if missing:
             raise KeyError(f"{path.name} lacks {sorted({m[0] for m in missing})}")
+        # optional: the toe hinge angle, or the toes' own 4x4
+        extra = [(f"{SIDE[b]}_Toes_Joint_Angle", "X") for b in LIMBS]
+        extra += [(f"{SIDE[b]}_Toes_Global_4x4", str(i)) for b in LIMBS
+                  for i in range(16)]
+        extra = [w for w in extra if w in where]
+        want += extra
         cols = [where[w] for w in want]
         items, rows = [], []
         for line in fh:
@@ -220,7 +233,15 @@ def read_theia(path, pose_names):
         P[:, 3, :] = (0.0, 0.0, 0.0, 1.0)
         P[~np.isfinite(P[:, :3, :]).all(axis=(1, 2))] = np.nan
         pose[b] = P
-    return frames, out, pose
+    column = {w: data[:, j] for j, w in enumerate(want)}
+    toes = {}
+    for b in LIMBS:
+        angle = column.get((f"{SIDE[b]}_Toes_Joint_Angle", "X"))
+        four = [column.get((f"{SIDE[b]}_Toes_Global_4x4", str(i)))
+                for i in range(16)]
+        toes[b] = dict(angle=angle, pose=None if any(c is None for c in four)
+                       else np.stack(four, axis=1).reshape(-1, 4, 4))
+    return frames, out, pose, toes
 
 
 def read_binding(path):
@@ -312,11 +333,58 @@ def apply_2d(A, xy):
 
 
 def sole_chunks(pose, sole, chunk=4000):
-    """Yield (slice, (n, V, 3)) world positions of the sole vertices."""
+    """Yield (slice, (n, V, 3)) world positions of the sole vertices; the
+    toe cap rides the toes pose when the boot is bent at the MTP."""
+    v, toe, toe_pose = sole["v"], sole["toe"], sole["toe_pose"]
     for s in range(0, len(pose), chunk):
         P = pose[s:s + chunk]
-        yield (slice(s, s + len(P)),
-               sole @ P[:, :3, :3].transpose(0, 2, 1) + P[:, None, :3, 3])
+        W = v @ P[:, :3, :3].transpose(0, 2, 1) + P[:, None, :3, 3]
+        if toe_pose is not None:
+            T = toe_pose[s:s + chunk]
+            W[:, toe] = (v[toe] @ T[:, :3, :3].transpose(0, 2, 1)
+                         + T[:, None, :3, 3])
+        yield slice(s, s + len(P)), W
+
+
+def rot_x(a):
+    """Rotations about the foot's X (medio-lateral) axis, a (F,) in rad."""
+    c, s = np.cos(a), np.sin(a)
+    R = np.zeros((len(a), 3, 3))
+    R[:, 0, 0] = 1.0
+    R[:, 1, 1], R[:, 1, 2], R[:, 2, 1], R[:, 2, 2] = c, -s, s, c
+    return R
+
+
+def toe_hinge(pose, mtp_world, angle, toes4, sole_v):
+    """The toes pose, and which sole vertices ride it: the foot pose turned
+    by the toe angle about the MTP (fixed in the foot frame), or the export's
+    own toes 4x4. -> (toe_pose or None, toe mask, MTP in the foot frame)."""
+    none = (None, np.zeros(len(sole_v), bool), None)
+    if not TOE_HINGE or (angle is None and toes4 is None):
+        return none
+    R, t = pose[:, :3, :3], pose[:, :3, 3]
+    ok = np.isfinite(pose).all(axis=(1, 2))
+    if toes4 is not None:
+        mtp_world = toes4[:, :3, 3]
+    local = np.einsum("fji,fj->fi", R, mtp_world - t)
+    good = ok & np.isfinite(local).all(axis=1)
+    if good.sum() < 10:
+        return none
+    m = np.median(local[good], axis=0)
+    up = np.median(R[ok][:, 2, :], axis=0)
+    up /= np.linalg.norm(up)
+    fwd = m - m[0] * np.array([1.0, 0, 0])
+    fwd -= (fwd @ up) * up
+    fwd /= np.linalg.norm(fwd)
+    toe = (sole_v - m) @ fwd > 0
+    if toes4 is not None:
+        rel = np.einsum("fji,fjk->fik", R, orthonormalise(toes4[:, :3, :3]))
+    else:
+        rel = rot_x(TOE_SIGN * np.radians(angle - TOE_REFERENCE_DEG))
+    rel[~np.isfinite(rel).all(axis=(1, 2))] = np.eye(3)     # no angle: straight
+    H = np.zeros((len(rel), 4, 4))
+    H[:, :3, :3], H[:, :3, 3], H[:, 3, 3] = rel, m - rel @ m, 1.0
+    return pose @ H, toe, m
 
 
 # %% ==========================================================================
@@ -904,7 +972,7 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
 
     # --- read -----------------------------------------------------------
     fz, cop = read_forces(force_path)
-    frames, points, pose = read_theia(
+    frames, points, pose, toes = read_theia(
         find_file(KINEMATIC_FOLDER, stem, "_metrics.csv"), pose_names)
     n_rows, n_samples = len(frames), len(fz["L"])
     say(f"  force {n_samples / GRF_RATE:.1f} s, kinematics "
@@ -959,7 +1027,14 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
     # --- 2. boots: surface, contact, registration, belts ------------------
     soles, long_axis = {}, {}
     for b in LIMBS:
-        soles[b], long_axis[b] = boot_sole(boots[b], pose[b])
+        sole_v, long_axis[b] = boot_sole(boots[b], pose[b])
+        toe_pose, toe, mtp = toe_hinge(
+            pose[b], points[f"{SIDE[b]}_Toes_Position"], toes[b]["angle"],
+            toes[b]["pose"], sole_v)
+        soles[b] = dict(v=sole_v, toe=toe, toe_pose=toe_pose)
+        say(f"  {SIDE[b]} boot: " + (
+            f"{toe.sum()} of {len(sole_v)} sole points bend at the MTP"
+            if toe_pose is not None else "no toe angle in the export, rigid"))
     forward = walking_direction(pose, long_axis)
     surface = fit_belt_surface(pose, soles, forward)
     say(f"  belt surface {surface['floor']['L'] * 1000:.1f} / "
@@ -1075,6 +1150,7 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
     say(f"  saved {out}")
     return dict(events=events, untrimmed=untrimmed, contacts=contacts,
                 anchors=anchors, registration=(A, reg), surface=surface,
+                height=height,
                 zeni=zeni_report)
 
 

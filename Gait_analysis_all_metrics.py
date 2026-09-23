@@ -767,14 +767,33 @@ mos_have_mesh = False
 
 if mos_posed_path.exists() and mos_binding_path.exists():
     mos_bind = np.load(mos_binding_path, allow_pickle=False)
-    mos_seg_names = json.loads(str(mos_bind["meta"]))["segments"]
+    mos_bind_meta = json.loads(str(mos_bind["meta"]))
+    mos_seg_names = mos_bind_meta["segments"]
     mos_seg_of = mos_bind["vertex_segment"]
     mos_have_mesh = True
+
+    # both_feet_theia.obj is the two single-foot meshes again, vertex for
+    # vertex (checked: every one sits exactly on a single-foot vertex), so
+    # taking it too doubles the memory and the time and changes nothing
+    mos_single = np.zeros(len(mos_seg_of), bool)
+    for mos_m in mos_bind_meta["meshes"]:
+        if "both" not in mos_m["name"].lower():
+            mos_single[mos_m["start"]:mos_m["start"] + mos_m["count"]] = True
+
+    # the toe cap bends with Theia's toe angle only if the posed file was
+    # written by an apply_binding.py that knows about toes
+    mos_posed_segments = [str(s_) for s_ in
+                          np.load(mos_posed_path, allow_pickle=False)["segments"]]
+    if not any('toes' in s_ for s_ in mos_posed_segments):
+        print("  ! the posed .npz carries the boots rigid: the toe cap goes")
+        print("    through the belt at every push-off. Re-run apply_binding.py")
+        print("    on this trial so the toes bend with Toes_Joint_Angle")
 
     for mos_seg, mos_side in (('left_foot', 'Left'), ('right_foot', 'Right')):
         if mos_seg not in mos_seg_names:
             continue
-        mos_idx = np.flatnonzero(mos_seg_of == mos_seg_names.index(mos_seg))
+        mos_idx = np.flatnonzero((mos_seg_of == mos_seg_names.index(mos_seg))
+                                 & mos_single)
         mos_foot_vertices[mos_side], _ = ab.vertex_tracks(
             str(mos_posed_path), vertices=mos_idx,
             binding=str(mos_binding_path), dtype=np.float32)
@@ -792,6 +811,63 @@ else:
 
 foot_clearance = pd.DataFrame()
 foot_clearance['frame'] = kinematic_data['Unnamed: 0']
+
+#map event frames onto row positions in the kinematic data
+frame_position = pd.Series(np.arange(len(foot_clearance)), index=foot_clearance['frame'].to_numpy())
+
+# --- the belt surface, from where each boot sits in mid-stance -------------
+# Clearance is height above the BELT, not Theia's z. Two things keep those
+# apart on this treadmill:
+#   * the plates are pitched ~0.8 deg (C3D corners), so the belt drops ~12 mm
+#     between heel strike and toe-off -- the slope across every stance;
+#   * Theia's boot height is not the same standing still as walking (~15 mm
+#     higher in D05's quiet standing), so the start of the trial is no floor.
+# So the surface is fitted to the lowest vertex of each boot over 20-50% of
+# every stance (foot flat), as z = offset[boot] + slope * AP. One slope for
+# the belt; one offset per boot, so a height bias in either boot's Theia pose
+# is taken out rather than read as clearance. Every z in mos_foot_vertices
+# is then height above that surface, for the MFC and the trip risk below
+mfc_mid_stance = (0.2, 0.5)
+mfc_pts = {'Left': [], 'Right': []}
+for x in range(len(gait_event_data)):
+    hs = gait_event_data['initial_contact_kinematic_frame_100hz'][x]
+    to = gait_event_data['toe_off_kinematic_frame_100hz'][x]
+    if np.isnan(hs) or np.isnan(to) or to <= hs:
+        continue
+    if int(hs) not in frame_position.index or int(to) not in frame_position.index:
+        continue
+    a, b = frame_position[int(hs)], frame_position[int(to)]
+    mid = np.arange(a + int(mfc_mid_stance[0] * (b - a)),
+                    a + int(mfc_mid_stance[1] * (b - a)) + 1)
+    side = 'Left' if gait_event_data['support_limb'][x] == 'L' else 'Right'
+    mid = mid[mid < len(mos_foot_vertices[side])]
+    zz = mos_foot_vertices[side][mid, :, 2]
+    k = np.argmin(np.where(np.isfinite(zz), zz, np.inf), axis=1)
+    mfc_pts[side].append(mos_foot_vertices[side][mid, k])
+mfc_pts = {s_: np.vstack(v_) for s_, v_ in mfc_pts.items()}
+mfc_pts = {s_: v_[np.isfinite(v_).all(axis=1)] for s_, v_ in mfc_pts.items()}
+
+mfc_keep = {s_: np.ones(len(v_), bool) for s_, v_ in mfc_pts.items()}
+for _ in range(3):              # least squares, then drop >3 MAD and refit
+    mfc_A = np.vstack([np.column_stack([np.full(mfc_keep[s_].sum(), s_ == 'Left'),
+                                        np.full(mfc_keep[s_].sum(), s_ == 'Right'),
+                                        mfc_pts[s_][mfc_keep[s_], 1]])
+                       for s_ in ('Left', 'Right')]).astype(float)
+    mfc_z = np.concatenate([mfc_pts[s_][mfc_keep[s_], 2] for s_ in ('Left', 'Right')])
+    mfc_off_l, mfc_off_r, mfc_slope = np.linalg.lstsq(mfc_A, mfc_z, rcond=None)[0]
+    mfc_offset = {'Left': mfc_off_l, 'Right': mfc_off_r}
+    for s_ in ('Left', 'Right'):
+        r_ = mfc_pts[s_][:, 2] - mfc_offset[s_] - mfc_slope * mfc_pts[s_][:, 1]
+        mfc_keep[s_] = np.abs(r_) < 3 * 1.4826 * np.median(np.abs(r_)) + 1e-4
+
+print(f"  belt surface from mid-stance: {1000 * mfc_offset['Left']:.1f} / "
+      f"{1000 * mfc_offset['Right']:.1f} mm under the left / right boot, "
+      f"{np.degrees(np.arctan(mfc_slope)):+.2f} deg along +Y "
+      f"(C3D plates: ~0.8 deg)")
+for s_ in ('Left', 'Right'):
+    mos_foot_vertices[s_][:, :, 2] -= (mfc_offset[s_]
+                                       + mfc_slope * mos_foot_vertices[s_][:, :, 1])
+
 foot_clearance['Left_min_z'] = np.nanmin(mos_foot_vertices['Left'][:, :, 2], axis=1)
 foot_clearance['Right_min_z'] = np.nanmin(mos_foot_vertices['Right'][:, :, 2], axis=1)
 
@@ -819,8 +895,8 @@ for hs, to, next_hs in zip(right['initial_contact_kinematic_frame_100hz'],
 ax.plot(plot_frames, plot_z, color='k', lw=1)
 ax.set_xlim(f0, f1)
 ax.set_xlabel('Frame')
-ax.set_ylabel('Min z (m)')
-ax.set_title('Minimum mesh position right foot')
+ax.set_ylabel('Lowest point above the belt (m)')
+ax.set_title('Minimum mesh height above the belt, right foot')
 ax.legend(handles=[Patch(color='red', alpha=0.15, label='Stance'),
                    Patch(color='green', alpha=0.15, label='Swing')],
           loc='upper right')
@@ -829,9 +905,6 @@ plt.tight_layout()
 #toe AP velocity in m/s, .1 is the AP axis and the data is 100 Hz
 foot_clearance['Left_toe_ap_velocity']  = np.gradient(kinematic_data['Left_Toes_Position.1'].to_numpy()) * 100
 foot_clearance['Right_toe_ap_velocity'] = np.gradient(kinematic_data['Right_Toes_Position.1'].to_numpy()) * 100
-
-#map event frames onto row positions in the kinematic data
-frame_position = pd.Series(np.arange(len(foot_clearance)), index=foot_clearance['frame'].to_numpy())
 
 gait_event_data['minimum_foot_clearance'] = np.nan
 gait_event_data['minimum_foot_clearance_frame'] = np.nan
@@ -867,10 +940,14 @@ plt.figure()
 plt.plot(gait_event_data['minimum_foot_clearance'])
 plt.title('Minimum foot clearance (m)')
 
-###### Hmm there are negative values in here.... I know I can't accomodate for the bending of the toes (or maybe I can? does Theia do that?)
-# so there is a grain of salt to take here. Maybe I only use a set of vertices under the heel to toes? 
-#To be figured out 
-print([gait_event_data[['minimum_foot_clearance']]].describe())
+# Negative MFC came from two things, both handled above: the toe cap was rigid
+# with the foot and went through the belt at push-off (apply_binding.py now
+# bends it with Theia's toe angle), and z was Theia's, not height above the
+# pitched belt. What is left below zero is pose error, so it is counted
+print(gait_event_data['minimum_foot_clearance'].describe())
+mfc_neg = (gait_event_data['minimum_foot_clearance'] < 0).sum()
+if mfc_neg:
+    print(f"  ! {mfc_neg} swings still have MFC below the belt surface")
 # =============================================================================
 # %% Margin of Stability
 # =============================================================================
@@ -2723,13 +2800,34 @@ if trunk_raw is None:
 else:
     print(f"  source: {trunk_name}, differentiated {trunk_deriv_order} time(s)")
 
+    # filtfilt cannot cross a NaN: one missing frame -- Theia loses the trunk
+    # at the start and end of most trials -- turns the whole filtered signal
+    # NaN, and savgol_filter then refuses it outright. So fill the gaps to
+    # filter, then put them back, widened by how far the differentiator
+    # reaches, so every metric below sees them as missing rather than as
+    # invented data (the harmonic ratio skips a stride with any NaN in it;
+    # the entropy and regularity drop the frames)
+    trunk_gap = ~np.isfinite(trunk_raw).all(axis=1)
+    trunk_index = np.arange(len(trunk_raw))
+    trunk_fill = trunk_raw.copy()
+    for trunk_k in range(3):
+        trunk_ok = np.isfinite(trunk_fill[:, trunk_k])
+        trunk_fill[~trunk_ok, trunk_k] = np.interp(
+            trunk_index[~trunk_ok], trunk_index[trunk_ok], trunk_fill[trunk_ok, trunk_k])
+    trunk_reach = trunk_deriv_order * (trunk_deriv_window // 2)
+    trunk_gap_wide = np.convolve(trunk_gap, np.ones(2 * trunk_reach + 1), 'same') > 0
+    if trunk_gap.any():
+        print(f"  {trunk_gap.sum()} frames missing ({100 * trunk_gap.mean():.1f}%): "
+              f"filled to filter, then set back to NaN")
+
     # low-pass FIRST, so differentiation does not amplify what is about to be
     # thrown away anyway
     trunk_b, trunk_a = butter(4, trunk_lowpass_hz / (kinematic_fs / 2), 'low')
-    trunk_acc = filtfilt(trunk_b, trunk_a, trunk_raw, axis=0)
+    trunk_acc = filtfilt(trunk_b, trunk_a, trunk_fill, axis=0)
     for _ in range(trunk_deriv_order):
         trunk_acc = savgol_filter(trunk_acc, trunk_deriv_window, trunk_deriv_poly,
                                   deriv=1, delta=1.0 / kinematic_fs, axis=0)
+    trunk_acc[trunk_gap_wide] = np.nan
 
     trunk_rms = np.sqrt(np.nanmean(trunk_acc ** 2, axis=0))
     print(f"  RMS  ML {trunk_rms[0]:.2f}   AP {trunk_rms[1]:.2f}   "
@@ -2751,7 +2849,10 @@ else:
                                        kinematic_data[f'{trunk_other}.1'].to_numpy(),
                                        kinematic_data[f'{trunk_other}.2'].to_numpy()])
             trunk_o_rms = np.sqrt(np.nanmean(trunk_o ** 2, axis=0))
-            trunk_corr = [np.corrcoef(trunk_acc[:, k], trunk_o[:, k])[0, 1]
+            trunk_both = (np.isfinite(trunk_acc).all(axis=1)
+                          & np.isfinite(trunk_o).all(axis=1))
+            trunk_corr = [np.corrcoef(trunk_acc[trunk_both, k],
+                                      trunk_o[trunk_both, k])[0, 1]
                           for k in range(3)]
             print(f"  not used: {trunk_other}, RMS "
                   f"{trunk_o_rms[0]:.1f}/{trunk_o_rms[1]:.1f}/{trunk_o_rms[2]:.1f}, "
@@ -2766,7 +2867,8 @@ else:
 
     # what the harmonic ratio needs to differentiate exactly, in the frequency
     # domain, instead of using trunk_acc
-    trunk_spec_signal = filtfilt(trunk_b, trunk_a, trunk_raw, axis=0)
+    trunk_spec_signal = filtfilt(trunk_b, trunk_a, trunk_fill, axis=0)
+    trunk_spec_signal[trunk_gap] = np.nan
     trunk_spec_power = trunk_deriv_order
 
     # One yaw for the whole trial, from the travel direction, applied to BOTH

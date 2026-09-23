@@ -120,6 +120,22 @@ VERBOSE = True
 
 SHAPE_TOLERANCE_MM = 5.0
 
+# --- toes -------------------------------------------------------------------
+# Theia's toe is a hinge at the MTP joint: <Side>_Toes_Joint_Angle has an X
+# component only. A foot-only binding carries the whole boot rigidly on the
+# foot, so at heel-off the toe cap -- a quarter of each mesh -- swings down
+# through the floor (30-40 mm on D05). With TOE_HINGE the vertices beyond the
+# MTP ride a toes pose instead: the foot pose turned about the MTP
+# (<Side>_Toes_Position) by the toe angle, or <Side>_Toes_Global_4x4 itself
+# if the export carries it.
+TOE_HINGE = True
+# +1: a positive toe angle is extension, a turn about the foot's +X (checked
+# on D05 by the toes lying flatter on the floor, both feet). "auto" lets
+# each trial's own check decide; either way the check is printed.
+TOE_SIGN = 1
+TOE_REFERENCE_DEG = 0.0      # toe angle in the static scan (D05: +0.4 / -1.4)
+TOE_SIDE = {"left_foot": "Left", "right_foot": "Right"}
+
 # --- 3D check figure --------------------------------------------------------
 # Draws the whole body from the export -- every joint and segment position,
 # the skeleton linking them -- with the posed mesh on top and each driven
@@ -705,6 +721,122 @@ def show_3d(result, frame=0, zoom=None):
 #  MAIN
 # ============================================================================
 
+def _rot_x(a):
+    """Rotations about the foot's own X (medio-lateral) axis, (F,) rad."""
+    c, s = np.cos(a), np.sin(a)
+    R = np.zeros((len(a), 3, 3))
+    R[:, 0, 0] = 1.0
+    R[:, 1, 1], R[:, 1, 2], R[:, 2, 1], R[:, 2, 2] = c, -s, s, c
+    return R
+
+
+def _about(point, R):
+    """4x4s that rotate by R (F,3,3) about `point`, in the foot frame."""
+    H = np.zeros((len(R), 4, 4))
+    H[:, :3, :3] = R
+    H[:, :3, 3] = point - R @ point
+    H[:, 3, 3] = 1.0
+    return H
+
+
+def toe_poses(poses, seg_names, v_local, seg_of, vectors, matrices):
+    """Split each boot at the MTP joint and pose the toes on their own.
+
+    -> (poses with a <side>_toes segment added per foot, segment names, the
+    segment each vertex now rides, a report). A foot without toe data is
+    left whole, and a frame without a toe angle keeps its toes straight.
+    """
+    out, names, seg = [poses], list(seg_names), np.array(seg_of).copy()
+    report = {}
+    for k, s in enumerate(seg_names):
+        side = TOE_SIDE.get(s)
+        if side is None:
+            continue
+        P = poses[:, k]
+        R, t = P[:, :3, :3], P[:, :3, 3]
+        ok = np.isfinite(P).all(axis=(1, 2))
+        toes4 = matrices.get(f"{side}_Toes_Global_4x4")
+        angle = vectors.get(f"{side}_Toes_Joint_Angle")
+        mtp = (toes4[:, :3, 3] if toes4 is not None
+               else vectors.get(f"{side}_Toes_Position"))
+        if mtp is None or (toes4 is None and angle is None):
+            report[s] = "no toe data in the export: boot left rigid"
+            continue
+
+        # the MTP in the foot's own frame, which it does not leave
+        local = np.einsum("fji,fj->fi", R, mtp - t)
+        m = np.nanmedian(local[ok & np.isfinite(local).all(axis=1)], axis=0)
+        # beyond the MTP along the foot: its offset from the ankle, less the
+        # hinge axis (local X) and the foot's vertical
+        up = np.median(R[ok][:, 2, :], axis=0)
+        up /= np.linalg.norm(up)
+        fwd = m - m[0] * np.array([1.0, 0, 0])
+        fwd -= (fwd @ up) * up
+        fwd /= np.linalg.norm(fwd)
+        distal = (seg == k) & ((v_local - m) @ fwd > 0)
+
+        if toes4 is not None:
+            Rt = orthonormalise(toes4[:, :3, :3])
+            rel = np.einsum("fji,fjk->fik", R, Rt)
+            rel = rel @ _rot_x(np.full(len(rel), -np.radians(TOE_REFERENCE_DEG)))
+            how, sign = f"{side}_Toes_Global_4x4", None
+        else:
+            theta = np.radians(angle[:, 0] - TOE_REFERENCE_DEG)
+            sign, check = _toe_sign(P, m, theta)
+            rel = _rot_x(sign * theta)
+            how = f"{side}_Toes_Joint_Angle X, sign {sign:+d} ({check})"
+        rel[~np.isfinite(rel).all(axis=(1, 2))] = np.eye(3)   # no angle: straight
+        Pt = P @ _about(m, rel)
+
+        out.append(Pt[:, None])
+        names.append(s.replace("foot", "toes"))
+        seg[distal] = len(names) - 1
+        report[s] = dict(source=how, vertices_on_toes=int(distal.sum()),
+                         of=int((np.asarray(seg_of) == k).sum()),
+                         mtp_in_foot_mm=np.round(m * 1000, 1).tolist())
+    return np.concatenate(out, axis=1), names, seg, report
+
+
+def _toe_sign(P, m, theta):
+    """Which way a positive toe angle bends, checked on the data: with the
+    MTP on the floor and the toes bent, the toes lie flat, so the right sign
+    turns the toe segment towards level and the wrong one away from it."""
+    mtp_z = (P[:, :3, :3] @ m + P[:, :3, 3])[:, 2]
+    use = (np.isfinite(theta) & (np.abs(theta) > np.radians(10))
+           & (mtp_z < np.nanpercentile(mtp_z, 5) + 0.03))
+    fixed = None if TOE_SIGN == "auto" else int(TOE_SIGN)
+    if use.sum() < 20:
+        return fixed or 1, "too few frames with the toes bent on the floor to check"
+    tilt = {}
+    for sign in (1, -1):
+        Rt = P[use, :3, :3] @ _rot_x(sign * theta[use])
+        tilt[sign] = float(np.degrees(np.median(np.arccos(
+            np.clip(Rt[:, 2, 2], -1, 1)))))
+    best = min(tilt, key=tilt.get)
+    sign = best if fixed is None else fixed
+    note = (f"toes {tilt[1]:.0f} deg off level with +1, {tilt[-1]:.0f} with -1,"
+            f" over {int(use.sum())} frames")
+    if sign != best and abs(tilt[1] - tilt[-1]) > 5:
+        note += "  *** the data prefer the other sign: check TOE_SIGN ***"
+    return sign, note
+
+
+def _as_posed(z, posed):
+    """The binding as a posed file sees it: which segment each vertex rides
+    (a boot bent at the MTP puts its toes on a toes segment)."""
+    if posed is None or "vertex_segment" not in posed.files:
+        return z
+    seg = posed["vertex_segment"]
+    if len(seg) != len(z["vertices_local"]):
+        return z
+    view = {k: z[k] for k in z.files}
+    view["vertex_segment"] = seg
+    meta = json.loads(str(z["meta"]))
+    meta["segments"] = [str(x) for x in posed["segments"]]
+    view["meta"] = np.array(json.dumps(meta))
+    return view
+
+
 def posed_path(trial_csv=None, out_dir=None):
     """Where apply_binding() writes, and vertex_tracks() looks for, the .npz.
 
@@ -803,6 +935,17 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
                 np.array(ref_d) - np.array(trial_d))) * 1000)
         stats.append(st)
 
+    toes = {}
+    if TOE_HINGE:
+        poses, seg_names, seg_of, toes = toe_poses(
+            poses, seg_names, v_local, seg_of, vectors, matrices)
+    # the binding as these poses see it, for everything below and the result
+    view = {k: z[k] for k in z.files}
+    view["vertex_segment"] = seg_of
+    view_meta = dict(meta)
+    view_meta["segments"] = list(seg_names)
+    view["meta"] = np.array(json.dumps(view_meta))
+
     verts = None
     if save_vertices:
         verts = apply_poses(poses, v_local, segment_blocks(seg_of),
@@ -823,7 +966,7 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
                    frames=np.array(items), vertex_segment=seg_of,
                    meta=np.array(json.dumps(dict(
                        trial=os.path.basename(trial_csv), binding=slim,
-                       stats=stats))))
+                       stats=stats, toes=toes))))
     if save_vertices:
         payload["vertices"] = verts
     np.savez_compressed(out_npz, **payload)
@@ -848,6 +991,13 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
                 print("   *** MISMATCH -- different subject or model? ***"
                       if st["shape_mismatch_mm"] > SHAPE_TOLERANCE_MM
                       else "   OK, same body")
+        for s, tr in toes.items():
+            if isinstance(tr, str):
+                print(f"\n    {s:12s} toes: {tr}")
+            else:
+                print(f"\n    {s:12s} toes: {tr['vertices_on_toes']} of "
+                      f"{tr['of']} vertices beyond the MTP bend with it")
+                print(f"      {tr['source']}")
         print("\n" + "-" * 74)
         print(f"  wrote {out_npz}  ({os.path.getsize(out_npz) / 1e6:.1f} MB)")
         print("    poses          (frames, segments, 4, 4)   always")
@@ -862,7 +1012,7 @@ def apply_binding(trial_csv=None, binding_file=None, save_vertices=None,
         print("-" * 74)
     return dict(poses=poses, vertices=verts, stats=stats,
                 frames=items, out=out_npz, vectors=vectors, matrices=matrices,
-                binding_npz=z, meta=meta,
+                binding_npz=view, meta=view_meta, toes=toes,
                 trial=os.path.basename(trial_csv),
                 trial_path=os.path.abspath(trial_csv))
 
@@ -907,6 +1057,7 @@ def vertex_tracks(source=None, vertices=None, mesh=None, binding=None,
         posed = np.load(source, allow_pickle=False)
         poses = posed["poses"]
         _, z = load_binding(binding)
+        z = _as_posed(z, posed)
 
     v_local, seg_of = z["vertices_local"], z["vertex_segment"]
     meta = json.loads(str(z["meta"]))
@@ -965,6 +1116,7 @@ def mesh_dataframe(source=None, binding=None, dtype=None):
         z, trial = source["binding_npz"], source["trial"]
     else:
         _, z = load_binding(binding)
+        z = _as_posed(z, np.load(source or posed_path(), allow_pickle=False))
         trial = os.path.basename(str(source)) if source else TRIAL_METRICS_CSV
     meta = json.loads(str(z["meta"]))
     seg_of, seg_names = z["vertex_segment"], meta["segments"]
@@ -1021,8 +1173,10 @@ def save_mesh_h5(source=None, trial_csv=None, path=None, binding=None,
     else:
         if source is None:
             source = posed_path()
-        poses = np.load(source, allow_pickle=False)["poses"]
+        posed = np.load(source, allow_pickle=False)
+        poses = posed["poses"]
         _, z = load_binding(binding)
+        z = _as_posed(z, posed)
         trial = os.path.basename(str(source))
         src_path = trial_csv or TRIAL_METRICS_CSV
 

@@ -568,14 +568,24 @@ be one rigid object, and `left_feet` + `right_feet` already cover it.
   transients the FBX analysis flagged independently. The binding script drops
   those from the reference pose automatically.
 
-### What it cannot do
+### The toes
 
-Each region is rigid. The arch does not flatten and the toes do not flex,
-because Theia exports no toe orientation to drive them with. **27% of the left
-mesh and 22% of the right sit distal to the MTP joint** and are held rigid
-relative to the rest. Fine for skin position in the lab frame; not fine for toe
-kinematics. If you need that, export more landmarks from Visual3D and add a
-toes segment — the landmark lists are one line of config.
+The toe cap bends. Theia's toe is a hinge at the MTP joint:
+`<Side>_Toes_Joint_Angle` has an X component only. So `apply_binding.py`
+splits each boot at the MTP (`<Side>_Toes_Position`, which is fixed in the
+foot frame). The vertices beyond it (1292 left, 1272 right) ride a toes
+pose: the foot pose turned by the toe angle about the foot's X axis. If the
+export carries `<Side>_Toes_Global_4x4`, that is used instead.
+
+Without this, the rigid toe cap swings 30–40 mm through the belt at every
+push-off. A positive angle is extension (`TOE_SIGN = 1`). Every run checks
+that on the data: with the MTP on the floor and the toes bent, the toes must
+lie flat. On D05 they are 11° off level with +1 against 30° with −1.
+
+The posed `.npz` records the extra `left_toes` / `right_toes` segments, and
+`vertex_tracks()` follows them, so readers need no changes. Re-run
+`apply_binding.py` on a trial to get bent toes; an older `_posed.npz` still
+carries the boots rigid. The arch still does not flatten.
 
 ## Adapting it
 

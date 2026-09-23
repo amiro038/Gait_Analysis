@@ -15,12 +15,15 @@ treadmill whose forces are computed from where each sole actually touches:
     reaching the other belt, which costs nothing,
   * after step L25's toe-off the left belt keeps a decaying 150 N load for
     250 ms well lateral of the foot, as seen on D05's left belt,
+  * the boots bend at the MTP: at push-off the foot tips heel-up over toes
+    that stay flat on the belt, and the export carries the toe angle,
   * both belts have their own baseline, slow drift and noise,
   * the kinematics lose 20 frames to a tracking dropout.
 
 It checks that
 
-  * the registration and the belt's pitch are recovered,
+  * the registration and the belt's pitch are recovered, and the bent boot
+    stays on the belt where a rigid one goes through it,
   * no event the pipeline calls GRF is more than a frame from the truth,
     none of them comes from a step that was crossed or straddled, and the
     overhanging step keeps its GRF events,
@@ -92,10 +95,26 @@ for limb, lag in (("L", 0.0), ("R", CYCLE / 2)):
 t_k = np.arange(int(DURATION * FS_K)) / FS_K
 
 
+MTP = np.array([0.0, 0.15, -0.04])            # in the foot frame
+
+
+def bend(v, toe_angle):
+    """Boot vertices (V, 3) with the toe cap turned by toe_angle (n,) about
+    the MTP, extension positive -> (n, V, 3), still in the foot frame."""
+    out = np.repeat(v[None], len(toe_angle), axis=0)
+    toe = v[:, 1] > MTP[1]
+    c, s = np.cos(toe_angle)[:, None], np.sin(toe_angle)[:, None]
+    d = v[toe] - MTP
+    out[:, toe, 1] = MTP[1] + c * d[:, 1] - s * d[:, 2]
+    out[:, toe, 2] = MTP[2] + s * d[:, 1] + c * d[:, 2]
+    return out
+
+
 def foot_track(limb):
-    """Per kinematic frame: origin (x, y, z) and pitch, treadmill frame."""
+    """Per kinematic frame: origin (x, y, z), pitch and toe angle, treadmill
+    frame. At push-off the toes stay flat: toe extension = -pitch."""
     st = stances[limb]
-    x, y, pitch, clear = (np.zeros(len(t_k)) for _ in range(4))
+    x, y, pitch, clear, toe = (np.zeros(len(t_k)) for _ in range(5))
     stance_now = np.zeros(len(t_k), bool)
     for i, s in enumerate(st):
         m = (t_k >= s["hs"]) & (t_k < s["to"])
@@ -105,6 +124,7 @@ def foot_track(limb):
         y[m] = Y_AT_HS - BELT_SPEED * (t_k[m] - s["hs"])
         pitch[m] = (np.radians(15) * (1 - smooth(tau / 0.15))
                     - np.radians(35) * smooth((tau - 0.6) / 0.4))
+        toe[m] = np.clip(-pitch[m], 0, None)
         if i + 1 < len(st):
             nxt = st[i + 1]
             m = (t_k >= s["to"]) & (t_k < nxt["hs"])
@@ -114,11 +134,15 @@ def foot_track(limb):
             x[m] = s["x"] + (nxt["x"] - s["x"]) * smooth(sw)
             pitch[m] = np.radians(-35 + 50 * smooth(sw))
             clear[m] = 0.06 * np.sin(np.pi * sw)
-    v = MESH[limb]
+            toe[m] = np.radians(35) * (1 - smooth(sw / 0.3))
+    lowest = np.zeros(len(t_k))
     c, s = np.cos(pitch), np.sin(pitch)
-    lowest = (np.outer(s, v[:, 1]) + np.outer(c, v[:, 2])).min(1)
+    for c0 in range(0, len(t_k), 1000):
+        sl = slice(c0, c0 + 1000)
+        vb = bend(MESH[limb], toe[sl])
+        lowest[sl] = (s[sl, None] * vb[..., 1] + c[sl, None] * vb[..., 2]).min(1)
     z = clear - lowest                       # treadmill floor at z = 0
-    return x, y, z, pitch, stance_now
+    return x, y, z, pitch, stance_now, toe
 
 
 def rot_x(a):
@@ -142,16 +166,18 @@ def to_theia(p):
     return q
 
 
-poses, split, cop_xy = {}, {}, {}
+poses, split, cop_xy, toe_angle, on_belt = {}, {}, {}, {}, {}
 for limb in ("L", "R"):
-    x, y, z, pitch, on = foot_track(limb)
+    x, y, z, pitch, on, toe_angle[limb] = foot_track(limb)
+    on_belt[limb] = on
     R_t = rot_x(pitch)
     origin = np.column_stack([x, y, z])
     frac = {b: np.zeros(len(t_k)) for b in ("L", "R")}
     cen = {b: np.full((len(t_k), 2), np.nan) for b in ("L", "R")}
     for c0 in range(0, len(t_k), 2000):
         sl = slice(c0, c0 + 2000)
-        world = (MESH[limb] @ R_t[sl].transpose(0, 2, 1)
+        world = (np.einsum("nij,nvj->nvi", R_t[sl],
+                           bend(MESH[limb], toe_angle[limb][sl]))
                  + origin[sl, None, :])
         touch = (world[..., 2] < 0.002) & on[sl, None]
         wx = world[..., 0]
@@ -243,11 +269,13 @@ pelvis_t = np.column_stack([np.zeros(len(t_k)),
 signals = {"Pelvis_Position": to_theia(pelvis_t)}
 for limb, side in (("L", "Left"), ("R", "Right")):
     P = poses[limb]
-    for name, local in (("Heel", (0, -0.045, -0.09)), ("Toes", (0, 0.20, -0.085)),
+    for name, local in (("Heel", (0, -0.045, -0.09)), ("Toes", MTP),
                         ("Ankle", (0, 0, 0)), ("Foot", (0, 0.065, 0))):
         signals[f"{side}_{name}_Position"] = (P[:, :3, :3] @ np.array(local)
                                              + P[:, :3, 3])
     signals[f"{side}_Foot_Global_4x4"] = P.reshape(len(P), 16)
+    signals[f"{side}_Toes_Joint_Angle"] = np.column_stack(
+        [np.degrees(toe_angle[limb]), np.zeros(len(P)), np.zeros(len(P))])
 DROP = slice(3000, 3020)
 names, comps, columns = [], [], []
 for name, arr in signals.items():
@@ -295,6 +323,17 @@ check(rot_err < 1.0 and shift_err < 15,
 pitch = np.degrees(np.arctan(res["surface"]["slope"]))
 check(abs(pitch - np.degrees(INCLINE)) < 0.1,
       f"belt pitch {pitch:.2f} deg (true {np.degrees(INCLINE):.2f})")
+low = {b: np.nanmin(res["height"][b][on_belt[b]]) * 1000
+       for b in ("L", "R")}
+dg.TOE_HINGE = False
+rigid = dg.process_trial(force_dir / f"{trial}.csv", MESH, POSE_NAMES,
+                         plates, verbose=False)
+dg.TOE_HINGE = True
+low_rigid = {b: np.nanmin(rigid["height"][b][on_belt[b]]) * 1000
+             for b in ("L", "R")}
+check(min(low.values()) > -8 and max(low_rigid.values()) < -10,
+      f"deepest sole point in stance: bent {low['L']:.0f} / "
+      f"{low['R']:.0f} mm, rigid {low_rigid['L']:.0f} / {low_rigid['R']:.0f} mm")
 
 truth = []
 for limb in ("L", "R"):
