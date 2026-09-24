@@ -21,25 +21,38 @@ family:
     gait/lds.py             local dynamic stability
     gait/uncertainty.py     block bootstrap and DFA intervals
     gait/summary.py         everything into one long table
+    gait/tables.py          ... and into one row per trial
     gait/figures.py         QA figures
 
 Run it with F5 after running detect_gait_events.py, or
 
     python run_gait_analysis.py                    # every trial with events
     python run_gait_analysis.py "D05_C1_Treadmill_1.3mpers 108bpm"
+    python run_gait_analysis.py --tables           # only rebuild the tables
 
-Per trial, in OUTPUT_FOLDER:
+THE RESULTS, in OUTPUT_FOLDER, one row per trial and one column per metric
+(every trial analysed into this folder, including earlier runs):
+
+    all_trials_metrics.xlsx   a sheet of key metrics, one sheet per family,
+                              the 95% confidence limits, and a dictionary of
+                              every column
+    all_trials_metrics.csv    the same values as plain CSV
+    all_trials_metrics_ci.csv their 95% confidence limits
+    metric_dictionary.csv     what each column is, its unit, and the section
+                              of METHODS.md that defines it
+    all_trials_summary.csv    the long form (one row per number), for mixed
+                              models: participant random, condition fixed
+
+Per trial, for checking and for re-analysis:
 
     {trial}_steps.csv         one row per heel strike, every per-step metric
-    {trial}_summary.csv       one row per number: metric, limb, statistic,
-                              value, 95% CI, n, bootstrap block length
+    {trial}_summary.csv       that trial's numbers in the long form
     {trial}_waveforms.npz     time-normalised GRF and joint angles per stride,
                               LDS divergence curves, MSE curve
     {trial}_lds_windows.csv   lambda per window of strides
     {trial}_qa.png, {trial}_variability.png
 
-and all_trials_summary.csv: every trial's summary stacked, ready for a mixed
-model (participant random, condition fixed).
+METHODS.md describes how every metric is computed.
 """
 
 import sys
@@ -57,7 +70,7 @@ sys.path.insert(0, str(HERE))
 
 import detect_gait_events as dge                              # noqa: E402
 from gait import figures, kinematics, kinetics, spatiotemporal  # noqa: E402
-from gait import stability, summary                           # noqa: E402
+from gait import stability, summary, tables                   # noqa: E402
 from gait import trial as gt                                  # noqa: E402
 
 # %% ==========================================================================
@@ -155,22 +168,22 @@ def main(stems=None):
         n = min(counts.values())
         print(f"series cut to {n} strides, the shortest trial's "
               f"({min(counts, key=counts.get)})")
-    tables = []
+    done = 0
     for stem in stems:
         who = stem.split("_")[0]
         try:
-            tables.append(analyse(stem, people.get(who, {}), n)[1])
+            analyse(stem, people.get(who, {}), n)
+            done += 1
         except Exception as exc:                       # keep the batch going
             print(f"\n{stem}: FAILED -- {exc}")
             traceback.print_exc()
-    if tables:
-        allt = pd.concat(tables, ignore_index=True)
-        allt.to_csv(Path(OUTPUT_FOLDER) / "all_trials_summary.csv",
-                    index=False)
-        print(f"\n{len(tables)} of {len(stems)} trials -> "
-              f"{Path(OUTPUT_FOLDER) / 'all_trials_summary.csv'}")
-    return tables
+    print(f"\n{done} of {len(stems)} trials analysed")
+    # every trial in the output folder, including earlier runs, as one row
+    return tables.build(OUTPUT_FOLDER)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or None)
+    if sys.argv[1:] == ["--tables"]:        # just rebuild the tables
+        tables.build(OUTPUT_FOLDER)
+    else:
+        main(sys.argv[1:] or None)

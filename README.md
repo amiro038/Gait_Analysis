@@ -720,20 +720,27 @@ One module per metric family, each with its method in its header:
 | `gait/variability.py` | DFA, sample entropy, multiscale entropy, harmonic ratio, regularity, GEM, foot placement, symmetry |
 | `gait/lds.py` | local dynamic stability, with windows and a stride bootstrap |
 | `gait/uncertainty.py` | block bootstrap (Politis–White block length), DFA parametric bootstrap |
-| `gait/summary.py`, `gait/figures.py` | the long results table, the QA figures |
+| `gait/summary.py`, `gait/tables.py`, `gait/figures.py` | the results in long form, as one row per trial, and the QA figures |
 
-Per trial, in `gait_analysis_outputs/`:
+**The results**, in `gait_analysis_outputs/`, one row per trial and one column
+per metric (every trial analysed into that folder, earlier runs included;
+`python run_gait_analysis.py --tables` rebuilds them without re-analysing):
 
-- `{trial}_steps.csv` — one row per heel strike with every per-step metric;
-- `{trial}_summary.csv` — one row per number: `metric`, `limb` (L, R, both),
-  `statistic` (mean, sd, cv, value, …), `value`, `ci_low`, `ci_high` (95%),
-  `n`, `block` (bootstrap block length, in strides), `note`;
-- `{trial}_waveforms.npz`, `{trial}_lds_windows.csv`, `{trial}_qa.png`,
-  `{trial}_variability.png`;
+- `all_trials_metrics.xlsx` — a **Key metrics** sheet, one sheet per family
+  (Trial, Spatiotemporal, Stability, Kinetics, CoM work, Posture, Symmetry,
+  DFA, Entropy, Trunk, Control, LDS), the **95% CI** sheet and a
+  **Dictionary**. Row 1 of each sheet describes the column with its unit, row 2
+  is the column name;
+- `all_trials_metrics.csv` and `all_trials_metrics_ci.csv` — the same values
+  and their 95% confidence limits (`<column>_lo`, `<column>_hi`);
+- `metric_dictionary.csv` — what every column is, its unit, and the section of
+  `METHODS.md` that defines it.
 
-and `all_trials_summary.csv`, every trial stacked with `participant` and
-`condition` columns, ready for a mixed model (participant random, condition
-fixed), e.g. with statsmodels:
+Column names: `step_width_m` is the mean over all steady steps, `_sd` / `_cv`
+the SD and CV, `_L` / `_R` each foot. `all_trials_summary.csv` has the same
+numbers in long form (one row per number, with CI, N, bootstrap block length
+and a note), which is the shape a mixed model wants (participant random,
+condition fixed), e.g. with statsmodels:
 
 ```python
 import pandas as pd, statsmodels.formula.api as smf
@@ -741,6 +748,10 @@ d = pd.read_csv("all_trials_summary.csv")
 d = d[(d.metric == "step_width_m") & (d.limb == "both") & (d.statistic == "mean")]
 print(smf.mixedlm("value ~ condition", d, groups=d["participant"]).fit().summary())
 ```
+
+Per trial, for checking: `{trial}_steps.csv` (every per-step value),
+`{trial}_summary.csv`, `{trial}_waveforms.npz`, `{trial}_lds_windows.csv`,
+`{trial}_qa.png` and `{trial}_variability.png`.
 
 **What changed from `Gait_analysis_all_metrics.py`** (now in `archive/analysis_v3/`
 with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
@@ -762,5 +773,7 @@ with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
 - GEM on dimensionless stride time and length; regularity from the
   autocorrelation peaks; multiscale entropy to 30 scales.
 
-`GAIT_METRICS_METHODS.md` has the theory, equations and parameter choices
-for every metric.
+**`METHODS.md`** is the full methods document: equipment, boots, event
+detection, trial preparation (load, system CoM, velocity), and for every metric
+its definition, equations, parameters, output columns and interpretation, with
+the uncertainty methods, the tables, the validation and all parameters.

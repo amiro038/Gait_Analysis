@@ -25,6 +25,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -208,6 +209,20 @@ files = [f"{name}_{x}" for x in ("steps.csv", "summary.csv", "waveforms.npz",
                                  "lds_windows.csv", "qa.png",
                                  "variability.png")]
 check(all((out / f).exists() for f in files), "all the per-trial files")
+built = rga.tables.build(out)
+wide = pd.read_csv(out / "all_trials_metrics.csv")
+dictionary = pd.read_csv(out / "metric_dictionary.csv")
+missing = [c for c in rga.tables.KEY if c not in wide]
+check(len(wide) == 1 and not missing
+      and set(dictionary["column"]) == set(wide.columns[3:])
+      and dictionary["methods_section"].notna().all(),
+      f"one row per trial, {wide.shape[1] - 3} metric columns, each in the "
+      f"dictionary with its methods section"
+      + (f"; key columns missing {missing}" if missing else ""))
+check(abs(wide.loc[0, "load_kg"] - t.load["load_kg"]) < 1e-9
+      and abs(wide.loc[0, "step_width_m_L"]
+              - s.loc[s["limb"] == "L", "step_width_m"].mean()) < 1e-9,
+      "the table's values are the trial's")
 
 print(f"\n{'ALL PASSED' if not failures else f'{len(failures)} FAILED'}"
       f"  (work dir {WORK})")
