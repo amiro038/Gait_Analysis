@@ -607,8 +607,9 @@ history is inspectable without digging through git.
 ## Gait events — `detect_gait_events.py`
 
 One self-contained script, numpy and scipy only. It writes
-`{trial}_merged_events.csv` with the four columns `Gait_analysis_all_metrics.py`
-reads. Set the paths in its CONFIG cell and press F5, or:
+`{trial}_merged_events.csv` (four columns: event, limb, frame, source) and the
+`_event_qa.csv` that `run_gait_analysis.py` reads. Its CONFIG cell holds the data
+paths for both scripts; set them and press F5, or:
 
 ```bash
 python detect_gait_events.py                       # every trial
@@ -616,8 +617,15 @@ python detect_gait_events.py "D05_C1_Treadmill_1.3mpers 108bpm"
 python test_detect_gait_events.py                  # synthetic end-to-end check
 ```
 
-It needs `foot_mesh_binding.npz` (the boot meshes) and
-`force_plates_DICE_treadmill.txt` (the C3D plate parameters) next to it.
+It needs each participant's `{participant}_foot_mesh_binding.npz` (the boot
+meshes, from `build_foot_binding.py`) and `force_plates_DICE_treadmill.txt` (the
+C3D plate parameters).
+
+Contact edges are found on the 50 Hz-filtered force, then placed where the RAW
+force crosses the threshold, within ±15 ms and held for 5 samples: a zero-lag
+filter otherwise starts every contact 1–2 ms early and ends it 1–2 ms late. On
+the synthetic trial trusted GRF events are within 0.2 frames (2 ms) of the
+truth.
 
 1. **GRF first, where it can be trusted.** Each belt contact's heel strike and
    toe-off is judged separately, over ±50 ms. It is kept only if all of these
@@ -635,7 +643,10 @@ It needs `foot_mesh_binding.npz` (the boot meshes) and
    searched for only in the gap the L HS → R TO → R HS → L TO sequence leaves
    for it. It is then shifted by Zeni's median offset from the trial's trusted
    GRF events. Across 11 D05 trials Zeni had the smallest worst-trial error of
-   seven candidate methods.
+   seven candidate methods. A Zeni peak must stand 50 mm above its
+   surroundings (±0.6 s): standing still, the heel-to-pelvis distance only
+   wobbles by millimetres, and without this the quiet standing that opens every
+   trial produced a string of phantom steps.
 3. **Only where Zeni finds nothing** (a tracking dropout): a clean-looking
    contact the mesh could not check (`GRF_unverified`), then interpolation.
 
@@ -682,3 +693,74 @@ mocap lab frame, set `LAB_TO_THEIA = "identity"`.
 `archive/gait_events_multifile/` has the earlier multi-file version. It
 benchmarks seven fallback variables against the trusted GRF events, which is
 how Zeni was chosen. To rerun it, put it back beside `apply_binding.py`.
+
+## Gait analysis — `run_gait_analysis.py` and `gait/`
+
+Step 2, after the events. The paths come from `detect_gait_events.py`; the
+participant table is `participants.csv` (body mass without the carried load,
+leg length, height). Press F5, or:
+
+```bash
+python run_gait_analysis.py                        # every trial with events
+python run_gait_analysis.py "D05_C1_Treadmill_1.3mpers 108bpm"
+python test_gait_analysis.py                       # synthetic end-to-end check
+python gait_metrics_validation.py                  # every estimator vs a known answer
+python lds_validation.py                           # Rosenstein vs Lorenz / Rossler
+```
+
+One module per metric family, each with its method in its header:
+
+| module | what |
+|---|---|
+| `gait/trial.py` | loads a trial: events → steps, the belt's speed and direction, the posed boot soles, the forces in Theia's axes, the load from the opening quiet standing, the system CoM, the fused CoM velocity |
+| `gait/spatiotemporal.py` | times (sub-frame), percentages of the stride, step length / width, stride length over the belt |
+| `gait/stability.py` | margin of stability, MFC, margin of instability, trip risk integral |
+| `gait/kinetics.py` | impulses, peaks, loading rate, CoP, free moment, individual-limb CoM work — trusted stances only |
+| `gait/kinematics.py` | trunk lean, pelvis tilt, joint ranges of motion |
+| `gait/variability.py` | DFA, sample entropy, multiscale entropy, harmonic ratio, regularity, GEM, foot placement, symmetry |
+| `gait/lds.py` | local dynamic stability, with windows and a stride bootstrap |
+| `gait/uncertainty.py` | block bootstrap (Politis–White block length), DFA parametric bootstrap |
+| `gait/summary.py`, `gait/figures.py` | the long results table, the QA figures |
+
+Per trial, in `gait_analysis_outputs/`:
+
+- `{trial}_steps.csv` — one row per heel strike with every per-step metric;
+- `{trial}_summary.csv` — one row per number: `metric`, `limb` (L, R, both),
+  `statistic` (mean, sd, cv, value, …), `value`, `ci_low`, `ci_high` (95%),
+  `n`, `block` (bootstrap block length, in strides), `note`;
+- `{trial}_waveforms.npz`, `{trial}_lds_windows.csv`, `{trial}_qa.png`,
+  `{trial}_variability.png`;
+
+and `all_trials_summary.csv`, every trial stacked with `participant` and
+`condition` columns, ready for a mixed model (participant random, condition
+fixed), e.g. with statsmodels:
+
+```python
+import pandas as pd, statsmodels.formula.api as smf
+d = pd.read_csv("all_trials_summary.csv")
+d = d[(d.metric == "step_width_m") & (d.limb == "both") & (d.statistic == "mean")]
+print(smf.mixedlm("value ~ condition", d, groups=d["participant"]).fit().summary())
+```
+
+**What changed from `Gait_analysis_all_metrics.py`** (now in `archive/analysis_v3/`
+with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
+
+- the **load** is weighed per trial in the opening quiet standing and placed on
+  the trunk from the standing CoP; margins, pendulum lengths, CoM work and the
+  GRF integration use the **system** (body + load) CoM and mass;
+- step length and width were read one frame late (a frame number used as a row);
+  times are now sub-frame, and stride length is measured over the belt;
+- the walking direction is the belt's, measured, not the boots' long axis;
+- the fused CoM velocity has its gaps put back as NaN, and the force axes are
+  derived from the plate geometry and checked against the markers;
+- kinetics only on trusted stances, on the belt that carried the foot, with the
+  plate baseline removed and the force filtered;
+- the AP / ML margin minima are over single support; the trip risk uses the
+  stance leg's pendulum;
+- DFA intervals, block-bootstrap intervals on every mean / SD / CV, LDS over
+  windows with a stride bootstrap; every trial's series cut to the same length;
+- GEM on dimensionless stride time and length; regularity from the
+  autocorrelation peaks; multiscale entropy to 30 scales.
+
+`GAIT_METRICS_METHODS.md` has the theory, equations and parameter choices
+for every metric.

@@ -1,9 +1,11 @@
 # Gait metrics: theory, mathematics and parameter justification
 
-Companion to `Spatiotemporal_analysis_v3.py`. Every metric the script computes is
-defined here: what it measures, the equations, what each symbol means, what a
-change in the value implies, why each parameter was set the way it was, and
-typical healthy-adult values.
+Companion to `run_gait_analysis.py` and the `gait/` package (one module per
+metric family, named in each section). Every metric is defined here: what it
+measures, the equations, what each symbol means, what a change in the value
+implies, why each parameter was set the way it was, and typical healthy-adult
+values. Section 0 covers what is shared: the treadmill, the metronome, the
+load, and the confidence intervals.
 
 **Citation confidence.** References marked ✔ were verified against the source
 during writing. References marked ~ are from domain knowledge and the exact
@@ -24,9 +26,15 @@ below uses
 
 $$v_{AP}^{\text{corrected}}(t) = v_{AP}^{\text{lab}}(t) + v_{\text{belt}}$$
 
-with `v_belt = 1.3 m/s` for this protocol. Mediolateral quantities are unaffected —
-the belt does not move sideways. This correction is the single most common
-omission in treadmill margin-of-stability work.
+where `v_belt` is **measured** per trial from the stance heels during foot-flat
+(25–55% of stance): a foot on the belt moves with it, so its velocity is the
+belt's (`gait/trial.py`, `belt_motion`). The same velocities give the belt's
+**direction of travel**, which is the walking direction every AP and ML
+quantity is projected on. The boots' long axes are not used for this: boots toe
+out, and 1.3° of that on D05's meshes leaked ±17 mm of step length into step
+width. Mediolateral quantities need no belt correction — the belt does not move
+sideways. This correction is the single most common omission in treadmill
+margin-of-stability work.
 
 ### 0.2 The metronome changes what long-range correlations mean
 
@@ -45,6 +53,68 @@ cueing-compliance measures.
 A second constraint compounds this: at fixed belt speed, stride time and stride
 length are mechanically forced to trade off (speed is pinned), which *imposes*
 anti-persistence on both regardless of neural control [Dingwell et al. 2010 ✔].
+
+### 0.3 The load, weighed in the opening quiet standing
+
+The load differs between trials, and Theia's `Whole_body_COG` knows nothing
+about it: the markerless model sees a body, not the mass of a pack or a vest.
+The force plates see everything. Every trial opens with a few seconds of quiet
+standing, and there (`gait/trial.py`, `quiet_standing`, `system_com`):
+
+- **System weight** $W$ = total vertical GRF over the steadiest 2 s window
+  before the first step with both belts loaded and both heels still (CV of the
+  total below 2%). System mass $m = W/g$.
+- **Load mass** $m_{load} = m - m_{body}$, with $m_{body}$ from
+  `participants.csv` (the participant weighed without the carried load).
+- **Load position.** Standing still, the CoP is directly below the system CoM,
+  so horizontally
+  $$x_{load} = \frac{m\,x_{CoP} - m_{body}\,x_{CoM,body}}{m_{load}}.$$
+  Its height cannot be seen standing still and is set at `Trunk_Position` +
+  `LOAD_HEIGHT_M` (0 by default). Left–right the load is centred on the trunk
+  (`LOAD_CENTRED`): the CoP locates it only to the plate registration's error
+  times $m/m_{load}$ (≈5: 4 mm of registration is 20 mm of load), and packs and
+  vests sit on the midline.
+- The load point is then carried in a trunk frame (Low_Back → Neck, walking
+  direction), and the **system CoM** is
+  $(m_{body}\,x_{CoM,body} + m_{load}\,x_{load})/m$.
+
+On the synthetic trial (80 kg + 20 kg, 150 mm behind the trunk) this recovers
+19.9 kg, 152 mm, and a system CoM within 2 mm of the truth; Theia's body CoM is
+82 mm from it. The system CoM feeds every margin of stability, pendulum length
+and CoM work; the system mass feeds the GRF-integrated velocity. Forces are
+reported per body weight (`_bw`) and per total weight (`_tw`).
+
+The walking mean vertical GRF is compared with the standing weight on every
+trial; more than 2% apart points at plate drift or a standing that was not
+still. If no quiet standing is found, the mass falls back to the walking mean
+and the load cannot be placed (printed, and noted in the summary).
+
+### 0.4 Confidence intervals, and what "block length" means
+
+Every value comes from one walk of a few hundred strides; walk again and it
+changes. Each value in `{trial}_summary.csv` carries a 95% interval saying by
+how much (`gait/uncertainty.py`):
+
+- **Circular block bootstrap** for everything computed from a stride series
+  (mean, SD, CV, regression R²). Strides are not independent — a long stride
+  tends to be followed by another — so resampling them one at a time would
+  destroy that correlation and make the intervals too narrow. Instead strides
+  are drawn in runs of consecutive strides (**blocks**) and the runs are glued
+  into a new series. The **block length** is how many strides go in a run. It
+  is chosen per series by the Politis & White (2004) rule, corrected by Patton,
+  Politis & White (2009): the slower the autocorrelation dies away, the longer
+  the block; an uncorrelated series gets 1. It is written in the `block`
+  column. On a persistent AR(1) series (φ = 0.6) blocks give 93% coverage of a
+  95% interval; resampling single strides gives 66%.
+- **Parametric bootstrap for DFA α.** Blocks would cut exactly the long-range
+  correlation α measures, so instead 200 series are simulated with the
+  estimated α (exact fractional Gaussian noise, Davies–Harte) and DFA is run on
+  each; the basic bootstrap interval and DFA's bias at this N come out of that.
+  At N = 486 the interval covers the truth 93% of the time and is ±0.17 wide.
+- **Stride bootstrap for λ** (§7): the divergence curve is kept per reference
+  stride, and blocks of strides are resampled.
+
+Sample entropy has no interval: blocks break its templates at every join.
 
 ---
 
@@ -106,7 +176,8 @@ $$F(n) \propto n^{\alpha}$$
 |---|---|---|
 | Detrending order | 1 (linear) | Standard for stride series; higher orders remove the low-frequency structure you are trying to measure. |
 | Box size range | $16 \le n \le N/9$ | Directly from the empirical examination in [Damouras et al. 2010 ✔], which showed the commonly used 4 to N/4 range inflates α. Small boxes are dominated by the detrending fit itself; boxes beyond N/9 contain too few samples to average. |
-| Series length | ≥ 600 strides | [Damouras et al. 2010 ✔]. This dataset has **798 strides per limb over 886 s**, so α is well-powered — unusually so for gait work. |
+| Series length | ≥ 600 strides recommended | [Damouras et al. 2010 ✔]. Every trial in a run is cut to the SAME N (`SERIES_LENGTH = "shortest"`), since α drifts with N. Below 9 × 16 × 2 strides the box range spans less than an octave and α is not computed. |
+| Interval | parametric bootstrap, §0.4 | ±0.17 at N = 486 (validated coverage 93%). |
 | Box spacing | logarithmic | Equal weighting per decade in the log–log fit. |
 | Series indexing | stride number | Not elapsed time. The series is a sequence of discrete strides. |
 
@@ -114,12 +185,13 @@ $$F(n) \propto n^{\alpha}$$
 
 1. **Shuffled surrogate** — randomly permute the series. α must return 0.5. If it
    doesn't, the implementation is wrong.
-2. **Synthetic fractional Gaussian noise** of known α, generated by spectral
-   synthesis, to quantify the estimator's bias at this N. Same approach as
-   `lds_validation.py` takes for λ.
-3. **Confirmatory estimator** — DFA alone cannot resolve the fGn/fBm ambiguity, so
-   an ARFIMA-based estimate of the fractional differencing parameter *d* is
-   reported alongside (α ≈ d + 0.5 for fGn).
+   20 shuffles per series; their mean is in the summary's note.
+2. **Synthetic fractional Gaussian noise** of known α (exact, Davies–Harte), in
+   `gait_metrics_validation.py`, quantifies the estimator's bias at this N; the
+   same simulation gives each trial's interval and bias.
+3. **Confirmatory estimator** — Geweke–Porter-Hudak on the periodogram
+   (α ≈ d + 0.5 for fGn), reported in the note. Its own scatter is about twice
+   DFA's, so only a large disagreement is informative.
 
 ### Healthy values
 
@@ -206,11 +278,11 @@ $$iHR = \frac{\sum_{k \in \text{intrinsic}} A_k^2}{\sum_{k=1}^{20} A_k^2} \times
 
 | Parameter | Value | Why |
 |---|---|---|
-| Signal | `Low_Back_Joint_Acc` | L5/low-back is the conventional site, closest to the whole-body CoM. |
+| Signal | `Trunk_Linear_Velocity`, weighted $k^1$ | **Not** `Low_Back_Joint_Acc` or `Trunk_Joint_Acceleration`: those are ANGULAR (deg/s²). The first linear trunk column is used; from a velocity, acceleration harmonic $k$ is exactly $k\,\omega_0$ times velocity harmonic $k$, so weighting by $k$ is exact where numerical differentiation rolls off before the 20th harmonic. $\omega_0$ cancels in the ratio. |
 | Harmonics | first 20 | The established convention; covers the spectral content that carries stride structure. |
-| Frame | rotated into pelvis heading | Global axes only coincide with anatomical axes if heading is exactly constant. Rotating removes that assumption. |
+| Frame | the belt's direction of travel | One fixed heading on a treadmill; a per-frame rotation would mix pelvis rotation into the signal. |
 | Segmentation | per stride, ipsilateral heel strike to heel strike | Stride segmentation method measurably affects HR, so it is fixed and stated. |
-| Aggregation | median + IQR across strides | HR is a ratio with occasional large outliers; the median is more robust than the mean. |
+| Aggregation | median, and mean with a block bootstrap CI | HR is a ratio with occasional large outliers; iHR is bounded and is the better mean. |
 
 ### Healthy values
 
@@ -302,7 +374,8 @@ reduces variance at long scales.
 | $r$ | 0.2 × SD, **and swept** | [Yentes & Raffalt 2021 ✔] recommends against assuming a single $r$ transfers between conditions. The sweep is reported, not just the point estimate. |
 | $N$ | ≥ 200 | [Yentes et al. 2013 ✔] showed both algorithms become extremely parameter-sensitive at N ≤ 200. This dataset has 798 strides, comfortably above. |
 | SD for $r$ | stated explicitly | Whether $r$ is scaled by each condition's own SD or by a pooled SD changes the result; the choice is recorded in the output. |
-| MSE scales | 1 – 10 | Beyond ~10 the coarse-grained series becomes too short for a stable estimate at this N. |
+| MSE signal | trunk acceleration, 300 s after the warm-up | A stride series runs out of points after 2–3 scales; the continuous signal does not. |
+| MSE scales | 1 – 30 (0.3 s at 100 Hz) | At 100 Hz, scale 10 is only 0.1 s — well inside one step. 30 reaches a quarter stride with 1000 points still left per phase. |
 | Reporting | $m$, $r$, $N$ always | Required by [Yentes & Raffalt 2021 ✔]; entropy values are meaningless without them. |
 
 ### Healthy values
@@ -375,18 +448,23 @@ points, several centimetres inside the true foot border. Using the mesh:
 - **ML boundary** — the lateral-most vertex of the stance foot.
 - **AP boundary** — the most anterior vertex.
 
-Both are computed per frame from `apply_binding`'s posed vertices. The
-marker-based value is computed alongside and the difference reported, since
-quantifying that offset is a methodological result in itself.
+Both come from the **sole** of the participant's MOVE4D boot (the lowest vertex
+in every 10 mm cell of the boot's footprint), posed on Theia's foot and bent at
+the MTP by the toe angle — the same geometry `detect_gait_events.py` uses, so
+events and margins see the same boot. The ankle-based value is computed
+alongside (`mos_ml_contact_ankle`), since quantifying that offset is a
+methodological result in itself.
 
 ### Parameter justification
 
 | Parameter | Value | Why |
 |---|---|---|
 | $\ell$ | per-frame CoM-to-ankle distance | Hof's original uses leg length; a per-frame distance is the more literal pendulum length. Constant-$\ell$ reported as a sensitivity check since the choice shifts absolute MoS. |
-| CoM source | `Whole_body_COG` from the Theia export | 100% finite in these trials; no reconstruction needed. |
+| CoM | the **system** CoM, body + load (§0.3) | The load moves the CoM; Theia's body CoM does not include it. |
+| Velocity | markers below 0.5 Hz, integrated GRF / system mass above | Complementary filter, same cutoff on both branches. Velocity error reaches the xCoM divided by $\omega_0$; on the synthetic trial the fused velocity is 4–8 mm/s RMS from the truth against 25 for markers alone. |
 | AP velocity | belt-corrected | §0.1. Without this the AP margin is meaningless on a treadmill. |
-| Timing | at foot contact **and** minimum across stance | Foot contact is the convention; the stance minimum captures the worst case within the step. |
+| Timing | at foot contact **and** minimum over **single support** | Before the other foot's toe-off and after its heel strike, the stance boot alone is not the base of support; a minimum over the whole stance picks up late stance, when the xCoM is far past a foot the body has already left. |
+| Normalisation | also per leg length (`*_per_leg`) | For comparison between people. |
 | Directions | ML and AP separately | They mean different things (see above) and must not be combined into a resultant. |
 
 ### Healthy values
@@ -468,8 +546,9 @@ $$TRI = \int_{t_1}^{t_2} \frac{MoI(t)}{MFC(t)}\, dt$$
 | $u_{max}$ | most anterior vertex of either foot mesh | Schulz used the most anterior toe *marker*; the mesh gives the actual anterior-most surface point, which is what would strike an obstacle. |
 | Direction | AP only | MoI is defined in the direction of progression. **Requires the belt correction of §0.1** — without it MoI on a treadmill is meaningless. |
 | Positive clamp | MoS > 0 → 0 | By definition: a stable configuration contributes no trip risk. |
-| $MFC(t)$ | min over all vertices of the swing foot | Schulz used all digitised shoe points; the mesh is the direct equivalent. |
-| Floor | flat, z = 0 | Treadmill belt. Schulz interpolated a digitised floor because his surfaces had obstacles; here the floor is planar, so clearance is simply vertex height. |
+| $MFC(t)$ | min over the swing boot's sole | Schulz used all digitised shoe points; the posed boot sole is the direct equivalent. |
+| Floor | the fitted belt plane | The DICE plates are pitched ~0.84°, 13 mm over a stance, and Theia's floor height differs between standing and walking, so the belt surface is fitted to the boots in mid-stance: one slope, one offset per boot. Clearance is height above it. |
+| Pendulum | CoM to the **stance** (other) ankle | During a swing the body pivots over the stance leg. |
 | Integration bounds | peak acceleration to peak deceleration of the MFC point | Excludes the spikes at lift-off and landing, when the foot is intentionally near the ground. |
 | Time normalisation | **none** | Schulz deliberately did not normalise, so slower swings yield larger TRI. Preserved here for comparability. |
 | Integration step | 1/100 s | Data rate. Schulz used 1/120 s at 120 Hz. |
@@ -511,24 +590,20 @@ $$MFC(t) = \min_j\ p_{j,z}(t)$$
 MFC for the stride is the **local** minimum of this trajectory during mid-swing,
 subject to the event criteria below.
 
-### What changes versus the current implementation
+### How it is found (`gait/stability.py`)
 
-The existing code takes the minimum of the **heel and toe joint centres**. Those are
-internal points, several centimetres above and inside the sole, so it measures the
-clearance of an imaginary point inside the foot. Three specific fixes:
-
-1. **Mesh instead of joint centres.** Minimum over all vertices gives the true
-   lowest surface point.
+1. **The boot sole, not joint centres.** The heel and toe joint centres are
+   internal points centimetres above the sole; the posed boot gives the true
+   lowest surface point, above the fitted belt plane.
 2. **Local minimum, not global.** [Schulz 2017 ✔] operationalises a valid MFC event
    as: (a) a local minimum — lower than the preceding and following two frames;
-   (b) foot segment speed within the upper quartile for that swing, which
-   eliminates spurious events immediately after foot-off; (c) the heel clearance is
-   not smaller than the toe clearance, which prevents false detections at midfoot.
-   The current code applies the velocity gate but takes a *global* minimum, so
-   strides with no genuine local minimum return a value that should be NaN.
-3. **Record which vertex was lowest.** Schulz's own work shows the MFC point moves
-   around the shoe with speed and surface. Logging it is both clinically meaningful
-   and an independent check on the binding.
+   (b) foot speed within the upper quartile for that swing, which eliminates
+   spurious events immediately after foot-off; (c) the rear of the sole is not
+   lower, which prevents false detections at the heel. A swing with no such
+   minimum is a non-MTC cycle and gives NaN; the count is in the summary.
+3. **Which vertex was lowest**, and whether it is on the toe cap, are recorded
+   (`mfc_vertex`, `mfc_on_toes`). Schulz's own work shows the MFC point moves
+   around the shoe with speed and surface.
 
 Where more than one candidate satisfies the criteria, Schulz uses the smaller
 value; the count of local minima per swing is also retained, since he raises
@@ -536,10 +611,11 @@ whether multiple minima themselves indicate risk.
 
 ### Limitation, stated up front
 
-The mesh is a rigid body driven by the foot segment, so it cannot represent MTP
-dorsiflexion. That deformation occurs in late stance, not mid-swing, so it does not
-contaminate MFC — but it does mean late-swing heel clearance near contact is
-approximate.
+The boot bends at one hinge (the MTP, by Theia's toe angle); the rest of the sole
+is rigid with the foot. A rigid toe cap went 30–40 mm through the belt at every
+push-off; with the hinge, the deepest stance penetration on the synthetic trial
+is 3–4 mm. What remains below the belt surface is pose error, and it is counted
+(`mfc_below_belt_pct`).
 
 ### Healthy values
 
@@ -562,11 +638,20 @@ distribution, not just central tendency.
 
 ---
 
-## 7. Local dynamic stability — already implemented
+## 7. Local dynamic stability
 
-Documented in the header of the `%% Local dynamic stability` cell in
-`Spatiotemporal_analysis_v3.py`, and validated in `lds_validation.py`. Summarised
-here only for how it relates to the rest:
+`gait/lds.py`, following Bruijn's LocalDynamicStability toolbox: 150 strides
+time-normalised to 100 samples each, delay-embedded (τ = 10, dE = 5), Rosenstein
+divergence over 10 strides, λ_S fitted over 0–0.5 stride and λ_L over 4–10.
+Validated in `lds_validation.py`, which now runs the shipped divergence code:
+Lorenz −3%, Rössler −15% of their known exponents, and a periodic signal gives
+λ_L ≈ 0 with a λ_S noise floor of 0.2–0.45 per stride.
+
+Two additions: a long trial holds several **windows** of 150 strides (up to 4),
+each gets its own λ and the trial value is their mean; and the curve is kept per
+reference stride so strides can be **bootstrapped** in blocks (§0.4). The
+interval says how much λ depends on which strides happened to be walked, not the
+estimator's own bias. How it relates to the rest:
 
 - **Lyapunov λ** measures how fast nearby trajectories diverge, assuming nothing
   about periodicity. Continuous, local, model-free.
@@ -593,11 +678,19 @@ setting because the goal — maintain belt speed — is unambiguous.
 
 **Mathematics.** With stride length $L$ and stride time $T$, the goal is constant
 speed $v^* = L/T$. The goal-equivalent manifold is the set of $(L, T)$ satisfying
-$L = v^* T$. Each stride's deviation is decomposed into a component **tangent** to
-the manifold (goal-irrelevant, $\delta_\parallel$) and **perpendicular** to it
-(goal-relevant, $\delta_\perp$). Variability is reported separately for each, along
-with the lag-1 autocorrelation of each, which indexes how strongly the controller
-corrects that component.
+$L = v^* T$. $T$ and $L$ are first divided by their means, so both axes are
+dimensionless and the manifold is the 45° line — rotating seconds and metres
+together would make the split depend on the units. Each stride's deviation is
+then decomposed into a component **along** the manifold (goal-equivalent,
+$\delta_\parallel$) and **across** it (goal-relevant, $\delta_\perp$). Each is
+reported as an SD (% of the mean stride, with a block bootstrap CI), a lag-1
+autocorrelation, and a DFA α with its interval.
+
+**Stride length on a treadmill** is how far the foot travelled over the belt:
+belt speed × stride time + how much further forward it landed than last time
+[Dingwell et al. 2010 ✔]. Two heel-to-heel step lengths do **not** add up to
+it: at the other foot's heel strike this heel has already lifted, which adds
+30–50 mm to each step (100 mm per stride on the synthetic trial).
 
 **What the value means.** Strong correction of $\delta_\perp$ with weak correction
 of $\delta_\parallel$ is the signature of a controller exploiting redundancy
@@ -616,7 +709,10 @@ velocity at midstance:
 
 $$z_{\text{foot}} = \beta_0 + \beta_1 z_{CoM} + \beta_2 \dot{z}_{CoM} + \varepsilon$$
 
-The **$R^2$ is the measure**. Coefficients $\beta_1, \beta_2$ describe the gain.
+The **$R^2$ is the measure**, per limb, with a block bootstrap CI. Coefficients
+$\beta_1, \beta_2$ describe the gain. Everything is across the walking direction
+and relative to the stance ankle, so a slow drift across the belt cannot appear
+on both sides of the regression; the CoM is the system CoM.
 
 **Healthy values.** [Wang & Srinivasan 2014 ✔] report that a linear function of hip
 position and velocity at midstance explains **over 80%** of next lateral foot
@@ -633,9 +729,13 @@ segmentation is worth inspecting.
 
 **Mathematics.** With unbiased autocorrelation $A_d$ at lag $d$:
 
-- $A_{d1}$ = coefficient at the **one-step** lag → step regularity
-- $A_{d2}$ = coefficient at the **one-stride** lag → stride regularity
+- $A_{d1}$ = the autocorrelation **peak** near one step → step regularity
+- $A_{d2}$ = the peak near one stride → stride regularity
 - symmetry = $A_{d1}/A_{d2}$
+
+The peaks are searched within ±25% of the median step and stride. Reading the
+value at a fixed lag misses the peak whenever the stride drifts: 6% off, a
+perfectly regular signal reads 0.94 instead of 1.
 
 **What the value means.** Coefficients near 1 mean each step/stride closely repeats
 the last. A symmetry ratio near 1 means the two steps of a stride are equivalent.
@@ -674,6 +774,44 @@ healthy adults; reduced in neurological impairment ~.
 the belt, the walk ratio is largely determined by the protocol rather than the
 walker. Report it, but do not interpret it as a free control variable here.
 
+### 8.6 Kinetics and CoM work
+
+`gait/kinetics.py`, per stance, **only where both its heel strike and toe-off
+were trusted GRF events of the same belt contact** — one boot on that belt, the
+other off it, the CoP under the boot (see the gait events section of the
+README). The event record names the belt, so a clean crossover step is read from
+the belt it landed on. Anything else carries two feet's force and is left NaN.
+
+- **Impulses**: braking and propulsive (the AP force along the walking
+  direction, split by sign) and vertical; BW·s.
+- **Peaks**: F1, trough, F2, peak braking and propulsive force; BW.
+- **Loading rate**: least-squares slope of the vertical force between 20% and
+  80% of F1; BW/s.
+- **CoP range** along and across the walking direction (15 Hz), **free moment**
+  peak |T_z|.
+- **CoM work, individual limbs method** [Donelan, Kram & Kuo 2002 ~]: each
+  leg's GRF · system CoM velocity (belt frame, so the stance foot is still as
+  in overground walking), integrated over collision (heel strike → other
+  toe-off, negative), rebound and preload (single support, positive and
+  negative) and push-off (other heel strike → toe-off, positive). J and J/kg of
+  system mass. Load carriage raises push-off and collision work, which is the
+  metabolic cost of step-to-step transitions.
+
+Forces are the GRF on the body in Theia's axes: the plate's rotation from its
+fitted corners, then the lab → Theia registration, with the sign that makes the
+vertical force hold the walker up. The horizontal axes are checked against the
+marker CoM acceleration (0.5–5 Hz correlation, in the summary); a strongly
+negative one is flipped and reported. Normalised per body weight (`_bw`) and per
+total weight (`_tw`): load raises the first; the second shows whether the
+pattern changed beyond carrying more.
+
+### 8.7 Posture and joint motion
+
+`gait/kinematics.py`: per stride, mean and range of the thorax segment angle
+(trunk lean, the main postural response to a load), the pelvis segment angle,
+and the range of motion of the hip, knee and ankle (first, sagittal component).
+Time-normalised waveforms of these and of the GRF go to `{trial}_waveforms.npz`.
+
 ---
 
 ## 9. Shared construction: one stride series for every metric
@@ -688,10 +826,10 @@ Without this, α computed on 798 strides would be compared against λ computed o
 
 | Decision | Value | Why |
 |---|---|---|
-| Warm-up excluded | 60 s | Matches `lds_warmup_s`; removes treadmill acclimatisation. |
-| Limb | right heel strikes define strides | Matches `lds_limb`. |
-| Gap handling | runs of NaN > 5 frames reject the window | Matches `lds_max_gap_frames`. |
-| Series length | stated per metric, identical across conditions | λ, α and entropy are all N-dependent. |
+| Warm-up excluded | 60 s after the first event (`WARMUP_S`) | The belt ramp and acclimatisation; applies to every summary value. |
+| Limb | each limb's own strides, both reported | Series for DFA, entropy, GEM and foot placement are per limb; the trunk measures and LDS use the right limb's strides (`LIMB_FOR_TRUNK`). |
+| Gap handling | a series under 95% complete is not used | DFA and entropy both accept a gappy array and return a number. |
+| Series length | the shortest trial's, for every trial (`SERIES_LENGTH`) | λ, α and entropy are all N-dependent; the N used is in every row. |
 
 ---
 
@@ -707,10 +845,18 @@ them are used to compare conditions.
 | SampEn | sine (regular), white noise (maximal), logistic map | ordering and direction correct |
 | MSE | white vs 1/f noise | white falls with scale, 1/f stays flat |
 | Harmonic ratio | synthetic 2-per-stride waveform with imposed asymmetry | HR falls monotonically with asymmetry |
-| MoS / MoI | analytic inverted pendulum with known $x_{CoM}$ | closed-form agreement |
-| MFC | mesh translated to a known height | recovers the imposed clearance |
+| MoS / MoI / TRI | analytic inverted pendulum with known $x_{CoM}$; a constructed swing | exact |
+| CoM fusion | known trajectory, noisy markers, offset force | beats markers alone, unbiased below 0.5 Hz |
+| DFA interval | fGn at N = 486 | covers the truth ~95% |
+| Block bootstrap | persistent AR(1) | ~95% coverage, where single-stride resampling gives ~66% |
+| Regularity, GEM, foot placement, symmetry | constructed signals | exact |
 
-`lds_validation.py` found λ to be off by a system-dependent 4–19%, with no fit
-window fixing both test systems at once. That result is the reason for this step:
-each estimator's bias should be known before differences between conditions are
+End to end, `test_gait_analysis.py` runs detection and the whole analysis on a
+synthetic trial with a known load, CoM, belt, clearance and forces, and checks
+the load, CoM, velocity, stance timing (−0.1 ± 0.4 ms), step width, MFC,
+margins and the kinetic balances against the truth.
+
+`lds_validation.py` finds λ off by a system-dependent 3–15%, with no fit window
+fixing both test systems at once. That result is the reason for this step: each
+estimator's bias should be known before differences between conditions are
 interpreted.

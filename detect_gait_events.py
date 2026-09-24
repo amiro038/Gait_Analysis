@@ -48,6 +48,7 @@ Per trial, in OUTPUT_FOLDER:
 import csv
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +96,13 @@ FORCE_FILTER_HZ = 50.0
 FORCE_THRESHOLD_N = 20.0       # above each belt's own baseline
 BASELINE_WINDOW_S = 10.0       # the baseline is re-measured this often
 MERGE_GAP_S = 0.030            # dips shorter than this do not split a contact
+# The zero-lag filter spreads a steep landing over a few ms, so the filtered
+# force crosses the threshold ~1-2 ms before the foot lands (and after it
+# leaves). Each edge is then placed where the RAW force crosses, searched
+# within this of the filtered crossing and held for EDGE_HOLD samples so a
+# noise spike cannot trigger it
+EDGE_SEARCH_S = 0.015
+EDGE_HOLD = 5
 MIN_CONTACT_S = 0.080          # contacts shorter than this are dropped
 SHAPE_LEVEL_N = 200.0          # a real landing reaches this within ...
 MAX_LOADING_S = 0.060          # ... this (D05: 10-36 ms)
@@ -132,6 +140,12 @@ COP_MIN_INSIDE = 0.90          # share of the contact the CoP must be under it
 KINEMATIC_FILTER_HZ = 10.0
 MAX_GAP_FILL_FRAMES = 10       # tracking gaps bridged before filtering
 MIN_CALIBRATION_EVENTS = 10    # fewer on one limb: pool both limbs
+# A Zeni event is a real swing of the foot past the pelvis, not a wobble of
+# a foot standing still: its peak must stand this far above the lowest
+# point within ZENI_WINDOW_S on each side (walking: ~0.3 m; the quiet
+# standing that opens a trial: a few mm of tracking noise)
+ZENI_MIN_PROMINENCE_M = 0.05
+ZENI_WINDOW_S = 0.6
 INTERPOLATE_MISSING = True     # last resort, between two trusted events only
 
 # Output
@@ -443,9 +457,11 @@ def find_contacts(fz, belt):
         else:
             merged.append([s, e])
     contacts = []
+    raw = fz - base
     for s, e in merged:
         if e - s < MIN_CONTACT_S * GRF_RATE:
             continue
+        s, e = raw_edge(raw, s, rising=True), raw_edge(raw, e, rising=False)
         high = np.flatnonzero(force[s:e] > SHAPE_LEVEL_N)
         contacts.append(dict(
             belt=belt, start=int(s), stop=int(e),
@@ -455,6 +471,22 @@ def find_contacts(fz, belt):
             unloading_s=(e - s - high[-1] if len(high) else e - s) / GRF_RATE))
     return contacts, force, dict(baseline_n=float(np.median(base)),
                                  noise_n=noise)
+
+
+def raw_edge(raw, i, rising):
+    """Where the raw force (above baseline) crosses the threshold for good
+    near the filtered crossing i: the first sample of EDGE_HOLD above it
+    (landing), or of EDGE_HOLD at or below it (leaving). i if none."""
+    w = int(EDGE_SEARCH_S * GRF_RATE)
+    if i <= 0 or i >= len(raw):
+        return i
+    lo, hi = max(i - w, 0), min(i + w, len(raw) - EDGE_HOLD)
+    above = raw > FORCE_THRESHOLD_N
+    for j in range(lo, hi):
+        if (above[j:j + EDGE_HOLD].all() if rising
+                else not above[j:j + EDGE_HOLD].any()):
+            return j
+    return i
 
 
 # %% ==========================================================================
@@ -797,7 +829,14 @@ def peaks_between(x, lo, hi):
     with np.errstate(divide="ignore", invalid="ignore"):
         shift = np.where(curve < 0, 0.5 * (left[idx] - right[idx]) / curve, 0)
     t = i0 + idx + np.clip(shift, -0.5, 0.5)
-    t = t[np.isfinite(t)]
+    w = int(ZENI_WINDOW_S * KINEMATIC_RATE)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        prominence = np.array([
+            x[i] - max(np.nanmin(x[max(i - w, 0):i]),
+                       np.nanmin(x[i + 1:i + w + 1]))
+            for i in i0 + idx])
+    t = t[np.isfinite(t) & (prominence >= ZENI_MIN_PROMINENCE_M)]
     return t[(t > lo) & (t < hi)]
 
 
