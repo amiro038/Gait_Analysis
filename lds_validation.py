@@ -6,17 +6,17 @@ Created on Wed Sep 17 2026
 """
 
 ###############################################################################
-# Checks that sit alongside gait/lds.py but are not part of a per trial run.
+# Checks that sit alongside gait_analysis.py §18 but are not part of a per trial run.
 #
 # Part 1  does the Rosenstein implementation recover known exponents?
-#         Run this once after changing gait/lds.py. It does not touch your
-#         data. The divergence is gait.lds.divergence itself -- the shipped
+#         Run this once after changing gait_analysis.py §18. It does not touch your
+#         data. The divergence is gait_analysis.divergence itself -- the shipped
 #         code, not a copy of it.
 # Part 2  AMI and FNN, the estimators for picking tau and dE. These belong in
 #         the dataset level parameter script, not in a per trial analysis: tau
 #         and dE have to be FIXED across every trial you compare, so run these
-#         over the whole dataset, take the median, and set TAU and DE in
-#         gait/lds.py.
+#         over the whole dataset, take the median, and set LDS_TAU and LDS_DE
+#         in gait_analysis.py.
 ###############################################################################
 
 import sys
@@ -28,17 +28,17 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gait import lds  # noqa: E402
+import gait_analysis as ga  # noqa: E402
 
 # =============================================================================
 # %% shared: divergence curve, from the shipped code
 # =============================================================================
 
 def divergence_curve(Y, theiler, n_lags, seed=0):
-    """Rosenstein mean log divergence (gait.lds.divergence), and the mean log
+    """Rosenstein mean log divergence (gait_analysis.divergence), and the mean log
     distance between far-apart points: the attractor's size."""
     rng = np.random.default_rng(seed)
-    sums, counts = lds.divergence(Y, theiler, n_lags + 1)
+    sums, counts = ga.divergence(Y, theiler, n_lags + 1)
     curve = sums.sum(0) / counts.sum(0)
     M = len(Y)
     p1, p2 = rng.integers(0, M, 20000), rng.integers(0, M, 20000)
@@ -138,12 +138,12 @@ if (val_results['verdict'] == 'CHECK PIPELINE').any():
 
 # --- what does the pipeline return when there is NO divergence at all? --------
 # A periodic signal has lambda = 0. Run it through the gait analysis itself
-# (gait.lds.window_lambda: the same normalisation, embedding, stride count,
+# (gait_analysis.window_lambda: the same normalisation, embedding, stride count,
 # fit windows and stride bootstrap) and whatever comes back is the noise
 # floor: it is entirely the neighbour selection transient. Compare it against
 # your real lambda_S, it is not small.
 
-val_sps, val_strides = lds.SAMPLES_PER_STRIDE, lds.N_STRIDES
+val_sps, val_strides = ga.LDS_SAMPLES_PER_STRIDE, ga.LDS_N_STRIDES
 val_hs = np.arange(val_strides + 1) * 110.0          # 1.1 s strides at 100 Hz
 val_t = np.arange(int(val_hs[-1]) + 1) / 110.0        # in strides
 val_clean = np.sin(2 * np.pi * val_t) + 0.3 * np.sin(4 * np.pi * val_t)
@@ -153,7 +153,7 @@ print("\n Noise floor at the gait settings (true lambda = 0):")
 for val_noise in (0.001, 0.01, 0.05):
     val_x = val_clean + val_rng.normal(0, val_noise * np.std(val_clean),
                                        len(val_clean))
-    val_r = lds.window_lambda(val_x[:, None], val_hs, lds.DE, "none")
+    val_r = ga.window_lambda(val_x[:, None], val_hs, ga.LDS_DE, "none")
     val_lo, val_hi = np.percentile(val_r["reps_S"], [2.5, 97.5])
     print(f"   {val_noise*100:4g}% noise: lambda_S = {val_r['lambda_S']:.4f} "
           f"[{val_lo:.4f}, {val_hi:.4f}] per stride, lambda_L = "
@@ -162,8 +162,8 @@ for val_noise in (0.001, 0.01, 0.05):
 # =============================================================================
 # %% Part 2: AMI and FNN, for the dataset level tau / dE script
 # =============================================================================
-# Run these over EVERY trial, take the median, then set TAU and DE in
-# gait/lds.py. Do not fit them per trial.
+# Run these over EVERY trial, take the median, then set LDS_TAU and LDS_DE in
+# gait_analysis.py §18. Do not fit them per trial.
 #
 # IMPORTANT: tau comes out in samples of whatever series you feed in. The main
 # script analyses time normalised strides, so feed these the SAME time

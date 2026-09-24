@@ -1,4 +1,4 @@
-"""End-to-end test for run_gait_analysis.py on a synthetic trial.
+"""End-to-end test for gait_analysis.py on a synthetic trial.
 
 synthetic_trial.py writes a trial whose answers are known: a walker of 80 kg
 carrying a 20 kg load 150 mm behind the trunk, a quiet standing to start, a
@@ -31,9 +31,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import detect_gait_events as dg  # noqa: E402
 import synthetic_trial as syn  # noqa: E402
-import run_gait_analysis as rga  # noqa: E402
-from gait import lds, trial as gt, variability as var  # noqa: E402
-from gait.trial import G  # noqa: E402
+import gait_analysis as ga  # noqa: E402
+G = ga.G
 
 WORK = Path(tempfile.mkdtemp(prefix="gait_analysis_test_"))
 truth = syn.make_trial(WORK, duration=200.0, special=False)
@@ -48,15 +47,15 @@ dg.process_trial(truth["force_dir"] / f"{name}.csv", boots, pose_names,
                  plates, verbose=False)
 
 # a short trial, so shorter windows than a real one would use
-gt.WARMUP_S = 10.0
-lds.N_STRIDES = 50
-var.DFA_MIN_BOX = 8
-rga.FOLDERS = dict(force=truth["force_dir"], kinematic=truth["kin_dir"],
+ga.WARMUP_S = 10.0
+ga.LDS_N_STRIDES = 50
+ga.DFA_MIN_BOX = 8
+ga.FOLDERS = dict(force=truth["force_dir"], kinematic=truth["kin_dir"],
                    events=WORK / "events", binding=binding,
                    plates=truth["plates"])
-rga.OUTPUT_FOLDER = WORK / "analysis"
-people = rga.read_participants(WORK / "participants.csv")
-t, table = rga.analyse(name, people["S01"], None)
+ga.OUTPUT_FOLDER = WORK / "analysis"
+people = ga.read_participants(WORK / "participants.csv")
+t, table = ga.analyse_trial(name, people["S01"], None)
 
 failures = []
 
@@ -112,7 +111,7 @@ def true_stance(st, limb=None):
 stance_err, width_err = [], []
 for st in s.itertuples():
     mine = true_stance(st)
-    other = [x for x in truth["stances"][gt.OTHER[st.limb]]
+    other = [x for x in truth["stances"][ga.OTHER[st.limb]]
              if x["hs"] * 100 < st.hs][-1]
     stance_err.append(st.stance_s - (mine["to"] - mine["hs"]))
     width_err.append(st.step_width_m - abs(mine["x"] - other["x"]))
@@ -145,7 +144,7 @@ for st in s.itertuples():
     if not np.isfinite(st.mos_ml_contact):
         continue
     r = int(np.ceil(st.hs))
-    o = gt.OTHER[st.limb]
+    o = ga.OTHER[st.limb]
     side = np.sign((t.ankle[st.limb][r, :2] - t.ankle[o][r, :2]) @ t.lateral)
     edge = (t.boots.ext[st.limb]["lat_max"][r] if side > 0
             else -t.boots.ext[st.limb]["lat_min"][r])
@@ -209,10 +208,10 @@ files = [f"{name}_{x}" for x in ("steps.csv", "summary.csv", "waveforms.npz",
                                  "lds_windows.csv", "qa.png",
                                  "variability.png")]
 check(all((out / f).exists() for f in files), "all the per-trial files")
-built = rga.tables.build(out)
+built = ga.build_tables(out)
 wide = pd.read_csv(out / "all_trials_metrics.csv")
 dictionary = pd.read_csv(out / "metric_dictionary.csv")
-missing = [c for c in rga.tables.KEY if c not in wide]
+missing = [c for c in ga.KEY_METRICS if c not in wide]
 check(len(wide) == 1 and not missing
       and set(dictionary["column"]) == set(wide.columns[3:])
       and dictionary["methods_section"].notna().all(),

@@ -608,7 +608,7 @@ history is inspectable without digging through git.
 
 One self-contained script, numpy and scipy only. It writes
 `{trial}_merged_events.csv` (four columns: event, limb, frame, source) and the
-`_event_qa.csv` that `run_gait_analysis.py` reads. Its CONFIG cell holds the data
+`_event_qa.csv` that `gait_analysis.py` reads. Its CONFIG cell holds the data
 paths for both scripts; set them and press F5, or:
 
 ```bash
@@ -694,47 +694,59 @@ mocap lab frame, set `LAB_TO_THEIA = "identity"`.
 benchmarks seven fallback variables against the trusted GRF events, which is
 how Zeni was chosen. To rerun it, put it back beside `apply_binding.py`.
 
-## Gait analysis — `run_gait_analysis.py` and `gait/`
+## Gait analysis — `gait_analysis.py`
 
-Step 2, after the events. The paths come from `detect_gait_events.py`; the
-participant table is `participants.csv` (body mass without the carried load,
-leg length, height). Press F5, or:
+Step 2, after the events. **One flat script**, commented throughout, that goes
+with the Word document **`docs/Gait_Analysis_Methods.docx`**. Every section of
+the script is headed with the section of the document that explains it
+(`# %% §10  MARGIN OF STABILITY  (Word document §10, Fig. 17)`), and they run
+in the same order, so the two can be read side by side. The document gives,
+for every step, the equations, the exact steps, why each step and each choice
+is needed, a figure, and the range of values a healthy population shows.
+
+The paths come from `detect_gait_events.py`; the participant table is
+`participants.csv` (body mass without the carried load, leg length, height).
+Press F5, or:
 
 ```bash
-python run_gait_analysis.py                        # every trial with events
-python run_gait_analysis.py "D05_C1_Treadmill_1.3mpers 108bpm"
+python gait_analysis.py                            # every trial with events
+python gait_analysis.py "D05_C1_Treadmill_1.3mpers 108bpm"
+python gait_analysis.py --tables                   # only rebuild the tables
 python test_gait_analysis.py                       # synthetic end-to-end check
 python gait_metrics_validation.py                  # every estimator vs a known answer
 python lds_validation.py                           # Rosenstein vs Lorenz / Rossler
 ```
 
-One module per metric family, each with its method in its header:
-
-| module | what |
+| section | what |
 |---|---|
-| `gait/trial.py` | loads a trial: events → steps, the belt's speed and direction, the posed boot soles, the forces in Theia's axes, the load from the opening quiet standing, the system CoM, the fused CoM velocity |
-| `gait/spatiotemporal.py` | times (sub-frame), percentages of the stride, step length / width, stride length over the belt |
-| `gait/stability.py` | margin of stability, MFC, margin of instability, trip risk integral |
-| `gait/kinetics.py` | impulses, peaks, loading rate, CoP, free moment, individual-limb CoM work — trusted stances only |
-| `gait/kinematics.py` | trunk lean, pelvis tilt, joint ranges of motion |
-| `gait/variability.py` | DFA, sample entropy, multiscale entropy, harmonic ratio, regularity, GEM, foot placement, symmetry |
-| `gait/lds.py` | local dynamic stability, with windows and a stride bootstrap |
-| `gait/uncertainty.py` | block bootstrap (Politis–White block length), DFA parametric bootstrap |
-| `gait/summary.py`, `gait/tables.py`, `gait/figures.py` | the results in long form, as one row per trial, and the QA figures |
+| §0 | every setting, each tagged with the section that uses it |
+| §5 | preparing a trial: events → steps, the belt's speed and direction, the posed boot soles, the forces in Theia's axes, the load from the opening quiet standing, the system CoM, the fused CoM velocity |
+| §6–§11 | per step: spatiotemporal, posture, kinetics, CoM work, margin of stability, foot clearance and trip risk |
+| §12–§18 | per trial: confidence intervals, summary statistics and symmetry, DFA, entropy, trunk harmonic ratio and regularity, GEM and foot placement, local dynamic stability |
+| §19 | the results tables (with the healthy reference ranges) and the per-trial figures |
+
+**The methods document** is built from `docs/methods/*.md` (text and LaTeX
+equations) by `python docs/methods/build_methods_doc.py` (needs
+`pip install pypandoc_binary python-docx`; LibreOffice, if installed, fills in
+the table of contents). Its figures come from `python docs/make_methods_figures.py`,
+which runs the real functions on a synthetic trial. Its tables of settings,
+healthy ranges and code sections are generated from the scripts, so they
+always match the code.
 
 **The results**, in `gait_analysis_outputs/`, one row per trial and one column
 per metric (every trial analysed into that folder, earlier runs included;
-`python run_gait_analysis.py --tables` rebuilds them without re-analysing):
+`python gait_analysis.py --tables` rebuilds them without re-analysing):
 
 - `all_trials_metrics.xlsx` — a **Key metrics** sheet, one sheet per family
   (Trial, Spatiotemporal, Stability, Kinetics, CoM work, Posture, Symmetry,
-  DFA, Entropy, Trunk, Control, LDS), the **95% CI** sheet and a
-  **Dictionary**. Row 1 of each sheet describes the column with its unit, row 2
-  is the column name;
+  DFA, Entropy, Trunk, Control, LDS), a **Healthy ranges** sheet (each trial
+  coloured green inside / orange outside the healthy range), the **95% CI**
+  sheet and a **Dictionary**. Row 1 of each sheet describes the column with
+  its unit, row 2 is the column name;
 - `all_trials_metrics.csv` and `all_trials_metrics_ci.csv` — the same values
   and their 95% confidence limits (`<column>_lo`, `<column>_hi`);
-- `metric_dictionary.csv` — what every column is, its unit, and the section of
-  `METHODS.md` that defines it.
+- `metric_dictionary.csv` — what every column is, its unit, the section of the
+  methods document that defines it, and its healthy range and source.
 
 Column names: `step_width_m` is the mean over all steady steps, `_sd` / `_cv`
 the SD and CV, `_L` / `_R` each foot. `all_trials_summary.csv` has the same
@@ -772,8 +784,3 @@ with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
   windows with a stride bootstrap; every trial's series cut to the same length;
 - GEM on dimensionless stride time and length; regularity from the
   autocorrelation peaks; multiscale entropy to 30 scales.
-
-**`METHODS.md`** is the full methods document: equipment, boots, event
-detection, trial preparation (load, system CoM, velocity), and for every metric
-its definition, equations, parameters, output columns and interpretation, with
-the uncertainty methods, the tables, the validation and all parameters.

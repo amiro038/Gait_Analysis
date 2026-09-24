@@ -3,7 +3,7 @@
 Validation of the gait/ metrics on signals whose answers are known.
 
 Before a number is used to compare conditions, establish what it does when
-the answer is known. Every section imports the SHIPPED function from gait/
+the answer is known. Every section imports the SHIPPED function from gait_analysis.py
 and runs it on a constructed signal: the CoM velocity fusion, the margin of
 stability, MFC and the trip risk integral, DFA and its confidence interval,
 the block bootstrap, entropy, the harmonic ratio, regularity, the goal-
@@ -24,8 +24,8 @@ import pandas as pd
 from scipy.signal import butter, filtfilt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gait import stability, uncertainty as unc, variability as var  # noqa: E402
-from gait.trial import complementary  # noqa: E402
+import gait_analysis as ga  # noqa: E402
+from gait_analysis import complementary  # noqa: E402
 
 RESULTS = {}
 
@@ -94,7 +94,7 @@ def validate_com_fusion(fs=100.0, seed=0):
 #  Margin of stability
 # ============================================================================
 # One stance with a known CoM state, pendulum and lateral boot edge, so the
-# margin is worked out by hand and compared with stability.margin_of_stability.
+# margin is worked out by hand and compared with ga.margin_of_ga.
 # The other foot is a step length BEHIND, so a lateral direction that picked
 # up an AP component would show.
 
@@ -125,7 +125,7 @@ def validate_margin_of_stability(edge=0.14, ankle_ml=0.10, v_ml=0.30,
     t = fake_trial(n, [dict(limb="R", hs=100.0, to=160.0, contra_to=110.0,
                             contra_hs=150.0, next_hs=210.0)],
                    ankle, com, vel, ext)
-    s = stability.margin_of_stability(t).iloc[0]
+    s = ga.margin_of_stability(t).iloc[0]
     print(f"  shipped: MoS_ML = {s.mos_ml_contact:.5f} m, pendulum "
           f"{s.pendulum_m:.5f} m, ankle-boundary margin "
           f"{s.mos_ml_contact_ankle:.5f} (expected {ankle_ml - v_ml / w0:.5f})")
@@ -164,7 +164,7 @@ def trip_scenario(mfc=0.018, base=0.060, moi_mm=12.0, length=1.0,
         com=np.tile([0.0, 0.0, z], (n, 1)),
         ankle={"L": np.tile([-0.1, 0.0, 0.0], (n, 1))},
         com_vel_belt=np.tile([0.0, (0.30 + moi_mm / 1000) * w0, 0.0], (n, 1)))
-    return stability.swing_clearance(t, "R", "L", np.arange(n)), W, clear
+    return ga.swing_clearance(t, "R", "L", np.arange(n)), W, clear
 
 
 def validate_trip_risk(moi_mm=12.0):
@@ -204,20 +204,20 @@ def validate_dfa(lengths=(486, 756), hursts=(0.5, 0.7, 0.9), reps=60,
     for n in lengths:
         line = f"  N={n}  "
         for h in hursts:
-            a = [var.dfa_alpha(unc.fractional_gaussian_noise(n, h, rng))
+            a = [ga.dfa_alpha(ga.fractional_gaussian_noise(n, h, rng))
                  for _ in range(reps)]
             worst = max(worst, abs(np.mean(a) - h))
             line += f"H={h}: {np.mean(a):.3f}+-{np.std(a):.3f}   "
         print(line)
-    x = unc.fractional_gaussian_noise(756, 0.9, rng)
-    shuffled = np.mean([var.dfa_alpha(rng.permutation(x)) for _ in range(40)])
+    x = ga.fractional_gaussian_noise(756, 0.9, rng)
+    shuffled = np.mean([ga.dfa_alpha(rng.permutation(x)) for _ in range(40)])
     print(f"  shuffled H=0.9 series: alpha {shuffled:.3f} (must be 0.5)")
 
     h, n = 0.75, 486
     hits, widths = 0, []
     for k in range(coverage_trials):
-        a = var.dfa_alpha(unc.fractional_gaussian_noise(n, h, rng))
-        lo, hi, _, _ = unc.dfa_interval(a, n, var.dfa_alpha, n_boot=100,
+        a = ga.dfa_alpha(ga.fractional_gaussian_noise(n, h, rng))
+        lo, hi, _, _ = ga.dfa_interval(a, n, n_boot=100,
                                         tag=f"cov{k}")
         hits += lo <= h <= hi
         widths.append(hi - lo)
@@ -251,13 +251,13 @@ def validate_block_bootstrap(phi=0.6, n=400, trials=200, seed=1):
         for i in range(1, n + 100):
             x[i] = phi * x[i - 1] + e[i]
         x = x[100:]
-        r = unc.series_summary(x, ("mean",), n_boot=500, tag=f"b{k}")["mean"]
+        r = ga.series_summary(x, ("mean",), n_boot=500, tag=f"b{k}")["mean"]
         hit_block += r["ci_low"] <= 0 <= r["ci_high"]
         blocks.append(r["block"])
-        idx = unc.block_indices(n, 1, 500, unc.rng_for(f"i{k}"))
-        lo, hi = unc.percentile_ci(x[idx].mean(1))
+        idx = ga.block_indices(n, 1, 500, ga.rng_for(f"i{k}"))
+        lo, hi = ga.percentile_ci(x[idx].mean(1))
         hit_iid += lo <= 0 <= hi
-    white = unc.optimal_block_length(rng.normal(size=n))
+    white = ga.optimal_block_length(rng.normal(size=n))
     print(f"  AR(1) phi={phi}, N={n}: block length {np.median(blocks):.0f} "
           f"(white noise: {white})")
     print(f"  95% interval covers the true mean: blocks "
@@ -282,7 +282,7 @@ def validate_entropy(seed=0):
     worst = 0.0
     for r in (0.15, 0.20, 0.25):
         exact = -np.log(2 * norm.cdf(r / np.sqrt(2)) - 1)
-        got = np.mean([var.sample_entropy(rng.normal(size=5000), 2, r)
+        got = np.mean([ga.sample_entropy(rng.normal(size=5000), 2, r)
                        for _ in range(8)])
         worst = max(worst, abs(got - exact))
         print(f"  r={r:.2f}: exact {exact:.4f}, measured {got:.4f}")
@@ -292,7 +292,7 @@ def validate_entropy(seed=0):
     for _ in range(n + 1000):
         x = 4 * x * (1 - x)
         logistic.append(x)
-    e = [var.sample_entropy(s) for s in
+    e = [ga.sample_entropy(s) for s in
          (sine, np.array(logistic[1000:]), rng.normal(size=n))]
     print(f"  sine {e[0]:.3f} < logistic {e[1]:.3f} < white {e[2]:.3f}")
 
@@ -301,7 +301,7 @@ def validate_entropy(seed=0):
         f[0] = f[1]
         return np.fft.irfft((rng.normal(size=len(f))
                              + 1j * rng.normal(size=len(f))) / np.sqrt(f), n)
-    cw, cp = var.rcmse(rng.normal(size=12000), 10), var.rcmse(pink(12000), 10)
+    cw, cp = ga.rcmse(rng.normal(size=12000), 10), ga.rcmse(pink(12000), 10)
     print(f"  RCMSE white {cw[0]:.2f} -> {cw[-1]:.2f}, 1/f {cp[0]:.2f} -> "
           f"{cp[-1]:.2f}")
     verdict("entropy", worst < 0.02 and e[0] < e[1] < e[2]
@@ -321,17 +321,17 @@ def validate_harmonic_ratio(n=110):
     t = np.arange(n) / n
     exact = True
     for a1 in (0.05, 0.25, 1.0):
-        hr, ihr = var.harmonic_ratio(var.harmonics(
+        hr, ihr = ga.harmonic_ratio(ga.harmonics(
             np.sin(4 * np.pi * t) + a1 * np.sin(2 * np.pi * t)))
         exact &= abs(hr - 1 / a1) < 1e-9 and \
             abs(ihr - 100 / (1 + a1 ** 2)) < 1e-9
         print(f"  A1={a1}: HR {hr:.4f} (exact {1 / a1:.4f}), iHR {ihr:.2f}%")
-    amp = var.harmonics(np.sin(4 * np.pi * t) + 0.25 * np.sin(2 * np.pi * t))
-    inv = var.harmonic_ratio(amp)[0] * var.harmonic_ratio(amp, True)[0]
+    amp = ga.harmonics(np.sin(4 * np.pi * t) + 0.25 * np.sin(2 * np.pi * t))
+    inv = ga.harmonic_ratio(amp)[0] * ga.harmonic_ratio(amp, True)[0]
     vel = np.cos(4 * np.pi * t) / 2 + 0.25 * np.cos(2 * np.pi * t)
     acc = -np.sin(4 * np.pi * t) * 2 * np.pi - 0.25 * np.sin(2 * np.pi * t) * 2 * np.pi
-    spec = var.harmonic_ratio(var.harmonics(vel, power=1))[0]
-    direct = var.harmonic_ratio(var.harmonics(acc))[0]
+    spec = ga.harmonic_ratio(ga.harmonics(vel, power=1))[0]
+    direct = ga.harmonic_ratio(ga.harmonics(acc))[0]
     print(f"  ML convention inverts: product {inv:.9f}; from velocity with "
           f"k-weighting {spec:.6f} vs from acceleration {direct:.6f}")
     verdict("hr", exact and abs(inv - 1) < 1e-9 and abs(spec - direct) < 1e-9,
@@ -350,9 +350,9 @@ def validate_supplementary(seed=0):
     period, assumed = 116.6, 110
     t = np.arange(4000)
     sym = np.sin(4 * np.pi * t / period)
-    reg = var.regularity(var.unbiased_autocorr(sym, 200), assumed)
-    fixed = var.unbiased_autocorr(sym, 200)[assumed // 2]
-    asym = var.regularity(var.unbiased_autocorr(
+    reg = ga.regularity(ga.unbiased_autocorr(sym, 200), assumed)
+    fixed = ga.unbiased_autocorr(sym, 200)[assumed // 2]
+    asym = ga.regularity(ga.unbiased_autocorr(
         sym + 0.5 * np.sin(2 * np.pi * t / period), 200), assumed)
     print(f"  symmetric: step {reg['step_regularity']:.3f}, stride "
           f"{reg['stride_regularity']:.3f} (value at the fixed lag {fixed:.3f})")
@@ -364,7 +364,7 @@ def validate_supplementary(seed=0):
     par, perp = rng.normal(0, 0.03, 600), rng.normal(0, 0.01, 600)
     T = 1.1 * (1 + (par - perp) / np.sqrt(2))
     L = 1.43 * (1 + (par + perp) / np.sqrt(2))
-    g = var.gem_decompose(T, L)
+    g = ga.gem_decompose(T, L)
     r_par = np.corrcoef(g["parallel"], par)[0, 1]
     r_perp = np.corrcoef(g["perpendicular"], perp)[0, 1]
     print(f"  GEM: v* {g['v_star']:.3f}, recovered components r = "
@@ -378,15 +378,15 @@ def validate_supplementary(seed=0):
         x = np.zeros(4000)
         for i in range(1, 4000):
             x[i] = phi * x[i - 1] + rng.normal()
-        phis.append(abs(var.lag1(x) - phi) < 0.05)
+        phis.append(abs(ga.lag1(x) - phi) < 0.05)
     zc, vc = rng.normal(0, 0.02, 800), rng.normal(0, 0.1, 800)
-    fp = var.foot_placement_model(zc, vc, 0.05 + 0.8 * zc + 0.2 * vc)
+    fp = ga.foot_placement_model(zc, vc, 0.05 + 0.8 * zc + 0.2 * vc)
     print(f"  foot placement: R2 {fp['r2']:.6f}, gains "
           f"{fp['gain_position']:.4f} / {fp['gain_velocity']:.4f} (0.8 / 0.2)")
-    sa = var.symmetry_angle(1.1, 0.9) + var.symmetry_angle(0.9, 1.1)
+    sa = ga.symmetry_angle(1.1, 0.9) + ga.symmetry_angle(0.9, 1.1)
     verdict("supplementary", reg_ok and gem_ok and all(phis)
             and fp["r2"] > 0.9999 and abs(fp["gain_position"] - 0.8) < 1e-9
-            and abs(var.symmetry_angle(1, 1)) < 1e-12 and abs(sa) < 1e-12,
+            and abs(ga.symmetry_angle(1, 1)) < 1e-12 and abs(sa) < 1e-12,
             "regularity peaks found, GEM recovered, AR(1), regression, "
             "symmetry antisymmetric")
 

@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 import detect_gait_events as dg
-from gait.uncertainty import fractional_gaussian_noise
+from gait_analysis import fractional_gaussian_noise
 
 FS_K, FS_F = 100, 1000
 G = 9.81

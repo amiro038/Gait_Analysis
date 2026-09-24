@@ -9,3 +9,7 @@ posed_frames/
 *_vertices_*.csv
 *_mesh.pkl
 *_mesh.h5
+docs/figures/_trial.pkl
+docs/methods/_combined.md
+docs/methods/reference.docx
+docs/methods/_ref_default.docx
