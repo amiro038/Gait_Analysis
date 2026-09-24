@@ -62,7 +62,7 @@ HERE = Path(__file__).resolve().parent
 # =============================================================================
 
 DATA_FOLDER = Path(
-    r"C:\Users\lcour081\Box\Military Project\Data\Analysis\DICE_Treadmill"
+    r"C:\Users\alexm\Box\Military Project\Data\Analysis\DICE_Treadmill"
 )
 FORCE_FOLDER = DATA_FOLDER / "FP_renamed"            # {trial}.csv, 1000 Hz
 KINEMATIC_FOLDER = DATA_FOLDER / "Theia_csv_outputs"  # {trial}_metrics.csv
