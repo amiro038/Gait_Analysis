@@ -61,7 +61,7 @@ If several minima qualify, the lowest one is taken. If none qualifies, the swing
 **Steps** (`swing_clearance()`, `foot_clearance()`):
 
 1. Take the swing from toe-off to the next heel strike, trimming **2%** at each end (`SWING_TRIM`), where the boot is still on the belt.
-2. Pose every sole point in every frame (§3), with the toe cap bent only as far as the belt requires (§3.3), and compute each point's height above the belt.
+2. Pose every sole point in every frame (§3), with the toe cap bent by Theia's extension or as far as the belt requires, whichever is larger (§3.3), and compute each point's height above the belt.
 3. Find the minima that meet (a)–(c), and keep the lowest.
 
 ## 11.2 Margin of instability and the trip-risk integral

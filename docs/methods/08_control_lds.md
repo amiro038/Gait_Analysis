@@ -78,13 +78,10 @@ $$y(i) = \left\langle \ln\lVert\mathbf{X}(j+i) - \mathbf{X}(\hat{j}+i)\rVert\rig
 :::
 
 ::: {custom-style="Note Box"}
-**Caution** — λ values depend strongly on the method: the signal, the normalisation, τ, $d_E$, the series length and the fit windows. Compare them between conditions within this study. Published ranges are only a rough check.
+**Caution** — λ values depend strongly on the method: the signal, the normalisation, τ, $d_E$, the series length and the fit windows (Bruijn et al. 2013). Published values differ several-fold between methods, and none used this state space, so **no healthy range is given**. On D05 the 1-D trunk velocity gave $\lambda_S \approx 2.3$ per stride. Compare conditions within this study, with the same settings and the same number of strides.
 :::
 
 ::: {custom-style="Code Box"}
 **In the code** — §18: `lds_state_space()`, `divergence()`, `fit_lambdas()`, `window_lambda()`, `lds_rows()`. Settings: `LDS_N_STRIDES = 150`, `LDS_SAMPLES_PER_STRIDE = 100`, `LDS_TAU = 10`, `LDS_DE = 5`, `LDS_WS = 10`, `LDS_FIT`, `LDS_MAX_WINDOWS = 4`, `LDS_N_BOOT = 500`, `LDS_STATE_SPACES`, `LDS_PRIMARY`, `RUN_LDS`. Results: `lds_lambda_S_<space>`, `lds_lambda_L_<space>`; each window is in `{trial}_lds_windows.csv`. `lds_validation.py` (part 1) checks that the shipped `divergence()` recovers known exponents.
 :::
 
-{{ranges: lds_lambda_S_trunkVel_AP}}
-
-: Table 18.1. Healthy range for the short-term Lyapunov exponent of the trunk (per stride).

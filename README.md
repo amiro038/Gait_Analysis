@@ -790,9 +790,12 @@ It reads the Box layout around the events file (`Theia_csv_outputs/`,
 `all_trials_all_metrics.csv` (one row per trial; re-running a trial replaces
 its row) and a folder per trial with the LDS, DFA, entropy, harmonic-ratio,
 regularity and symmetry tables. The BOOTS AND THE BELT cell prints, per foot,
-how often a swing goes below the belt and the mid-swing clearance under three
-models of the toe cap (Theia's toe angle as in v3, rigid, bent only by the
-belt), which is how a wrong toe angle shows up on real data.
+how often a swing goes below the belt and the mid-swing clearance under four
+models of the toe cap (Theia's toe angle both ways as in v3, rigid, bent by
+the belt alone, and the model used). It also prints where Theia puts the boot
+at the force-plate heel strikes and toe-offs, where the boot must be on the
+belt: a boot posed too low there is posed too low in swing, and the MFC then
+measures Theia's pose, not the walker.
 
 **What changed from version 3 of `Gait_analysis_all_metrics.py`** (in `archive/analysis_v3/`
 with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
@@ -810,9 +813,12 @@ with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
 - the AP / ML margin minima are over single support; the trip risk uses the
   stance leg's pendulum, and is integrated between the two peaks of the MFC
   point's resultant acceleration (lift-off and landing, Schulz 2017 Fig. 2);
-- the boot's toe cap is bent only as far as the belt requires, never by
-  Theia's toe angle (whose swing-phase flexion put the toe cap through the
-  belt and the MFC near zero); the CoP range is measured over the belt;
+- the boot's toe cap is bent by Theia's toe extension or as far as the belt
+  requires, whichever is larger, never by Theia's flexion, so the toe can no
+  longer put the boot through the belt; the CoP range is measured over the belt;
+- the forces are levelled so their mean over steady walking is vertical (D05:
+  a ~1 deg tilt gave a net braking impulse); steps with gross event errors
+  leave steady walking; loads under 10 kg are spread like the body;
 - DFA intervals, block-bootstrap intervals on every mean / SD / CV, LDS over
   windows with a stride bootstrap; every trial's series cut to the same length;
 - GEM on dimensionless stride time and length; regularity from the

@@ -132,6 +132,10 @@ LOAD_MIN_KG = 1.0              # §5.6 below 1 kg: no load
 LOAD_HEIGHT_M = 0.0            # §5.6 load CoM height above Trunk_Position
 LOAD_CENTRED = True            # §5.6 load on the mid-line (left-right)
 LOAD_MAX_OFFSET_M = 0.40       # §5.6 load placed further than this: not believed
+LOAD_PLACE_MIN_KG = 10.0       # §5.6 lighter (boots, clothing): spread like the body
+FORCE_ALIGN_GRAVITY = True     # §5.4 turn the forces so their walking mean is vertical
+FORCE_MAX_TILT_DEG = 3.0       # §5.4 a larger tilt is reported, not corrected
+OUTLIER_ROBUST_Z = 5.0         # §6 steps this many robust SD off: event errors
 CROSSOVER_HZ = 0.5             # §5.7 markers below, force plates above
 MARKER_SAVGOL = (11, 3)        # §5.7 Savitzky-Golay window, order (markers)
 ANTIALIAS_HZ = 40.0            # §5.7 before taking force to 100 Hz
@@ -147,6 +151,7 @@ MIN_CLEARANCE_MM = 1.0         # §11 floor for the trip-risk division
 TRI_DERIV_WINDOW = 7           # §11 Savitzky-Golay frames (order 3), MFC point
 TOE_MAX_BEND_DEG = 60.0        # §5.3 the toe cap never bends further than this
 TOE_BEND_STEP_DEG = 0.5        # §5.3 resolution of the contact-constrained bend
+TOE_USE_THEIA_EXTENSION = True # §5.3 also lift the toe cap by Theia's toe extension
 
 # --- §12 confidence intervals -------------------------------------------------
 N_BOOT = 1000                  # block-bootstrap resamples
@@ -448,15 +453,17 @@ def belt_motion(t, say):
 # WHAT: pose the participant's scanned boot soles on Theia's feet every
 #       frame, bend the toe cap at the MTP, and measure them against the
 #       belt surface.
-# TOE CAP: a boot's toe cap is stiff. It bends at the MTP only when the belt
-#       pushes it up (push-off) and springs back once it is off the belt.
-#       So it is bent by the SMALLEST angle that keeps every toe vertex on
-#       or above the belt, frame by frame: zero in the air, just enough at
-#       push-off. Theia's toe angle is NOT used: its toe segment is fitted to
-#       a foot inside a boot, and a toe FLEXION it reports in swing turns
-#       the toe cap down through the belt (a 25 deg flexion takes the
-#       mid-swing clearance from ~20 mm to ~5 mm, below zero in some
-#       swings; test_gait_analysis_all_metrics.py builds exactly that).
+# TOE CAP: a boot's toe cap is stiff. It bends up at the MTP when the belt
+#       pushes it (push-off) and springs back once it is off the belt; it
+#       cannot curl down. So it is bent by the LARGER of Theia's toe
+#       EXTENSION (as the event detection does; never its flexion) and the
+#       smallest angle that keeps every toe vertex on or above the belt.
+#       A toe FLEXION from Theia would turn the toe cap down through the
+#       belt (25 deg takes the mid-swing clearance from ~20 mm to ~5 mm;
+#       test_gait_analysis_all_metrics.py builds exactly that). On D05,
+#       Theia's toe angle in swing is mostly extension, and the rigid boot
+#       itself reaches the belt in mid-swing: there the low clearance is
+#       Theia's foot pose, which no toe model can correct.
 # WHY:  the base of support (§10) and foot clearance (§11) are about the
 #       real edge and underside of the boot. Joint centres (ankle, "toe")
 #       sit centimetres inside it. The boot geometry is the same one
@@ -467,10 +474,13 @@ def belt_motion(t, say):
 #       direction of travel (for the base of support). Whole-sole positions
 #       are rebuilt only for the frames a swing or a figure needs.
 
-def contact_toe_pose(pose, sole, long_axis, surface, b):
+def contact_toe_pose(pose, sole, long_axis, surface, b, extension=None):
     """The toes pose: the foot pose turned about the MTP by the smallest
     angle (0 to TOE_MAX_BEND_DEG) that keeps every toe vertex on or above
-    the belt. -> (toe pose (F, 4, 4), bend in degrees (F,)).
+    the belt, or by Theia's toe extension (radians, per frame) where that
+    is larger. -> (toe pose (F, 4, 4), bend in degrees (F,)).
+    Lifting the toe cap further only raises it, so the larger angle is
+    never below the belt either.
     Heights are linear in the world position, h = a . w - floor with
     a = (-slope f_x, -slope f_y, 1), so for each frame a vertex v of the
     foot frame sits at h = (R^T a) . v + a . p - floor; every candidate bend
@@ -497,6 +507,8 @@ def contact_toe_pose(pose, sole, long_axis, surface, b):
         clear = h.min(2) >= 0
         first = np.where(clear.any(1), clear.argmax(1), len(grid) - 1)
         bend[sl] = np.where(ok[sl], grid[first], 0.0)
+    if extension is not None:
+        bend = np.where(ok, np.maximum(bend, extension), 0.0)
     rel = dge.rot_x(sign * bend)
     H = np.zeros((len(pose), 4, 4))
     H[:, :3, :3], H[:, :3, 3], H[:, 3, 3] = rel, m - rel @ m, 1.0
@@ -535,8 +547,15 @@ class Boots:
             if sole["mtp"] is None or not sole["toe"].any():
                 self.toe_bend_deg[b] = np.zeros(len(pose[b]))
                 continue
+            ext = None
+            if TOE_USE_THEIA_EXTENSION:
+                ang = trial.angle(f"{SIDE[b]}_Toes_Joint_Angle")
+                if ang is not None:
+                    ext = np.radians(np.clip(np.nan_to_num(
+                        dge.TOE_SIGN * (ang - dge.TOE_REFERENCE_DEG)),
+                        0.0, TOE_MAX_BEND_DEG))
             sole["toe_pose"], self.toe_bend_deg[b] = contact_toe_pose(
-                pose[b], sole, self.long_axis[b], self.surface, b)
+                pose[b], sole, self.long_axis[b], self.surface, b, ext)
         fwd2, lat2 = trial.forward, trial.lateral
         n = len(pose["L"])
         self.low_z, self.low_idx, self.ext = {}, {}, {}
@@ -587,6 +606,43 @@ class Boots:
 #       walker up. §5.7 then checks the horizontal axes against the markers.
 # BASELINE: an unloaded plate does not read zero, and the reading drifts;
 #       it is re-measured every 10 s from the unloaded samples (§4.1).
+
+def align_gravity(t, say):
+    """Turn the forces so their mean over steady walking is vertical.
+    A body that does not accelerate is pushed straight up on average,
+    whatever the treadmill's incline; a mean that leans is a tilt between
+    the plates' axes and Theia's (D05: ~1 deg, which leaks sin(1 deg) of
+    the vertical force into AP and makes a net braking impulse of ~0.01
+    BW*s per stance). The shear offsets are already removed, so what is
+    left is a rotation, undone as one."""
+    t.force_tilt_deg = 0.0
+    hs = t.steps.loc[t.steps["steady"], "hs"]
+    if not FORCE_ALIGN_GRAVITY or not len(hs):
+        return
+    walk = slice(int(hs.min() * STEP), int(hs.max() * STEP))
+    if t.handrail[walk].mean() > 0.01:
+        say("  forces not levelled: hands on the rails carry part of the weight")
+        return
+    f = np.mean((t.grf_raw["L"] + t.grf_raw["R"])[walk], axis=0)
+    f = f / np.linalg.norm(f)
+    tilt = float(np.degrees(np.arccos(np.clip(f[2], -1, 1))))
+    say(f"  mean GRF while walking leans "
+        f"{np.degrees(np.arctan2(f[:2] @ t.forward, f[2])):+.2f} deg along "
+        f"travel, {np.degrees(np.arctan2(f[:2] @ t.lateral, f[2])):+.2f} deg "
+        f"across" + ("" if tilt <= FORCE_MAX_TILT_DEG else
+                     f"; over {FORCE_MAX_TILT_DEG:g} deg, NOT corrected: check "
+                     f"the plate corners and the registration"))
+    if tilt <= FORCE_MAX_TILT_DEG and tilt > 0.01:
+        k = np.cross(f, [0.0, 0.0, 1.0])
+        sn = np.linalg.norm(k)
+        k /= sn
+        K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        R = np.eye(3) + sn * K + (1 - f[2]) * K @ K
+        for b in LIMBS:
+            t.grf_raw[b] = t.grf_raw[b] @ R.T
+            t.grf[b] = t.grf[b] @ R.T
+        t.force_tilt_deg = tilt
+
 
 def read_forces(t, path, plates, A, say):
     head = pd.read_csv(path, nrows=0).columns
@@ -780,6 +836,13 @@ def system_com(t, say):
     if not (L["found"] and np.isfinite(L["load_kg"])
             and L["load_kg"] >= LOAD_MIN_KG):
         return
+    if L["load_kg"] < LOAD_PLACE_MIN_KG:
+        # boots, clothing, a light vest: the placement equation multiplies
+        # CoP errors by m / m_load (x18 at 4.7 kg), so it is not solved; the
+        # load is spread like the body (CoM unchanged, mass as weighed)
+        say(f"  load {L['load_kg']:.1f} kg < {LOAD_PLACE_MIN_KG:g} kg: spread "
+            f"like the body, CoM unchanged")
+        return
     trunk = t.kin("Trunk_Position")
     if trunk is None:
         say("  ! no Trunk_Position: the load cannot be carried; CoM is the "
@@ -945,6 +1008,7 @@ def load_trial(stem, folders, participant, verbose=True):
             "frame")
     read_forces(t, dge.find_file(folders["force"], stem, ".csv"), plates, A,
                 say)
+    align_gravity(t, say)
 
     # §5.5 - §5.7 the load, the system CoM, its velocity
     t.body_mass = float(participant.get("body_mass_kg", np.nan))
@@ -1028,6 +1092,29 @@ def spatiotemporal(t):
         | s["to_source"].isin(["kinematic", "interpolated"]))
     s["events_interpolated"] = ((s["hs_source"] == "interpolated")
                                 | (s["to_source"] == "interpolated"))
+    # gross event errors: a missed, doubled or misplaced event gives a step
+    # that cannot be gait (D05: a step length of -0.38 m, a cadence of 144
+    # at a 108-bpm metronome). Steps over OUTLIER_ROBUST_Z robust SDs from
+    # their foot's median, or with a step length <= 0, leave steady walking
+    out = np.zeros(len(s), bool)
+    steady = s["steady"].to_numpy()
+    for c in ("stride_s", "step_s", "stance_s", "swing_s", "step_length_m",
+              "step_width_m"):
+        v = s[c].to_numpy(float)
+        for b in LIMBS:
+            m = steady & (s["limb"] == b).to_numpy() & np.isfinite(v)
+            if m.sum() < 10:
+                continue
+            med = np.median(v[m])
+            mad = 1.4826 * np.median(np.abs(v[m] - med))
+            if mad > 0:
+                out |= m & (np.abs(v - med) > OUTLIER_ROBUST_Z * mad)
+    out |= steady & (s["step_length_m"].to_numpy(float) <= 0)
+    s["gait_outlier"] = out
+    s["steady"] = steady & ~out
+    if out.any():
+        print(f"  {int(out.sum())} steady steps with gross event errors "
+              f"taken out of steady walking")
     return s
 
 
@@ -2526,13 +2613,12 @@ REFERENCE_RANGES = {
     "step_regularity_AP": (0.60, 0.90, "healthy adults, trunk", "Moe-Nilssen & Helbostad 2004; Kobsar et al. 2014", "verify"),
     "stride_regularity_AP": (0.65, 0.90, "healthy adults, trunk", "Moe-Nilssen & Helbostad 2004; Kobsar et al. 2014", "verify"),
     "dfa_alpha_stride_s": (0.75, 0.90, "healthy adults, uncued; METRONOME-PACED walking gives < 0.5", "Hausdorff et al. 1996; Terrier et al. 2005", "confirmed"),
-    "dfa_alpha_stride_length_m": (0.60, 0.90, "healthy young adults, treadmill (persistent)", "Dingwell et al. 2010", "confirmed"),
+    "dfa_alpha_stride_length_m": (0.60, 0.90, "healthy young adults, treadmill, UNCUED (a metronome paces it too: L = v T)", "Dingwell et al. 2010", "confirmed"),
     "dfa_alpha_stride_speed_ms": (0.20, 0.40, "healthy young adults, treadmill (anti-persistent)", "Dingwell et al. 2010; Terrier 2012", "confirmed"),
     "dfa_alpha_step_width_m": (0.60, 0.90, "healthy young adults, treadmill (persistent)", "Dingwell & Cusumano 2015", "verify"),
     "gem_perpendicular_dfa_alpha": (0.20, 0.50, "healthy young adults, treadmill", "Dingwell et al. 2010", "verify"),
-    "gem_parallel_dfa_alpha": (0.70, 1.00, "healthy young adults, treadmill", "Dingwell et al. 2010", "verify"),
+    "gem_parallel_dfa_alpha": (0.70, 1.00, "healthy young adults, treadmill, UNCUED (paced by a metronome)", "Dingwell et al. 2010", "verify"),
     "foot_placement_r2": (0.60, 0.90, "healthy adults, ML, mid-stance (> 0.8 with pelvis state)", "Wang & Srinivasan 2014", "confirmed"),
-    "lds_lambda_S_trunkVel_AP": (0.40, 0.60, "healthy adults, trunk, per stride (0.50 +- 0.06); strongly method dependent", "van Schooten et al. 2011", "confirmed"),
     "symmetry_angle_stance_s": (-3, 3, "healthy adults", "Zifchock et al. 2008", "verify"),
     "symmetry_angle_step_length_m": (-3, 3, "healthy adults", "Zifchock et al. 2008", "verify"),
     "symmetry_angle_f1_bw": (-3, 3, "healthy adults", "Zifchock et al. 2008", "verify"),

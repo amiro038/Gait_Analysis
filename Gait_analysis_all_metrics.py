@@ -195,6 +195,16 @@ warmup_seconds = 60
 # Burnfield 2010); version 3's 30-70% included the heel rising.
 belt_flat_fraction = (0.20, 0.45)
 
+# --- gross event errors ------------------------------------------------------------
+# A step whose timing or length is this many robust SDs (1.4826 x MAD) from the
+# median of its foot is a missed, doubled or misplaced event, not gait. It is
+# taken out of steady walking for every metric (D05: a step length of -0.38 m,
+# a cadence of 144 steps/min). Hausdorff-type screens use 3 SD of the mean;
+# a robust 5 only catches what cannot be a real step.
+outlier_robust_z = 5.0
+# metronome-paced trial? None = read it from the trial name ("...bpm")
+metronome_paced = None
+
 # --- forces ------------------------------------------------------------------
 force_filter_hz = 50.0        # peaks and landmarks (impulses use the raw force)
 handrail_contact_n = 15.0     # N above its baseline that counts as a hand
@@ -204,7 +214,16 @@ quiet_window_s = 2.0          # ... as the steadiest 2 s
 quiet_max_cv = 0.02           # total vertical force steady within 2%
 quiet_min_share = 0.15        # both feet loaded (each belt >= 15%)
 quiet_max_heel_travel = 0.02  # heels still (moved < 20 mm)
+force_align_gravity = True    # turn the forces so their mean over steady walking
+                              # is vertical (a body that does not accelerate is
+                              # pushed straight up on average): removes a plate /
+                              # registration tilt (D05: ~1 deg, a net braking impulse)
+force_max_tilt_deg = 3.0      # a larger tilt is reported, not corrected
 load_min_kg = 1.0             # below this: no load
+load_place_min_kg = 10.0      # below this the load is boots / clothing / a light
+                              # vest: its position cannot be solved (the equation
+                              # multiplies CoP errors by m / m_load, x18 for 4.7 kg),
+                              # so it is spread like the body: CoM unchanged
 load_height_m = 0.0           # load CoM above Trunk_Position (not observable)
 load_max_offset_m = 0.40      # a load further than this is not believed
 
@@ -212,6 +231,9 @@ load_max_offset_m = 0.40      # a load further than this is not believed
 belt_floor_fraction = (0.20, 0.45)   # foot flat, used to fit the belt surface
 toe_max_bend_deg = 60.0              # the toe cap never bends further than this
 toe_bend_step_deg = 0.5              # resolution of the contact-constrained bend
+toe_use_theia_extension = True       # also lift the toe cap by Theia's toe EXTENSION
+                                     # (never flexion), as step 1 does; False = the
+                                     # belt alone bends it
 
 # --- minimum foot clearance (Schulz 2011, 2017) -----------------------------
 mfc_local_window = 2          # frames either side that a local minimum must beat
@@ -657,12 +679,49 @@ spatial_speed_gap = g.loc[steady, 'stride_velocity'].mean() / belt_speed - 1
 print(f"  mean stride speed over the belt is {100 * spatial_speed_gap:+.2f}% from the belt speed")
 if abs(spatial_speed_gap) > 0.02:
     print("  ! over 2%: the walker drifted on the belt, or the heels are mis-tracked")
-# what version 3's definition would have given, for the record
-print(f"  (two heel-to-heel step lengths add up to "
-      f"{1000 * (g.loc[steady, 'step_length'].mean() * 2 - g.loc[steady, 'stride_length'].mean()):+.0f} mm "
-      f"more than the stride over the belt)")
+# what version 3's definition would have given, for the record. On a treadmill
+# two heel-to-heel steps are SHORTER than the stride over the belt: at the
+# other foot's heel strike the trailing heel has already risen and rolled
+# forward over the forefoot (D05: ~50 mm per step)
+spatial_two_steps = 2 * g.loc[steady, 'step_length'].mean() - g.loc[steady, 'stride_length'].mean()
+print(f"  (two heel-to-heel step lengths add up to {1000 * abs(spatial_two_steps):.0f} mm "
+      f"{'less' if spatial_two_steps < 0 else 'more'} than the stride over the belt)")
 if not (0.02 < g.loc[steady, 'step_width'].median() < 0.40):
     print("  ! that is not a plausible step width: check the direction of travel")
+
+# --- gross event errors --------------------------------------------------------
+# REVISED, new: a missed, doubled or misplaced event makes a step that cannot be
+# gait (a negative step length, a 0.42 s step at a 0.56 s metronome). Such steps
+# are taken out of steady walking for EVERY metric, so a single bad event does
+# not inflate a CV, a DFA alpha or a margin. Robust: median and MAD of each foot.
+qa_vars = ['stride_time', 'step_time', 'stance_time', 'swing_time', 'step_length', 'step_width']
+gait_outlier = np.zeros(len(g), bool)
+qa_counts = {}
+for c_ in qa_vars:
+    v_ = g[c_].to_numpy(float)
+    bad_ = np.zeros(len(g), bool)
+    for b in limbs:
+        m_ = steady & (g['support_limb'] == b).to_numpy() & np.isfinite(v_)
+        if m_.sum() < 10:
+            continue
+        med_ = np.median(v_[m_])
+        mad_ = 1.4826 * np.median(np.abs(v_[m_] - med_))
+        if mad_ > 0:
+            bad_ |= m_ & (np.abs(v_ - med_) > outlier_robust_z * mad_)
+    if c_ == 'step_length':
+        bad_ |= steady & (v_ <= 0)
+    qa_counts[c_] = int(bad_.sum())
+    gait_outlier |= bad_
+g['gait_outlier'] = gait_outlier
+print(f"  gross event errors (> {outlier_robust_z:g} robust SD from the foot's median): "
+      f"{int(gait_outlier.sum())} of {int(steady.sum())} steady steps "
+      f"({100 * gait_outlier.sum() / max(steady.sum(), 1):.1f}%) taken out of steady walking")
+if gait_outlier.any():
+    print("    flagged by " + ", ".join(f"{k_} {n_}" for k_, n_ in qa_counts.items() if n_))
+if gait_outlier.sum() > 0.02 * steady.sum():
+    print("  ! over 2%: look at the events before trusting the variability measures")
+steady = steady & ~gait_outlier
+gait_event_data['steady'] = steady
 
 if make_figures:
     plt.figure()
@@ -752,6 +811,44 @@ print(f"  plate baselines {force_baseline['L']:.1f} / {force_baseline['R']:.1f} 
       f"lab -> Theia {'from the event summary' if event_summary else 'ASSUMED identity'}")
 print(f"  handrail contact on {100 * handrail_contact.mean():.2f}% of samples")
 
+steady_samples = slice(int(frame_to_row(hs[steady].min()) * force_step),
+                       int(frame_to_row(hs[steady].max()) * force_step))
+
+# --- the forces' tilt: on average they must push straight up ----------------------
+# Over minutes of steady walking the body does not accelerate, so the mean of
+# the total GRF is the weight, VERTICAL, whatever the treadmill's incline. A
+# mean that leans is a tilt between the plates' axes and Theia's (corner
+# survey, registration, or an export already levelled and turned again):
+# sin(1 deg) of the vertical force leaks into AP, ~10 N at mid-stance, and a
+# net braking impulse of ~0.01 BW*s per stance (a quarter of the
+# propulsive impulse) appears that no walker
+# produces. The leftover shear offsets were removed above, so what remains is
+# a rotation, and it is undone as one.
+force_tilt_deg, force_tilt_ap_deg, force_tilt_ml_deg = 0.0, 0.0, 0.0
+force_mean = np.mean((grf_raw['L'] + grf_raw['R'])[steady_samples], axis=0)
+force_tilt_ap_deg = float(np.degrees(np.arctan2(force_mean[:2] @ forward, force_mean[2])))
+force_tilt_ml_deg = float(np.degrees(np.arctan2(force_mean[:2] @ lateral, force_mean[2])))
+force_tilt_deg = float(np.degrees(np.arccos(np.clip(force_mean[2] / np.linalg.norm(force_mean), -1, 1))))
+print(f"  mean GRF over steady walking leans {force_tilt_ap_deg:+.2f} deg along travel and "
+      f"{force_tilt_ml_deg:+.2f} deg across (should be 0: the body does not accelerate)")
+if not force_align_gravity:
+    print("    left as it is (force_align_gravity = False)")
+elif handrail_contact[steady_samples].mean() > 0.01:
+    print("    not corrected: hands on the rails carry part of the weight")
+elif force_tilt_deg > force_max_tilt_deg:
+    print(f"  ! over {force_max_tilt_deg:g} deg: that is not a small misalignment. Not corrected;")
+    print("    check the plate corners and the lab -> Theia registration")
+elif force_tilt_deg > 0.01:
+    k_ = np.cross(force_mean / np.linalg.norm(force_mean), [0.0, 0.0, 1.0])
+    sin_ = np.linalg.norm(k_)
+    k_ /= sin_
+    K_ = np.array([[0, -k_[2], k_[1]], [k_[2], 0, -k_[0]], [-k_[1], k_[0], 0]])
+    R_align = np.eye(3) + sin_ * K_ + (1 - np.cos(np.radians(force_tilt_deg))) * K_ @ K_
+    for b in limbs:
+        grf_raw[b] = grf_raw[b] @ R_align.T
+        grf[b] = grf[b] @ R_align.T
+    print(f"    turned back by {force_tilt_deg:.2f} deg (force_align_gravity)")
+
 # --- quiet standing: weigh body + load -----------------------------------------
 fz_total = grf['L'][:, 2] + grf['R'][:, 2]
 first_event_sample = int(frame_to_row(events['frame'].min()) * force_step)
@@ -776,8 +873,6 @@ for s0 in range(0, max(qs_end - qs_win, 0), int(force_fs // 10)):     # every 0.
     if still:
         qs_best, qs_cv = s0, cv
 
-steady_samples = slice(int(frame_to_row(hs[steady].min()) * force_step),
-                       int(frame_to_row(hs[steady].max()) * force_step))
 walking_weight = float(np.mean(fz_total[steady_samples]))
 if qs_best is None:
     print("  ! no quiet standing found before the first step: the system mass is")
@@ -1060,26 +1155,27 @@ if make_figures and lds_done:
 # the real boot, so the participant's scanned boots are posed on Theia's feet
 # in every frame: vertex(t) = R_foot(t) @ vertex_local + p_foot(t).
 #
-# REVISED, three things, which together are why the boot no longer goes
-# through the belt in swing:
+# REVISED, three things:
 #
-#  1. THE TOE CAP BENDS ONLY AS FAR AS THE BELT FORCES IT TO.
-#     Version 3 posed the boots with apply_binding.py, which bends the toe cap
-#     about the MTP by Theia's toe angle, in BOTH directions and in every
-#     frame. Theia's toe angle is the anatomical toes estimated from video;
-#     in swing it can read flexion (toes curled down) of 10-20 deg, and a
-#     boot's toe box cannot curl: a 15 deg flexion drops the tip of an 80 mm
-#     toe cap by ~20 mm, straight through the belt at mid-swing, exactly where
-#     the MFC is measured. A boot's sole bends at the flex line only when the
-#     forefoot is pressed against the ground at push-off, and springs back to
-#     its moulded (scanned) shape as soon as it is unloaded.
-#     So, in every frame, the toe cap is turned up about the MTP by the
-#     SMALLEST angle that keeps it out of the belt: zero whenever the boot is
-#     clear of the belt (all of mid-swing), exactly the bend that lays the
-#     toe cap flat at push-off. No toe angle from Theia is used.
-#     The cell below also poses the boot rigid and with Theia's toe angle, and
-#     reports how often each goes through the belt in swing, so the cause of
-#     version 3's negative clearances is a number, not a guess.
+#  1. THE TOE CAP. A boot's toe cap bends up at the flex line when the belt
+#     pushes it (push-off) and springs back to its moulded, scanned shape once
+#     it is unloaded; a boot cannot curl its toes down. So the toe cap is
+#     turned up about the MTP by the LARGER of
+#       - Theia's toe EXTENSION, never its flexion (toe_use_theia_extension),
+#         as the event detection does: Theia's toe segment is fitted to the
+#         image of the boot's toe, so its extension carries information;
+#       - the smallest bend that keeps every toe vertex out of the belt.
+#     The toe can then never put the boot through the belt. Version 3 bent
+#     the toe cap by Theia's angle in BOTH directions, every frame.
+#     D05, first real run: Theia's toe angle in swing is -1.5 to +11 deg
+#     (5-95%), mostly extension, and the RIGID boot already reaches the belt
+#     in mid-swing (median 0-2 mm). So the low clearance there is not the toe
+#     hinge: it is Theia's foot pose in swing relative to stance, or the
+#     binding. The force plates are the check, printed below: at a
+#     force-plate heel strike the boot's lowest point must be ON the belt,
+#     and at a force-plate toe-off too.
+#     The cell also poses the boot rigid, bent by the belt alone, and bent by
+#     Theia's angle both ways (version 3), and reports each model's clearance.
 #  2. ONLY THE SOLE. The lowest vertex in every 10 mm cell of the footprint,
 #     up to 35 mm above the lowest (detect_gait_events.boot_sole). Only the
 #     underside can touch the belt or an obstacle, and ~300 vertices instead
@@ -1103,7 +1199,7 @@ for b in limbs:
     foot_pose[b] = P
 
 # --- the sole, its toe cap, and the hinge ---------------------------------------
-sole_local, sole_is_toe, sole_is_front, toe_hinge_point, toe_lift_sign = {}, {}, {}, {}, {}
+sole_local, sole_is_toe, sole_is_front, toe_hinge_point, toe_lift_sign, boot_length = {}, {}, {}, {}, {}, {}
 for b in limbs:
     P = foot_pose[b]
     R, t = P[:, :3, :3], P[:, :3, 3]
@@ -1120,6 +1216,7 @@ for b in limbs:
     fwd_local = long_axis - (long_axis @ up_local) * up_local
     fwd_local /= np.linalg.norm(fwd_local)
     along = (sole_local[b] - m) @ fwd_local
+    boot_length[b] = float(np.ptp(sole_local[b] @ fwd_local))
     sole_is_toe[b] = along > 0
     # front and rear halves of the sole, for Schulz's toe-vs-heel criterion
     along_sole = sole_local[b] @ fwd_local
@@ -1176,8 +1273,8 @@ def height_above_belt(W, b):
 # of 0.5 deg steps) and the smallest one with no toe vertex below the belt kept.
 belt_normal = np.array([-belt_slope * forward[0], -belt_slope * forward[1], 1.0])
 bend_grid = np.radians(np.arange(0.0, toe_max_bend_deg + 1e-9, toe_bend_step_deg))
-sole_world, sole_height, toe_bend_deg = {}, {}, {}
-clear_rigid, clear_theia_toe = {}, {}
+sole_world, sole_height, toe_bend_deg, toe_bend_contact_deg, theia_toe_deg = {}, {}, {}, {}, {}
+clear_rigid, clear_theia_toe, clear_contact = {}, {}, {}
 for b in limbs:
     P = foot_pose[b]
     m = toe_hinge_point[b]
@@ -1190,9 +1287,16 @@ for b in limbs:
     theia_toe = (np.radians(dge.TOE_SIGN * (kinematic_data[toe_angle_col].to_numpy(float)
                                            - dge.TOE_REFERENCE_DEG))
                  if toe_angle_col in kinematic_data.columns else None)
+    theia_toe_deg[b] = np.degrees(theia_toe) if theia_toe is not None else np.full(n_frames, np.nan)
+    # Theia's EXTENSION only, as a lift of the toe cap (dge's convention:
+    # TOE_SIGN x (angle - reference) > 0 is extension, checked on D05)
+    theia_lift = (np.clip(np.nan_to_num(theia_toe), 0.0, np.radians(toe_max_bend_deg))
+                  if (theia_toe is not None and toe_use_theia_extension) else np.zeros(n_frames))
     bend = np.full(n_frames, np.nan)
+    bend_contact = np.full(n_frames, np.nan)
     sole_world[b] = np.full((n_frames, len(sole_local[b]), 3), np.nan, np.float32)
     clear_rigid[b] = np.full(n_frames, np.nan)
+    clear_contact[b] = np.full(n_frames, np.nan)
     if theia_toe is not None:
         clear_theia_toe[b] = np.full(n_frames, np.nan)
     # in chunks of frames, so a 15-min trial fits in memory
@@ -1205,11 +1309,20 @@ for b in limbs:
         enough = h_toe.min(axis=2) >= 0                                # (F, G)
         first_ok = np.where(enough.any(axis=1), np.argmax(enough, axis=1), len(bend_grid) - 1)
         bend_c = np.where(good, bend_grid[first_ok], np.nan)
-        bend[sl] = bend_c
-        # 2. every sole vertex in the world, the toe cap bent by that angle
+        bend_contact[sl] = bend_c
+        # ... and the larger of that and Theia's extension
+        bend_f = np.where(good, np.maximum(np.nan_to_num(bend_c), theia_lift[sl]), np.nan)
+        bend[sl] = bend_f
+        # 2. every sole vertex in the world: rigid, toe cap bent by the belt
+        #    alone, and toe cap bent by the model used
         W = sole_local[b] @ Pc[:, :3, :3].transpose(0, 2, 1) + Pc[:, None, :3, 3]
-        clear_rigid[b][sl] = np.nanmin(height_above_belt(W, b), axis=1) if good.any() else np.nan
-        Rb = rot_x(toe_lift_sign[b] * np.nan_to_num(bend_c))
+        H_rigid = height_above_belt(W, b)
+        clear_rigid[b][sl] = np.nanmin(H_rigid, axis=1) if good.any() else np.nan
+        Rc = rot_x(toe_lift_sign[b] * np.nan_to_num(bend_c))
+        W_toe_c = np.einsum('fij,ftj->fti', Pc[:, :3, :3], m + np.einsum('fij,tj->fti', Rc, d_toe)) + Pc[:, None, :3, 3]
+        clear_contact[b][sl] = np.minimum(np.nanmin(H_rigid[:, ~toe], axis=1),
+                                          np.nanmin(height_above_belt(W_toe_c, b), axis=1))
+        Rb = rot_x(toe_lift_sign[b] * np.nan_to_num(bend_f))
         W_toe = np.einsum('fij,ftj->fti', Pc[:, :3, :3], m + np.einsum('fij,tj->fti', Rb, d_toe)) + Pc[:, None, :3, 3]
         # 3. for comparison only: the toe cap bent by Theia's toe angle, both
         #    ways, as apply_binding.py posed it for version 3
@@ -1221,6 +1334,7 @@ for b in limbs:
         W[:, toe] = W_toe
         sole_world[b][sl] = W
     toe_bend_deg[b] = np.degrees(bend)
+    toe_bend_contact_deg[b] = np.degrees(bend_contact)
     sole_height[b] = height_above_belt(sole_world[b], b).astype(np.float32)
 
 # per frame: the lowest sole point (the foot's clearance) and which one it is
@@ -1252,36 +1366,70 @@ for x in range(len(g)):
         mid_swings[b].append(slice(int(np.ceil(r0 + 0.3 * (r1 - r0))), int(np.floor(r0 + 0.8 * (r1 - r0))) + 1))
     if steady[x] and np.isfinite(g['stance_time'][x]):
         stance_rows[b][int(np.ceil(frame_to_row(hs[x]))):int(np.floor(frame_to_row(to[x]))) + 1] = True
-print("  swing frames with the lowest sole point BELOW the belt (steady walking):")
-print("      foot   boot bent by Theia's toe angle (v3)   rigid boot   bent only by the belt (v4)")
+es_surface = event_summary.get('belt_surface')
+if es_surface:
+    print(f"  (the event detection fitted {1000 * es_surface['floor_m']['L']:.1f} / "
+          f"{1000 * es_surface['floor_m']['R']:.1f} mm and {es_surface['slope_deg']:+.2f} deg: "
+          f"a gap of several mm between the two fits is a warning)")
+toe_models = [("Theia's toe angle both ways (v3)", clear_theia_toe),
+              ('rigid boot', clear_rigid),
+              ('toe bent by the belt alone', clear_contact),
+              ('toe bent by Theia extension or belt (used)' if toe_use_theia_extension
+               else 'toe bent by the belt alone (used)',
+               {b: foot_clearance[f'{side_name[b]}_min_z'].to_numpy() for b in limbs})]
+print("  each model of the toe cap, steady swings: % of swing frames BELOW the belt,")
+print("  and the lowest sole point in mid-swing (30-80% of each swing), mm")
+print("      foot   model                                      below   median  5th pct  minimum")
 for b in limbs:
-    sw = swing_rows[b]
-    v3 = 100 * np.mean(clear_theia_toe[b][sw] < 0) if b in clear_theia_toe else np.nan
-    print(f"      {side_name[b]:5s}  {v3:30.1f}%   {100 * np.mean(clear_rigid[b][sw] < 0):9.1f}%   "
-          f"{100 * np.mean(foot_clearance[f'{side_name[b]}_min_z'].to_numpy()[sw] < 0):21.1f}%")
-    if b in clear_theia_toe:
-        th_sw = kinematic_data[f'{side_name[b]}_Toes_Joint_Angle'].to_numpy(float)[sw]
-        print(f"             Theia's toe angle in swing: median {np.nanmedian(th_sw):+.1f} deg, "
-              f"5-95% {np.nanpercentile(th_sw, 5):+.1f} to {np.nanpercentile(th_sw, 95):+.1f} deg")
-    print(f"             toe-cap bend needed at push-off: median "
-          f"{np.nanmedian(toe_bend_deg[b][stance_rows[b] & (toe_bend_deg[b] > 0)]) if (stance_rows[b] & (toe_bend_deg[b] > 0)).any() else 0:.1f} deg; "
-          f"in swing it is bent in {100 * np.mean(toe_bend_deg[b][sw] > 0):.1f}% of frames")
-print("  A swing frame bent 'only by the belt' means the REST of the boot is")
-print("  posed below the belt: that is Theia pose error, and is reported, not hidden.")
-
-# the same comparison as the MFC histogram sees it: the lowest point of each
-# swing between 30% and 80% of it, under each model of the toe
-print("  lowest sole point in mid-swing (30-80% of each steady swing), mm:")
-print("      foot   model                          median   5th pct   minimum")
-for b in limbs:
-    models = [('boot bent by Theia (v3)', clear_theia_toe.get(b)), ('rigid boot', clear_rigid[b]),
-              ('bent only by the belt (v4)', foot_clearance[f'{side_name[b]}_min_z'].to_numpy())]
-    for label, h in models:
-        if h is None or not mid_swings[b]:
+    for label, hh in toe_models:
+        if b not in hh or not mid_swings[b]:
             continue
+        h = hh[b]
         lows = 1000 * np.array([np.nanmin(h[sl]) if np.isfinite(h[sl]).any() else np.nan for sl in mid_swings[b]])
-        print(f"      {side_name[b]:5s}  {label:28s} {np.nanmedian(lows):7.1f}  {np.nanpercentile(lows, 5):8.1f}  "
-              f"{np.nanmin(lows):8.1f}")
+        print(f"      {side_name[b]:5s}  {label:42s} {100 * np.mean(h[swing_rows[b]] < 0):5.1f}%  "
+              f"{np.nanmedian(lows):7.1f}  {np.nanpercentile(lows, 5):7.1f}  {np.nanmin(lows):7.1f}")
+    th_sw = theia_toe_deg[b][swing_rows[b]]
+    if np.isfinite(th_sw).any():
+        print(f"             Theia's toe angle in swing: median {np.nanmedian(th_sw):+.1f} deg, "
+              f"5-95% {np.nanpercentile(th_sw, 5):+.1f} to {np.nanpercentile(th_sw, 95):+.1f} deg "
+              f"(+ = extension)")
+
+# --- the force plates as ground truth -------------------------------------------------
+# At a force-plate heel strike the boot touches the belt, and at a force-plate
+# toe-off it leaves it: within a frame or two of each, the boot's lowest point
+# must be ON the belt. (Within +-20 ms, because at 100 Hz the frame before a
+# landing can still be several mm up.) At toe-off the toe is the last point
+# on the belt, so the boot posed with Theia's toe angle checks that angle.
+anchor_win = 2                                    # frames either side of the event
+anchor_hs = {b: [] for b in limbs}
+anchor_to = {b: [] for b in limbs}
+for x in range(len(g)):
+    if not steady[x]:
+        continue
+    b = g['support_limb'][x]
+    for src, ev, store, hh in (('heel_strike_source', hs, anchor_hs, clear_rigid),
+                               ('toe_off_source', to, anchor_to, clear_theia_toe)):
+        if g[src][x] != 'GRF' or not np.isfinite(ev[x]) or b not in hh:
+            continue
+        r_ = frame_to_row(ev[x])
+        w_ = hh[b][max(int(np.floor(r_)) - anchor_win, 0):int(np.ceil(r_)) + anchor_win + 1]
+        if np.isfinite(w_).any():
+            store[b].append(1000 * float(np.nanmin(w_)))
+print("  at the FORCE-PLATE events (steady steps), the lowest point within +-20 ms; 0 = on the belt:")
+for b in limbs:
+    hs_, to_ = np.array(anchor_hs[b]), np.array(anchor_to[b])
+    line = f"      {side_name[b]:5s}"
+    if len(hs_):
+        line += (f"  heel strike, rigid boot {np.median(hs_):+5.1f} mm "
+                 f"(IQR {np.percentile(hs_, 25):+.1f} to {np.percentile(hs_, 75):+.1f})")
+    if len(to_):
+        line += (f";  toe-off, toe by Theia's angle {np.median(to_):+5.1f} mm "
+                 f"(IQR {np.percentile(to_, 25):+.1f} to {np.percentile(to_, 75):+.1f})")
+    print(line)
+print("  (below 0: Theia poses the boot too LOW at that instant, and probably through the")
+print("   swing next to it; above 0: too high. Within +-3 mm is as good as the belt fit.")
+print("   Toe-off near 0 says Theia's toe angle follows the real toe cap as it leaves the")
+print("   belt, the evidence for using its extension in swing)")
 
 if make_figures:
     # ----Plotting the minimum foot position (version 3's figure, three models)
@@ -1295,7 +1443,9 @@ if make_figures:
         ax.plot(kin_frames[:n_plot], 1000 * clear_theia_toe[b][:n_plot], color='#bbbbbb', lw=1,
                 label="toe cap bent by Theia's toe angle (v3)")
     ax.plot(kin_frames[:n_plot], 1000 * foot_clearance['Right_min_z'].to_numpy()[:n_plot], color='k', lw=1,
-            label='toe cap bent only by the belt (v4)')
+            label='model used (Theia extension or the belt, whichever lifts more)')
+    ax.plot(kin_frames[:n_plot], 1000 * clear_rigid[b][:n_plot], color='#2a5d9f', lw=0.8, alpha=0.6,
+            label='rigid boot')
     ax.axhline(0, color='#d94f04', lw=1)
     ax.set_xlim(kin_frames[0], kin_frames[n_plot - 1])
     ax.set_xlabel('Frame')
@@ -1398,11 +1548,13 @@ print(f"  Schulz (2017) regression at {belt_speed / participant_leg_length:.2f} 
       f"~{mfc_expected:.0f} mm")
 mfc_neg = int((mfc < 0).sum())
 if mfc_neg:
-    print(f"  ! {mfc_neg} MTC events are below the belt. The toe cap no longer bends in")
-    print("    swing, so this is the pose of the FOOT itself: check the tracking there")
+    print(f"  ! {mfc_neg} MTC events are below the belt. The toe cap cannot cause that")
+    print("    any more, so it is the pose of the FOOT itself: check the tracking there")
 if mfc.median() < 0.005:
-    print("  ! a median under 5 mm is lower than any healthy group reported; check the")
-    print("    belt surface fit and the boot binding before interpreting it")
+    print("  ! a median under 5 mm is lower than any healthy group reported. Read the")
+    print("    force-plate check in BOOTS AND THE BELT: if the boot is posed below the")
+    print("    belt at the force-plate events, Theia places the swinging foot too low,")
+    print("    and MFC and TRI from this trial measure that, not the walker")
 
 
 # =============================================================================
@@ -1469,7 +1621,15 @@ mos_com_body = xyz('Whole_body_COG')
 mos_com = mos_com_body.copy()
 load_offset_local = np.full(3, np.nan)
 trunk_pos = xyz('Trunk_Position')
-if (quiet_rows is not None and np.isfinite(load_kg) and load_kg >= load_min_kg
+# REVISED (after D05): a load under load_place_min_kg (boots, clothing, a light
+# vest; D05 C1 weighed 4.7 kg) is not placed. The equation above multiplies any
+# CoP or CoM error by m / m_load (x18 at 4.7 kg), so its answer is noise, and
+# putting it on the trunk instead moved the CoM 19 mm on a guess. It is spread
+# like the body: the CoM stays Theia's, the mass is the one weighed.
+if np.isfinite(load_kg) and load_min_kg <= load_kg < load_place_min_kg:
+    print(f"  load {load_kg:.1f} kg is under {load_place_min_kg:g} kg (boots, clothing): spread like the "
+          f"body, the CoM is Theia's and the mass the one weighed ({system_mass:.1f} kg)")
+elif (quiet_rows is not None and np.isfinite(load_kg) and load_kg >= load_place_min_kg
         and trunk_pos is not None and np.isfinite(quiet_cop).all()):
     lo, hi = xyz('Low_Back_Position'), xyz('Neck_Position')
     up = np.tile([0.0, 0.0, 1.0], (n_frames, 1))
@@ -1573,6 +1733,7 @@ print(f"  fusion moved the velocity by {mos_delta[0]:.1f} / {mos_delta[1]:.1f} /
 
 # the boot's extent along the direction of travel and across it, every frame
 boot_front = {b: np.nanmax(sole_world[b][..., :2] @ forward, axis=1) for b in limbs}
+boot_rear = {b: np.nanmin(sole_world[b][..., :2] @ forward, axis=1) for b in limbs}
 boot_left = {b: np.nanmax(sole_world[b][..., :2] @ lateral, axis=1) for b in limbs}
 boot_right = {b: np.nanmin(sole_world[b][..., :2] @ lateral, axis=1) for b in limbs}
 
@@ -1638,7 +1799,7 @@ if gait_event_data.loc[steady, 'mos_ap_min'].mean() > 0:
     print("    support the xCoM should pass the stance boot's front. Check the belt speed")
 mos_gap = 1000 * (gait_event_data.loc[steady, 'mos_ml_contact'] - gait_event_data.loc[steady, 'mos_ml_contact_ankle'])
 print(f"  boot edge vs ankle joint centre: the boot gives a margin {mos_gap.mean():.1f} +- "
-      f"{mos_gap.std():.1f} mm larger (the ankle-to-edge distance; expect 30-80 mm)")
+      f"{mos_gap.std():.1f} mm larger (the ankle-to-edge distance; expect 30-100 mm for a boot)")
 if gait_event_data['mos_handrail_contact'][steady].any():
     print(f"  {int(gait_event_data['mos_handrail_contact'][steady].sum())} steady steps had a hand "
           f"on a rail: their margins rest on a velocity whose assumption does not hold")
@@ -2027,6 +2188,7 @@ kmx_ensemble = {'L': [], 'R': []}
 kmx_ensemble_ap = {'L': [], 'R': []}
 kmx_cop_paths = {'L': [], 'R': []}
 kmx_first, kmx_second = [], []
+kmx_past_toe, kmx_past_heel = [], []
 dt = 1.0 / force_fs
 for x in np.flatnonzero(kmx_trusted & steady):
     belt = kmx_belt[x]
@@ -2077,6 +2239,13 @@ for x in np.flatnonzero(kmx_trusted & steady):
         gait_event_data.loc[x, 'cop_ml_range_mm'] = 1000 * np.ptp(cp @ lateral)
         if len(kmx_cop_paths[belt]) < 40:
             kmx_cop_paths[belt].append(1000 * np.column_stack([(cp - cp[0]) @ lateral, (cp - cp[0]) @ forward]))
+        # REVISED (after D05), a check: the CoP must lie under the boot. How far,
+        # at its most, does it pass the posed boot's toe and its heel?
+        limb_ = g['support_limb'][x]
+        rows_ = (a + cp_ok) / force_step
+        along_ = filtfilt(b_cop, a_cop, cop_theia[belt][a:b_][cp_ok], axis=0) @ forward
+        kmx_past_toe.append(1000 * np.nanmax(along_ - at(boot_front[limb_], rows_)))
+        kmx_past_heel.append(1000 * np.nanmax(at(boot_rear[limb_], rows_) - along_))
     gait_event_data.loc[x, 'free_moment_peak_nm'] = np.nanmax(np.abs(free_moment[belt][a:b_]))
 
     kmx_ensemble[g['support_limb'][x]].append(normalize(vt / system_weight, kmx_norm_points))
@@ -2099,10 +2268,27 @@ if np.mean(kmx_first) > 0 or np.mean(kmx_second) < 0:
 # 2. at steady speed propulsion cancels braking
 kmx_net = (kmx_steady['propulsive_impulse_bw'] + kmx_steady['braking_impulse_bw']).mean()
 kmx_prop = kmx_steady['propulsive_impulse_bw'].mean()
-print(f"  net AP impulse {kmx_net:+.5f} BW*s ({100 * abs(kmx_net / kmx_prop):.1f}% of the propulsive impulse)")
+print(f"  net AP impulse {kmx_net:+.5f} BW*s ({100 * abs(kmx_net / kmx_prop):.1f}% of the propulsive impulse)"
+      + (f"; the forces were turned by {force_tilt_ap_deg:+.2f} deg along travel (Forces cell)"
+         if force_align_gravity and 0.01 < force_tilt_deg <= force_max_tilt_deg else ""))
 if abs(kmx_net) > 0.1 * abs(kmx_prop):
-    print("  ! that should be near zero at steady speed: check the AP baseline")
-# 3. each foot carries about half the weight over a stride
+    print("  ! that should be near zero at steady speed: check the AP baseline and the tilt")
+# 3. the CoP stays under the boot, and its excursion fits the boot
+if kmx_past_toe:
+    kmx_toe, kmx_heel = float(np.nanmedian(kmx_past_toe)), float(np.nanmedian(kmx_past_heel))
+    kmx_boot = 1000 * np.mean([boot_length[b] for b in limbs])
+    print(f"  CoP vs the posed boot: at its most it passes the toe by {kmx_toe:+.0f} mm and the heel by "
+          f"{kmx_heel:+.0f} mm (median of the stances; <= 0 = under the boot)")
+    print(f"  CoP excursion along travel {kmx_steady['cop_ap_range_mm'].mean():.0f} mm = "
+          f"{100 * kmx_steady['cop_ap_range_mm'].mean() / kmx_boot:.0f}% of the boot's sole ({kmx_boot:.0f} mm)")
+    if kmx_toe > 15 and kmx_heel > 15:
+        print("  ! past BOTH ends: the plate's CoP is probably computed at the force sensors,")
+        print("    not at the belt surface. The error is height x F_AP / F_z: backwards while")
+        print("    braking, forwards at push-off, so the excursion comes out too long. The")
+        print("    other kinetics (forces, impulses) are not affected")
+    elif max(kmx_toe, kmx_heel) > 15:
+        print("  ! past one end only: an offset between the plates and Theia along travel")
+# 4. each foot carries about half the weight over a stride
 kmx_share = (kmx_steady['vertical_impulse_tw'] / kmx_steady['stride_time']).mean()
 print(f"  vertical impulse per stance = {100 * kmx_share:.1f}% of total weight x stride time (expect ~50%)")
 if abs(kmx_share - 0.5) > 0.03:
@@ -2226,9 +2412,12 @@ for ss_c in ss_candidates:
         stride_series_usable.append(ss_c)
 print(f"\n  {len(stride_series_usable)} series are over 95% complete and carry forward")
 
+# REVISED (after D05): stride length and stride speed are paced too. With the
+# belt speed fixed, L = v T + heel advance, so a metronome that paces T paces L
+# (D05: alpha 0.31 for stride length, against 0.6-0.9 uncued; Dingwell 2010)
 ss_cued = {'stride_time', 'stance_time', 'swing_time', 'step_time', 'cadence',
            'stance_percentage', 'swing_percentage', 'double_support_percentage',
-           'single_support_percentage'}
+           'single_support_percentage', 'stride_length', 'stride_velocity'}
 ss_uncued = [c_ for c_ in stride_series_usable if c_ not in ss_cued]
 print(f"  with a metronome, prefer the {len(ss_uncued)} it does not pace:")
 print(f"    {', '.join(ss_uncued[:6])}{' ...' if len(ss_uncued) > 6 else ''}")
@@ -2904,6 +3093,7 @@ def lit_table_value(table, key_col, key, col):
 
 
 lit_speed_ll = belt_speed / participant_leg_length
+lit_paced = bool(metronome_paced) if metronome_paced is not None else ('bpm' in trial.lower())
 
 # --- the trial's key values ------------------------------------------------------
 # name: (value, unit)
@@ -3003,14 +3193,25 @@ literature = {
     'cop_ap_range_mm': (150, 220, 'healthy adults, path over the belt (~60-75% of foot length)', 'gait literature', 'verify'),
     'cop_ml_range_mm': (15, 40, 'healthy adults', 'gait literature', 'verify'),
     'free_moment_peak_nm': (2, 8, 'healthy adults walking', 'Holden & Cavanagh 1991; Li et al. 2001', 'verify'),
-    'dfa_stride_time': (0.20, 0.60, 'METRONOME-cued walking is anti-persistent (uncued 0.75-0.90)', 'Hausdorff et al. 1996; Terrier et al. 2005; Terrier 2016', 'verify'),
-    'dfa_stride_length': (0.60, 0.90, 'healthy young adults, treadmill (persistent)', 'Dingwell et al. 2010', 'confirmed'),
+    'dfa_stride_time': ((0.20, 0.60, 'METRONOME-cued walking is anti-persistent', 'Hausdorff et al. 1996; Terrier et al. 2005; Terrier 2016', 'verify')
+                        if lit_paced else
+                        (0.75, 0.90, 'healthy adults, uncued', 'Hausdorff et al. 1996; Terrier et al. 2005', 'confirmed')),
+    'dfa_stride_length': ((np.nan, np.nan, 'no range: metronome AND belt pace it (L = v T); the uncued treadmill value is 0.6-0.9', 'Dingwell et al. 2010', '-')
+                          if lit_paced else
+                          (0.60, 0.90, 'healthy young adults, treadmill (persistent)', 'Dingwell et al. 2010', 'confirmed')),
     'dfa_stride_velocity': (0.20, 0.40, 'healthy young adults, treadmill (anti-persistent)', 'Dingwell et al. 2010; Terrier 2012', 'confirmed'),
     'dfa_step_width': (0.60, 0.90, 'healthy young adults, treadmill (persistent)', 'Dingwell & Cusumano 2015', 'verify'),
     'gem_perpendicular_dfa': (0.20, 0.50, 'healthy young adults, treadmill', 'Dingwell et al. 2010', 'verify'),
-    'gem_parallel_dfa': (0.70, 1.00, 'healthy young adults, treadmill', 'Dingwell et al. 2010', 'verify'),
+    'gem_parallel_dfa': ((np.nan, np.nan, 'no range: with a metronome the goal-equivalent direction is paced too; uncued treadmill 0.7-1.0', 'Dingwell et al. 2010', '-')
+                         if lit_paced else
+                         (0.70, 1.00, 'healthy young adults, treadmill', 'Dingwell et al. 2010', 'verify')),
     'foot_placement_r2': (0.60, 0.90, 'healthy adults, ML, mid-stance (> 0.8 with pelvis state)', 'Wang & Srinivasan 2014', 'confirmed'),
-    'lds_lambda_S_trunkVel_AP': (0.40, 0.60, 'healthy adults, trunk, per stride (0.50 +- 0.06); strongly method dependent', 'van Schooten et al. 2011', 'verify'),
+    # REVISED (after D05, lambda_S = 2.3): no range. lambda_S depends on the
+    # signal, the state space, the embedding, the time normalisation and the
+    # fit window, so published values differ several-fold between methods
+    # (Bruijn et al. 2013, review); none used this state space. Compare
+    # conditions, with the same settings, never against a published number.
+    'lds_lambda_S_trunkVel_AP': (np.nan, np.nan, 'no range: depends on the state space and settings; compare conditions', 'Bruijn et al. 2013 (review)', '-'),
     'hr_AP': (3.0, 4.0, 'healthy young adults, trunk accelerometer', 'Menz et al. 2003; Lowry et al. 2012', 'confirmed'),
     'hr_VT': (3.0, 4.0, 'healthy young adults, trunk accelerometer', 'Menz et al. 2003; Lowry et al. 2012', 'confirmed'),
     'hr_ML': (2.0, 2.7, 'healthy young adults, trunk accelerometer', 'Menz et al. 2003; Lowry et al. 2012', 'confirmed'),

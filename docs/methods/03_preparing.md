@@ -78,13 +78,14 @@ The boots of §3 are posed on Theia's feet in every frame. For every frame and b
 $$T_z = M_z - \left(r_x F_y - r_y F_x\right),\qquad \mathbf{r} = \text{CoP} - \mathbf{o},$$
 where $\mathbf{o}$ is the plate's moment origin. Because the export does not give $\mathbf{o}$, it is recovered from the data: $o_x = \operatorname{median}(\text{CoP}_x + M_y/F_z)$ and $o_y = \operatorname{median}(\text{CoP}_y - M_x/F_z)$.
 7. **Handrails.** Any handrail force more than **15 N** from its median counts as a hand on the rail (`HANDRAIL_N`). The GRF then misses an external force. Steps with handrail contact are flagged, and their share is reported (`handrail_steps_pct`).
+8. **Levelling** (`align_gravity()`). Over minutes of steady walking the body does not accelerate, so the mean total GRF is the weight and points straight up, whatever the treadmill's incline. If the mean leans, the plates' axes are tilted against Theia's (corner survey, registration, or an export that was already levelled). The tilt is then undone as a rotation (`FORCE_ALIGN_GRAVITY`), up to 3° (`FORCE_MAX_TILT_DEG`). A larger lean is reported, not corrected. On D05 the lean was about 1°. That leaks sin 1° of the vertical force into AP and gives a net braking impulse of about 0.01 BW·s per stance, a quarter of the propulsive impulse.
 
 ::: {custom-style="Why Box"}
 **Why recover the moment origin** — the free moment is small (a few N·m) compared with the moments of the vertical force about the plate centre (hundreds of N·m). An origin that is wrong by 1 cm gives an error comparable to the free moment itself. The origin is exactly the point about which $\text{CoP} = (-M_y/F_z, M_x/F_z)$ holds, so it can be read back from the exported CoP and moments.
 :::
 
 ::: {custom-style="Code Box"}
-**In the code** — §5.4: `read_forces()`. Settings: `FORCE_FILTER_HZ`, `HANDRAIL_N`. The plate geometry and registration come from `detect_gait_events.py` (`fit_plate`, the saved `lab_to_theia`).
+**In the code** — §5.4: `read_forces()`, `align_gravity()`. Settings: `FORCE_FILTER_HZ`, `HANDRAIL_N`, `FORCE_ALIGN_GRAVITY`, `FORCE_MAX_TILT_DEG`. The plate geometry and registration come from `detect_gait_events.py` (`fit_plate`, the saved `lab_to_theia`).
 :::
 
 ## 5.5 Quiet standing: weighing body + load
@@ -142,11 +143,11 @@ $$\mathbf{x}_\ell(t) = \mathbf{x}_{trunk}(t) + \mathbf{R}_{trunk}(t)\,\mathbf{d}
 ![Figure 11. Placing the load (synthetic trial: 20 kg, 150 mm behind the trunk). A: side view in the quiet standing. The standing CoP (green dotted line) is below the system CoM (black diamond), which lies on the line between the body CoM (blue) and the load (orange). Knowing the two masses, the load is placed on that line. B: the equations. The load was recovered 155 mm behind the trunk, and the system CoM is 83 mm from the body's.](figures/fig11.png){width=6.5in}
 
 ::: {custom-style="Why Box"}
-**Why the system CoM** — a 20–40 kg pack moves the centre of mass by several centimetres, backwards and upwards. The margin of stability (§10) and CoM work (§9) concern the mass that has to be kept over the feet and moved: body **and** load. **Why centre it left-right** — the equation divides by $m_\ell$, so any CoP error is multiplied by $m/m_\ell$. That factor is about 5 for a 20 kg load on an 80 kg body, so a few millimetres of registration error would place the load centimetres to one side. Packs and vests are symmetric, so the mid-line is the better estimate. **Why carry it with the trunk** — a pack moves with the trunk, and the trunk leans and sways in every stride. **Why the 0.40 m check** — a load placed more than 40 cm from the trunk is physically implausible and means the standing or the body mass is wrong. It is then placed on the trunk instead, with a warning (`LOAD_MAX_OFFSET_M`).
+**Why the system CoM** — a 20–40 kg pack moves the centre of mass by several centimetres, backwards and upwards. The margin of stability (§10) and CoM work (§9) concern the mass that has to be kept over the feet and moved: body **and** load. **Why centre it left-right** — the equation divides by $m_\ell$, so any CoP error is multiplied by $m/m_\ell$. That factor is about 5 for a 20 kg load on an 80 kg body, so a few millimetres of registration error would place the load centimetres to one side. Packs and vests are symmetric, so the mid-line is the better estimate. **Why carry it with the trunk** — a pack moves with the trunk, and the trunk leans and sways in every stride. **Why the 0.40 m check** — a load placed more than 40 cm from the trunk is physically implausible and means the standing or the body mass is wrong. It is then placed on the trunk instead, with a warning (`LOAD_MAX_OFFSET_M`). **Why light loads are not placed** — below 10 kg (`LOAD_PLACE_MIN_KG`) the factor $m/m_\ell$ makes the answer noise: 18 for D05's 4.7 kg of boots and clothing. Such a load is spread over the body anyway, so the CoM stays Theia's. The mass is still the one weighed.
 :::
 
 ::: {custom-style="Code Box"}
-**In the code** — §5.6: `trunk_frame()`, `system_com()`. Settings: `LOAD_MIN_KG`, `LOAD_HEIGHT_M`, `LOAD_CENTRED`, `LOAD_MAX_OFFSET_M`. Results: `load_offset_x_m`, `load_offset_y_m`, `load_offset_z_m` (trunk frame: x right, y forward, z up).
+**In the code** — §5.6: `trunk_frame()`, `system_com()`. Settings: `LOAD_MIN_KG`, `LOAD_PLACE_MIN_KG`, `LOAD_HEIGHT_M`, `LOAD_CENTRED`, `LOAD_MAX_OFFSET_M`. Results: `load_offset_x_m`, `load_offset_y_m`, `load_offset_z_m` (trunk frame: x right, y forward, z up).
 :::
 
 ## 5.7 CoM velocity: markers and force plates together

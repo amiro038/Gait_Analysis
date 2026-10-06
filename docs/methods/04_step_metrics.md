@@ -40,15 +40,17 @@ The second term is small. It is how much further forward (or back) in the lab th
 ![Figure 13. A: a heel strike seen from above, with travel to the right. The step length is the distance along the belt from the other heel (open circle) to the landing heel (filled circle); the step width is the distance across it. B: why two step lengths do not add up to a stride on a belt. During one stance the heel is compared with a point riding the belt. It stays with the belt through mid-stance (flat part), but by the other foot's heel strike (dashed line) it has already started to lift, 30–50 mm ahead of where it landed.](figures/fig13.png){width=6.5in}
 
 ::: {custom-style="Why Box"}
-**Why heels** — the heel is the point that lands, and it is tracked well at heel strike. **Why along and across the belt** — see §1.3: projecting on Theia's X and Y would move part of the step length into the width. **Why stride length is not two step lengths** — overground, a stride is the sum of two steps. On a belt, the rear heel has already begun to lift, and has moved relative to the belt, by the time the other foot lands (Fig. 13B). Two heel-to-heel step lengths therefore overestimate the stride by 30–50 mm each. Measuring the foot's travel over the belt gives the true stride. It also makes stride speed ($L/T$) equal to the belt speed on average, which is the task goal used by the GEM (§17).
+**Why heels** — the heel is the point that lands, and it is tracked well at heel strike. **Why along and across the belt** — see §1.3: projecting on Theia's X and Y would move part of the step length into the width. **Why stride length is not two step lengths** — overground, a stride is the sum of two steps. On a belt, the rear heel has already begun to lift, and has moved relative to the belt, by the time the other foot lands (Fig. 13B). Two heel-to-heel step lengths therefore fall 30–50 mm short of the stride each (D05: 96 mm per stride). Measuring the foot's travel over the belt gives the true stride. It also makes stride speed ($L/T$) equal to the belt speed on average, which is the task goal used by the GEM (§17).
 :::
 
 ## 6.3 Where the events came from
 
 Each step also records `events_from_kinematics` (either event came from Zeni or was interpolated) and `events_interpolated`. The per-step data can therefore be filtered to force-plate events only, to check that a result does not depend on the event source.
 
+**Gross event errors.** A missed, doubled or misplaced event makes a step that cannot be gait: on D05, a step length of −0.38 m and a cadence of 144 steps/min at a 108-beat metronome. A steady step is taken out of steady walking for every metric if any of these is more than **5 robust SDs** (1.4826 × MAD) from its foot's median: stride, step, stance or swing time, step length or step width (`OUTLIER_ROBUST_Z`). A step length ≤ 0 is also taken out. The step keeps the flag `gait_outlier`. A robust 5 catches only what cannot be a real step, while Hausdorff-type screens remove everything beyond 3 SD of the mean. One bad event then cannot inflate a CV, a DFA α or a margin.
+
 ::: {custom-style="Code Box"}
-**In the code** — §6: `spatiotemporal()`. Per-step columns in `{trial}_steps.csv`: `stance_s`, `swing_s`, `stride_s`, `step_s`, `cadence_spm`, `initial_ds_s`, `terminal_ds_s`, `double_support_s`, `single_support_s` and their `_pct`, `step_length_m`, `step_width_m`, `stride_length_m`, `stride_speed_ms`, `walk_ratio`.
+**In the code** — §6: `spatiotemporal()`. Per-step columns in `{trial}_steps.csv`: `stance_s`, `swing_s`, `stride_s`, `step_s`, `cadence_spm`, `initial_ds_s`, `terminal_ds_s`, `double_support_s`, `single_support_s` and their `_pct`, `step_length_m`, `step_width_m`, `stride_length_m`, `stride_speed_ms`, `walk_ratio`, `gait_outlier`. Setting: `OUTLIER_ROBUST_Z = 5`.
 :::
 
 ::: {custom-style="Range Box"}

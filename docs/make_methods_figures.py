@@ -1088,8 +1088,8 @@ def fig_table(d):
     import pandas as pd
     wide = pd.read_csv(d["work"] / "analysis" / "all_trials_metrics.csv")
     cols = ["stance_pct", "double_support_pct", "step_width_m", "stride_s_cv", "mfc_m", "f1_bw",
-            "mos_ml_contact", "harmonic_ratio_hr_AP", "dfa_alpha_stride_s_R", "lds_lambda_S_trunkVel_AP"]
-    cols = [c for c in cols if c in wide]
+            "mos_ml_contact", "harmonic_ratio_hr_AP", "dfa_alpha_stride_s_R", "foot_placement_r2_R"]
+    cols = [c for c in cols if c in wide and ga.reference_for(c) is not None]
     fig, ax = plt.subplots(figsize=(W, 0.32 * len(cols) + 0.7))
     for k, c in enumerate(cols):
         lo, hi = ga.reference_for(c)[:2]
