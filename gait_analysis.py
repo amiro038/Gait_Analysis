@@ -515,6 +515,42 @@ def contact_toe_pose(pose, sole, long_axis, surface, b, extension=None):
     return pose @ H, np.degrees(bend)
 
 
+def foot_flat_surface(t, pose, soles, every=3):
+    """Belt height under a point = floor[boot] + slope * (distance along
+    travel), least squares on the rigid boots' lowest sole point in foot-flat
+    (BELT_FLAT of every steady stance, every third stance), outliers over
+    3 MAD dropped and refitted. None if too few points."""
+    pts = {b: [] for b in LIMBS}
+    s = t.steps[t.steps["steady"]]
+    for st in s.iloc[::every].itertuples():
+        if not (np.isfinite(st.hs) and np.isfinite(st.to)):
+            continue
+        r0 = int(np.ceil(st.hs + BELT_FLAT[0] * (st.to - st.hs)))
+        r1 = int(np.floor(st.hs + BELT_FLAT[1] * (st.to - st.hs)))
+        P = pose[st.limb][r0:r1 + 1]
+        W = (soles[st.limb]["v"] @ P[:, :3, :3].transpose(0, 2, 1)
+             + P[:, None, :3, 3])
+        z = np.where(np.isfinite(W[..., 2]), W[..., 2], np.inf)
+        low = W[np.arange(len(W)), z.argmin(1)]
+        pts[st.limb].append(low[np.isfinite(low).all(1)])
+    pts = {b: np.vstack(v) if v else np.zeros((0, 3)) for b, v in pts.items()}
+    if min(len(v) for v in pts.values()) < 30:
+        return None
+    keep = {b: np.ones(len(v), bool) for b, v in pts.items()}
+    for _ in range(4):
+        A = np.vstack([np.column_stack([np.full(keep[b].sum(), b == "L"),
+                                        np.full(keep[b].sum(), b == "R"),
+                                        pts[b][keep[b], :2] @ t.forward])
+                       for b in LIMBS]).astype(float)
+        z = np.concatenate([pts[b][keep[b], 2] for b in LIMBS])
+        fl, fr, slope = np.linalg.lstsq(A, z, rcond=None)[0]
+        floor = {"L": float(fl), "R": float(fr)}
+        for b in LIMBS:
+            r = pts[b][:, 2] - floor[b] - slope * (pts[b][:, :2] @ t.forward)
+            keep[b] = np.abs(r) < 3 * 1.4826 * np.median(np.abs(r)) + 1e-4
+    return dict(floor=floor, slope=float(slope), forward=np.asarray(t.forward))
+
+
 class Boots:
     def __init__(self, trial, verts, summary):
         pose = trial.pose
@@ -529,15 +565,13 @@ class Boots:
                 np.full(len(pose[b]), dge.TOE_REFERENCE_DEG), None, sole_v)
             self.sole[b] = dict(v=sole_v, toe=toe, toe_pose=None, mtp=mtp)
         self.pose = pose
-        # the belt surface (one slope, one offset per boot), as fitted by the
-        # event detection and saved in its summary; refitted on the rigid
-        # boots (foot flat) if missing
-        s = summary.get("belt_surface")
-        if s and "walking_direction" in summary:
-            fwd = np.asarray(summary["walking_direction"], float)
-            self.surface = dict(floor=s["floor_m"], forward=fwd,
-                                slope=float(np.tan(np.radians(s["slope_deg"]))))
-        else:
+        # the belt surface (one slope, one offset per boot), fitted to the
+        # rigid boots' lowest point in FOOT-FLAT. The event detection's fit
+        # (every frame's lowest point, push-off and landing included) is kept
+        # for comparison only: on D05 it came out 2.3 deg against the plates'
+        # 0.8, which over the ~0.35 m a foot travels to mid-swing is ~8 mm
+        self.surface = foot_flat_surface(trial, pose, self.sole)
+        if self.surface is None:
             fwd = dge.walking_direction(pose, self.long_axis)
             self.surface = dge.fit_belt_surface(pose, self.sole, fwd)
         # the toe cap, bent only as far as the belt requires

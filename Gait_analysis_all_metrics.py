@@ -51,6 +51,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+plt.rcParams['figure.max_open_warning'] = 0       # one figure per check, ~30 in all
 from scipy.signal import savgol_filter, butter, filtfilt, sosfiltfilt
 from scipy.spatial import cKDTree
 from scipy.interpolate import PchipInterpolator, CubicSpline
@@ -907,6 +908,44 @@ if not np.isfinite(body_mass):
     print("  ! no body mass entered: per-body-weight kinetics use the system weight instead")
     body_mass, body_weight = system_mass, system_weight
 
+# --- timing: do the force plates and Theia run on the same clock? ------------------
+# REVISED (after D05), a check. The force file and the Theia export are taken
+# to start together. If they do not, every force-plate event is read at the
+# wrong kinematic instant (at 1.3 m/s a 20 ms offset is 26 mm of belt travel).
+# Newton gives the test: the system CoM's vertical acceleration from the
+# plates, GRF / m - g, and from Theia, the second derivative of
+# Whole_body_COG, are the same signal. The lag that best lines them up
+# (0.5-8 Hz, both filtered without phase shift) is the offset between the
+# two clocks. Positive = Theia's signal comes LATER than the force's.
+sync_lag_ms, sync_r = np.nan, np.nan
+sync_com = xyz('Whole_body_COG')
+if sync_com is not None:
+    sync_r0 = int(frame_to_row(hs[steady].min()))
+    sync_r1 = min(int(frame_to_row(hs[steady].max())), n_force // force_step - 1)
+    sync_az = savgol_filter(fill_gaps(sync_com[:, 2])[0], 11, 3, deriv=2, delta=1.0 / kinematic_fs)
+    sync_fz = sosfiltfilt(butter(4, 40.0, fs=force_fs, output='sos'),
+                          grf_raw['L'][:, 2] + grf_raw['R'][:, 2])
+    sync_af = sync_fz[np.arange(n_frames)[:sync_r1 + 1] * force_step] / system_mass - gravity
+    sync_band = butter(2, [0.5, 8.0], btype='band', fs=kinematic_fs, output='sos')
+    sync_x = sosfiltfilt(sync_band, sync_af[sync_r0:sync_r1])
+    sync_y = sosfiltfilt(sync_band, sync_az[sync_r0:sync_r1])
+    sync_k = np.arange(-15, 16)
+    sync_c = np.array([np.corrcoef(sync_x[max(0, -k):len(sync_x) - max(0, k)],
+                                   sync_y[max(0, k):len(sync_y) - max(0, -k)])[0, 1] for k in sync_k])
+    i_ = int(np.argmax(sync_c))
+    sync_frac = 0.0
+    if 0 < i_ < len(sync_k) - 1:
+        den = sync_c[i_ - 1] - 2 * sync_c[i_] + sync_c[i_ + 1]
+        sync_frac = 0.5 * (sync_c[i_ - 1] - sync_c[i_ + 1]) / den if den != 0 else 0.0
+    sync_lag_ms = 1000.0 * (sync_k[i_] + sync_frac) / kinematic_fs
+    sync_r = float(sync_c[i_])
+    print(f"  clocks: Theia's CoM acceleration matches the plates' best {sync_lag_ms:+.0f} ms later "
+          f"(r = {sync_r:.2f}; 0 = in sync)")
+    if abs(sync_lag_ms) > 10:
+        print(f"  ! the two recordings are about {abs(sync_lag_ms):.0f} ms apart. Every force-plate event is")
+        print("    read at the wrong kinematic instant: fix the offset in step 1 before trusting")
+        print("    anything timed by a force event (step lengths, margins at heel strike)")
+
 
 # =============================================================================
 # %% Local dynamic stability
@@ -1367,10 +1406,20 @@ for x in range(len(g)):
     if steady[x] and np.isfinite(g['stance_time'][x]):
         stance_rows[b][int(np.ceil(frame_to_row(hs[x]))):int(np.floor(frame_to_row(to[x]))) + 1] = True
 es_surface = event_summary.get('belt_surface')
-if es_surface:
-    print(f"  (the event detection fitted {1000 * es_surface['floor_m']['L']:.1f} / "
-          f"{1000 * es_surface['floor_m']['R']:.1f} mm and {es_surface['slope_deg']:+.2f} deg: "
-          f"a gap of several mm between the two fits is a warning)")
+if es_surface and 'walking_direction' in event_summary:
+    # compared WHERE THE FEET ARE: the offsets are heights at distance 0 along
+    # travel, which can be a metre away, so on their own they mean little
+    es_fwd = np.asarray(event_summary['walking_direction'], float)[:2]
+    es_slope = np.tan(np.radians(es_surface['slope_deg']))
+    gap_ = []
+    for b in limbs:
+        p_ = belt_pts[b][belt_keep[b]]
+        mine = belt_offset[b] + belt_slope * (p_[:, :2] @ forward)
+        theirs = es_surface['floor_m'][b] + es_slope * (p_[:, :2] @ es_fwd)
+        gap_.append(1000 * np.median(theirs - mine))
+    print(f"  (the event detection's fit, {es_surface['slope_deg']:+.2f} deg, sits {gap_[0]:+.1f} / {gap_[1]:+.1f} mm"
+          f" from this one under the feet in foot-flat; it is fitted to every frame's lowest point,")
+    print("   push-off and landing included, so this one, from foot-flat only, is used here)")
 toe_models = [("Theia's toe angle both ways (v3)", clear_theia_toe),
               ('rigid boot', clear_rigid),
               ('toe bent by the belt alone', clear_contact),
@@ -1415,6 +1464,31 @@ for x in range(len(g)):
         w_ = hh[b][max(int(np.floor(r_)) - anchor_win, 0):int(np.ceil(r_)) + anchor_win + 1]
         if np.isfinite(w_).any():
             store[b].append(1000 * float(np.nanmin(w_)))
+# and WHEN, relative to each force-plate event, Theia's boot actually touches
+# down (the rigid boot's lowest point first within 3 mm of the belt) and lifts
+# off (the boot, toe bent by the belt, last within 3 mm), searched +-100 ms
+touch_ms = {b: [] for b in limbs}
+lift_ms = {b: [] for b in limbs}
+for x in range(len(g)):
+    if not steady[x]:
+        continue
+    b = g['support_limb'][x]
+    for src, ev, store, hh, first in (('heel_strike_source', hs, touch_ms, clear_rigid, True),
+                                      ('toe_off_source', to, lift_ms, clear_contact, False)):
+        if g[src][x] != 'GRF' or not np.isfinite(ev[x]):
+            continue
+        r_ = frame_to_row(ev[x])
+        r0_ = max(int(np.floor(r_)) - 10, 0)
+        w_ = hh[b][r0_:int(np.ceil(r_)) + 11]
+        on_ = np.flatnonzero(w_ <= 0.003)
+        if not len(on_) or not np.isfinite(w_).all():
+            continue
+        j_ = on_[0] if first else on_[-1]
+        # the crossing of 3 mm, between frame j_ and its neighbour
+        k_ = j_ - 1 if first else j_ + 1
+        if 0 <= k_ < len(w_) and w_[k_] > 0.003:
+            j_ = k_ + (j_ - k_) * (w_[k_] - 0.003) / (w_[k_] - w_[j_])
+        store[b].append(10.0 * (r0_ + j_ - r_) * 100.0 / kinematic_fs)
 print("  at the FORCE-PLATE events (steady steps), the lowest point within +-20 ms; 0 = on the belt:")
 for b in limbs:
     hs_, to_ = np.array(anchor_hs[b]), np.array(anchor_to[b])
@@ -1430,6 +1504,13 @@ print("  (below 0: Theia poses the boot too LOW at that instant, and probably th
 print("   swing next to it; above 0: too high. Within +-3 mm is as good as the belt fit.")
 print("   Toe-off near 0 says Theia's toe angle follows the real toe cap as it leaves the")
 print("   belt, the evidence for using its extension in swing)")
+print("  when Theia's boot touches down and lifts off, against the force plates:")
+for b in limbs:
+    if touch_ms[b] or lift_ms[b]:
+        print(f"      {side_name[b]:5s}  Theia's boot touches down {np.nanmedian(touch_ms[b]):+4.0f} ms after the "
+              f"force-plate heel strike, lifts off {np.nanmedian(lift_ms[b]):+4.0f} ms after its toe-off")
+print("  (the same delay at both events, and the same as the clocks check in FORCES, is a")
+print("   clock offset; a late touch-down with an on-time lift-off is Theia smoothing the landing)")
 
 if make_figures:
     # ----Plotting the minimum foot position (version 3's figure, three models)
