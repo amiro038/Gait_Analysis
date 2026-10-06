@@ -73,6 +73,7 @@ SETTING_NOTES = {       # settings whose comment in the script is shared or miss
     "COP_FRAME": "frame of the exported CoP: \"plate\" = each belt's own frame, origin at its centre (§5.4)",
     "EDGE_HOLD": "samples the raw force must stay across the threshold at an edge (§4.1)",
     "TOE_SIGN": "sign of Theia's toe angle for extension (§3.3)",
+    "TOE_EXTENSION_ONLY": "apply only extension of Theia's toe angle: the belt can lift the toe cap, a flexion never turns it down through the belt (§3.3)",
     "SHARED_MIN_FRAMES": "frames with the other boot on this belt that make a contact \"shared\" (§4.3)",
     "STRADDLE_MIN_FRAMES": "frames with this boot also on the other belt that make it a \"straddle\" (§4.3)",
     "COP_MIN_FORCE_N": "the CoP is used only above this force (§4.3, §5.4)",

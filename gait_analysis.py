@@ -40,8 +40,9 @@
  Sections §2-§4 of the document (equipment, boot meshes, gait events) are
  implemented in build_foot_binding.py and detect_gait_events.py. This file
  borrows the boot geometry from detect_gait_events.py (read_binding,
- boot_sole, toe_hinge, ...), so the events and the metrics see exactly the
- same boot.
+ boot_sole, the MTP of toe_hinge, ...), so the events and the metrics see
+ the same boot. The toe cap is bent only as far as the belt requires
+ (§5.3), never by Theia's toe angle.
 
  RUNNING IT
  ----------
@@ -143,6 +144,9 @@ MFC_LOCAL_WINDOW = 2           # §11 frames either side a minimum must beat
 MFC_SPEED_QUANTILE = 0.75      # §11 MFC must be in the fastest 25% of swing
 SWING_TRIM = 0.02              # §11 trim 2% of the swing at each end
 MIN_CLEARANCE_MM = 1.0         # §11 floor for the trip-risk division
+TRI_DERIV_WINDOW = 7           # §11 Savitzky-Golay frames (order 3), MFC point
+TOE_MAX_BEND_DEG = 60.0        # §5.3 the toe cap never bends further than this
+TOE_BEND_STEP_DEG = 0.5        # §5.3 resolution of the contact-constrained bend
 
 # --- §12 confidence intervals -------------------------------------------------
 N_BOOT = 1000                  # block-bootstrap resamples
@@ -444,6 +448,15 @@ def belt_motion(t, say):
 # WHAT: pose the participant's scanned boot soles on Theia's feet every
 #       frame, bend the toe cap at the MTP, and measure them against the
 #       belt surface.
+# TOE CAP: a boot's toe cap is stiff. It bends at the MTP only when the belt
+#       pushes it up (push-off) and springs back once it is off the belt.
+#       So it is bent by the SMALLEST angle that keeps every toe vertex on
+#       or above the belt, frame by frame: zero in the air, just enough at
+#       push-off. Theia's toe angle is NOT used: its toe segment is fitted to
+#       a foot inside a boot, and a toe FLEXION it reports in swing turns
+#       the toe cap down through the belt (a 25 deg flexion takes the
+#       mid-swing clearance from ~20 mm to ~5 mm, below zero in some
+#       swings; test_gait_analysis_all_metrics.py builds exactly that).
 # WHY:  the base of support (§10) and foot clearance (§11) are about the
 #       real edge and underside of the boot. Joint centres (ankle, "toe")
 #       sit centimetres inside it. The boot geometry is the same one
@@ -454,6 +467,42 @@ def belt_motion(t, say):
 #       direction of travel (for the base of support). Whole-sole positions
 #       are rebuilt only for the frames a swing or a figure needs.
 
+def contact_toe_pose(pose, sole, long_axis, surface, b):
+    """The toes pose: the foot pose turned about the MTP by the smallest
+    angle (0 to TOE_MAX_BEND_DEG) that keeps every toe vertex on or above
+    the belt. -> (toe pose (F, 4, 4), bend in degrees (F,)).
+    Heights are linear in the world position, h = a . w - floor with
+    a = (-slope f_x, -slope f_y, 1), so for each frame a vertex v of the
+    foot frame sits at h = (R^T a) . v + a . p - floor; every candidate bend
+    is tried at once."""
+    m = sole["mtp"]
+    d_toe = sole["v"][sole["toe"]] - m
+    R, p = pose[:, :3, :3], pose[:, :3, 3]
+    ok = np.isfinite(pose).all(axis=(1, 2))
+    # which way about the foot's X axis lifts the tip
+    up = np.median(R[ok][:, 2, :], axis=0)
+    tip = d_toe[np.argmax(d_toe @ long_axis)]
+    sign = 1.0 if up @ np.cross([1.0, 0, 0], tip) > 0 else -1.0
+    grid = np.radians(np.arange(0.0, TOE_MAX_BEND_DEG + 1e-9,
+                                TOE_BEND_STEP_DEG))
+    bent = m + np.einsum("gij,tj->gti", dge.rot_x(sign * grid), d_toe)
+    f = surface["forward"]
+    a = np.array([-surface["slope"] * f[0], -surface["slope"] * f[1], 1.0])
+    q = np.einsum("fji,j->fi", R, a)
+    c = p @ a - surface["floor"][b]
+    bend = np.zeros(len(pose))
+    for s0 in range(0, len(pose), 1000):
+        sl = slice(s0, s0 + 1000)
+        h = np.einsum("fk,gtk->fgt", q[sl], bent) + c[sl, None, None]
+        clear = h.min(2) >= 0
+        first = np.where(clear.any(1), clear.argmax(1), len(grid) - 1)
+        bend[sl] = np.where(ok[sl], grid[first], 0.0)
+    rel = dge.rot_x(sign * bend)
+    H = np.zeros((len(pose), 4, 4))
+    H[:, :3, :3], H[:, :3, 3], H[:, 3, 3] = rel, m - rel @ m, 1.0
+    return pose @ H, np.degrees(bend)
+
+
 class Boots:
     def __init__(self, trial, verts, summary):
         pose = trial.pose
@@ -461,18 +510,16 @@ class Boots:
         for b in LIMBS:
             # the sole: lowest vertex in every 10 mm cell of the footprint
             sole_v, self.long_axis[b] = dge.boot_sole(verts[b], pose[b])
-            # the toe hinge: toe cap turned about the MTP by the toe angle
-            angle = trial.angle(f"{SIDE[b]}_Toes_Joint_Angle")
-            toes4 = (foot_pose(trial.columns, f"{SIDE[b]}_Toes_Global_4x4")
-                     if f"{SIDE[b]}_Toes_Global_4x4" in trial.columns
-                     else None)
-            toe_pose, toe, _ = dge.toe_hinge(
-                pose[b], trial.kin(f"{SIDE[b]}_Toes_Position"), angle, toes4,
-                sole_v)
-            self.sole[b] = dict(v=sole_v, toe=toe, toe_pose=toe_pose)
+            # the MTP (fixed in the foot frame) and the toe cap ahead of it;
+            # the toe angle passed is zero: only the geometry is wanted here
+            _, toe, mtp = dge.toe_hinge(
+                pose[b], trial.kin(f"{SIDE[b]}_Toes_Position"),
+                np.full(len(pose[b]), dge.TOE_REFERENCE_DEG), None, sole_v)
+            self.sole[b] = dict(v=sole_v, toe=toe, toe_pose=None, mtp=mtp)
         self.pose = pose
         # the belt surface (one slope, one offset per boot), as fitted by the
-        # event detection and saved in its summary; refitted if missing
+        # event detection and saved in its summary; refitted on the rigid
+        # boots (foot flat) if missing
         s = summary.get("belt_surface")
         if s and "walking_direction" in summary:
             fwd = np.asarray(summary["walking_direction"], float)
@@ -481,6 +528,15 @@ class Boots:
         else:
             fwd = dge.walking_direction(pose, self.long_axis)
             self.surface = dge.fit_belt_surface(pose, self.sole, fwd)
+        # the toe cap, bent only as far as the belt requires
+        self.toe_bend_deg = {}
+        for b in LIMBS:
+            sole = self.sole[b]
+            if sole["mtp"] is None or not sole["toe"].any():
+                self.toe_bend_deg[b] = np.zeros(len(pose[b]))
+                continue
+            sole["toe_pose"], self.toe_bend_deg[b] = contact_toe_pose(
+                pose[b], sole, self.long_axis[b], self.surface, b)
         fwd2, lat2 = trial.forward, trial.lateral
         n = len(pose["L"])
         self.low_z, self.low_idx, self.ext = {}, {}, {}
@@ -1115,8 +1171,13 @@ def kinetics(t):
             r[f"{name}_bw{unit}"] = v / bw
             r[f"{name}_tw{unit}"] = v / tw
         # --- §8 CoP and free moment ---
+        # the CoP is a point on the PLATE; the boot on it rides the belt
+        # backwards ~0.9 m per stance, so the belt's travel is added back to
+        # get its path over the belt -- along the foot, as over ground
         cop = t.cop[st.hs_belt][a:b]
-        cop = cop[np.isfinite(cop).all(1)]        # only where loaded
+        loaded = np.flatnonzero(np.isfinite(cop).all(1))     # only where loaded
+        cop = (cop[loaded]
+               + t.belt_speed * (loaded / FS_FORCE)[:, None] * t.forward)
         if len(cop) > 30:
             cop = sosfiltfilt(sos, cop, axis=0)
             r["cop_ap_range_mm"] = 1000 * np.ptp(cop @ t.forward)
@@ -1242,8 +1303,10 @@ def margin_of_stability(t):
 # be destabilised, relative to how close the foot is to the ground?
 #   MoI(t) = max(xCoM_AP - most anterior sole point of EITHER boot, 0)  [mm]
 #   TRI    = integral of MoI(t) / clearance(t) [mm/mm] dt   [s]
-#   between the MFC point's peak acceleration and peak deceleration (this
-#   excludes lift-off and landing, when the foot is meant to be low).
+#   between the MFC point's peak acceleration and peak deceleration: the
+#   two peaks of its resultant acceleration, before and after its speed
+#   peak (this excludes lift-off and landing, when the foot is meant to be
+#   low). The point of MFC is the lowest sole point of each frame.
 #   The xCoM uses the STANCE leg's pendulum (CoM -> other ankle).
 
 def swing_clearance(t, b, o, rows):
@@ -1257,10 +1320,14 @@ def swing_clearance(t, b, o, rows):
         return out
     clear = H.min(1)
     low = H.argmin(1)
-    speed = np.linalg.norm(np.gradient(W.mean(1), 1 / FS, axis=0), axis=1)
-    fast = speed >= np.quantile(speed, MFC_SPEED_QUANTILE)        # (b)
     along = W[..., :2] @ t.forward
     rear = along < along.mean(1, keepdims=True)
+    # (b) the speed of the FRONT of the boot over the BELT (on a treadmill
+    # the lab-frame speed is that minus the belt speed)
+    front = np.nanmean(np.where(rear[..., None], np.nan, W), axis=1)
+    speed = np.linalg.norm(np.gradient(front, 1 / FS, axis=0)
+                           + np.r_[t.forward, 0] * t.belt_speed, axis=1)
+    fast = speed >= np.quantile(speed, MFC_SPEED_QUANTILE)        # (b)
     rear_z = np.where(rear, H, np.inf).min(1)                       # (c)
     w = MFC_LOCAL_WINDOW
     cand = []
@@ -1282,22 +1349,39 @@ def swing_clearance(t, b, o, rows):
     moi = 1000 * np.maximum(xcom - anterior, 0)
     out["moi_peak_mm"] = float(np.nanmax(moi))
     out["moi_mean_mm"] = float(np.nanmean(moi))
-    if not cand:
-        return out
+    if cand:
+        k = min(cand, key=lambda i: clear[i])      # the lowest qualifying one
+        v = int(low[k])
+        out.update(mfc_m=float(clear[k]), mfc_row=int(rows[k]), mfc_vertex=v,
+                   mfc_on_toes=bool(t.boots.sole[b]["toe"][v]))
 
-    k = min(cand, key=lambda i: clear[i])          # the lowest qualifying one
-    v = int(low[k])
-    out.update(mfc_m=float(clear[k]), mfc_row=int(rows[k]), mfc_vertex=v,
-               mfc_on_toes=bool(t.boots.sole[b]["toe"][v]))
+    # trip risk: on the whole swing's clearance, MTC event or not
     risk = moi / np.maximum(1000 * clear, MIN_CLEARANCE_MM)
-    p = W[:, v]                                     # the MFC point's path
-    sp = np.linalg.norm(np.gradient(p, 1 / FS, axis=0), axis=1)
-    acc = np.gradient(sp, 1 / FS)
-    i0, i1 = sorted((int(np.argmax(acc)), int(np.argmin(acc))))
-    if i1 > i0:
+    # the point of MFC is the lowest sole point of each frame; its speed
+    # (over the belt) and RESULTANT acceleration are read off each point's
+    # own path. The acceleration has two peaks: lift-off before the speed
+    # peak, landing after it (Schulz 2017, Fig. 2); TRI integrates between.
+    # Savitzky-Golay derivatives over the swing plus a few frames either
+    # side: a one-sided difference at the swing's first frame (boot still on
+    # the belt) gives a false "peak" there that lets the lift-off spike in.
+    pad = TRI_DERIV_WINDOW // 2
+    around = np.clip(np.arange(rows[0] - pad, rows[-1] + pad + 1), 0, t.n - 1)
+    Wp = fill_gaps(t.boots.world(b, around))[0]
+    inner = slice(pad, pad + len(rows))
+    vel = (savgol_filter(Wp, TRI_DERIV_WINDOW, 3, deriv=1, delta=1 / FS,
+                         axis=0)[inner] + np.r_[t.forward, 0] * t.belt_speed)
+    accel = savgol_filter(Wp, TRI_DERIV_WINDOW, 3, deriv=2, delta=1 / FS,
+                          axis=0)[inner]
+    k_ = np.arange(len(rows))
+    speed_p = np.linalg.norm(vel[k_, low], axis=1)
+    acc_p = np.linalg.norm(accel[k_, low], axis=1)
+    peak = int(np.argmax(speed_p))
+    if 2 <= peak <= len(rows) - 3:
+        i0 = int(np.argmax(acc_p[:peak]))
+        i1 = peak + int(np.argmax(acc_p[peak:]))
         out["tri_s"] = float(np.sum(risk[i0:i1 + 1]) / FS)
         out["tri_window_s"] = (i1 - i0) / FS
-    out["tri_peak"] = float(np.nanmax(risk))
+        out["tri_peak"] = float(np.nanmax(risk[i0:i1 + 1]))
     return out
 
 

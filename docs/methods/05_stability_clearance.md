@@ -52,7 +52,7 @@ the height of the lowest sole point above the pitched belt (§3.4). The MFC is a
 
 (a) it is lower than the 2 frames on either side (`MFC_LOCAL_WINDOW`);
 
-(b) the foot is in the **fastest 25%** of its swing (`MFC_SPEED_QUANTILE`), which rules out the dip just after toe-off;
+(b) the front of the boot is in the **fastest 25%** of its swing (`MFC_SPEED_QUANTILE`), with the speed measured over the belt, which rules out the dip just after toe-off;
 
 (c) the rear half of the sole is not lower than it (the minimum is at the front of the boot).
 
@@ -61,7 +61,7 @@ If several minima qualify, the lowest one is taken. If none qualifies, the swing
 **Steps** (`swing_clearance()`, `foot_clearance()`):
 
 1. Take the swing from toe-off to the next heel strike, trimming **2%** at each end (`SWING_TRIM`), where the boot is still on the belt.
-2. Pose every sole point in every frame (§3), with the toe hinge, and compute each point's height above the belt.
+2. Pose every sole point in every frame (§3), with the toe cap bent only as far as the belt requires (§3.3), and compute each point's height above the belt.
 3. Find the minima that meet (a)–(c), and keep the lowest.
 
 ## 11.2 Margin of instability and the trip-risk integral
@@ -76,7 +76,7 @@ The **trip-risk integral** adds up the ratio of MoI to clearance over the risky 
 
 $$\text{TRI} = \int_{t_0}^{t_1}\frac{\text{MoI}(t)}{\max\left(c(t),\ 1\ \text{mm}\right)}\,dt\quad[\text{s}]$$
 
-Here $t_0$ and $t_1$ are the moments of peak acceleration and peak deceleration of the MFC point's speed. The 1 mm floor (`MIN_CLEARANCE_MM`) keeps the ratio finite.
+The point of MFC is the lowest sole point in each frame. Its speed over the belt peaks in mid-swing. Its resultant acceleration has two peaks: one as the foot is accelerated after lift-off, before the speed peak, and one as it is slowed before landing, after it. $t_0$ and $t_1$ are those two peaks (Schulz 2017, Fig. 2). Speed and acceleration are Savitzky–Golay derivatives (7 frames, order 3, `TRI_DERIV_WINDOW`) of each sole point's path over the swing plus 3 frames either side. A one-sided difference at the swing's first frame, where the boot is still on the belt, would otherwise produce a false peak that lets the lift-off spike into the integral. The 1 mm floor (`MIN_CLEARANCE_MM`) keeps the ratio finite. TRI is computed for every swing, including those without an MTC event, because it integrates the whole clearance trajectory.
 
 ![Figure 18. One swing. A: the clearance of the lowest sole point (blue). The MFC (orange triangle) is the local minimum inside the fastest 25% of the swing (shaded). B: the margin of instability, the distance by which the xCoM is ahead of the front of either boot. C: the ratio MoI/clearance. The trip-risk integral is the shaded area between the MFC point's peak acceleration and peak deceleration.](figures/fig18.png){width=6.5in}
 
@@ -85,9 +85,9 @@ Here $t_0$ and $t_1$ are the moments of peak acceleration and peak deceleration 
 :::
 
 ::: {custom-style="Code Box"}
-**In the code** — §11: `swing_clearance()`, `foot_clearance()`. Settings: `MFC_LOCAL_WINDOW`, `MFC_SPEED_QUANTILE`, `SWING_TRIM`, `MIN_CLEARANCE_MM`. Results: `mfc_m`, `moi_peak_mm`, `tri_s` (plus `mfc_on_toes`, `mfc_minima`, `moi_mean_mm`, `tri_window_s`, `tri_peak` per step).
+**In the code** — §11: `swing_clearance()`, `foot_clearance()`. Settings: `MFC_LOCAL_WINDOW`, `MFC_SPEED_QUANTILE`, `SWING_TRIM`, `MIN_CLEARANCE_MM`, `TRI_DERIV_WINDOW`. Results: `mfc_m`, `moi_peak_mm`, `tri_s` (plus `mfc_on_toes`, `mfc_minima`, `moi_mean_mm`, `tri_window_s`, `tri_peak` per step).
 :::
 
 {{ranges: mfc_m, mfc_m_sd}}
 
-: Table 11.1. Healthy ranges for minimum foot clearance. MoI and TRI are recent measures without established healthy ranges: compare them between conditions.
+: Table 11.1. Healthy ranges for minimum foot clearance. MoI and TRI are recent measures without established healthy ranges: compare them between conditions. Schulz's (2017, Fig. 4) regressions on level floor give the order of magnitude to expect: MTC ≈ 3.15 v + 7.51 mm and TRI ≈ 3.18 v − 2.02 s, with v the speed in leg lengths per second. MoI grows with $v/\omega_0$, so a fast walk (as in his Fig. 2) shows a larger MoI than 1.3 m/s.

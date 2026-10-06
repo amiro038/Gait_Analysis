@@ -765,7 +765,36 @@ Per trial, for checking: `{trial}_steps.csv` (every per-step value),
 `{trial}_summary.csv`, `{trial}_waveforms.npz`, `{trial}_lds_windows.csv`,
 `{trial}_qa.png` and `{trial}_variability.png`.
 
-**What changed from `Gait_analysis_all_metrics.py`** (now in `archive/analysis_v3/`
+## Cell by cell — `Gait_analysis_all_metrics.py` (version 4)
+
+The same metrics in the shape of the original v3 script: one trial, top to
+bottom, one Spyder cell per metric family, flat code with comments. It keeps
+v3's cells and names, and every change is marked `# REVISED:` with the reason,
+so the two versions compare line by line (v3 is in `archive/analysis_v3/`).
+Each cell names the guideline or paper it follows and ends with brain checks;
+the last cells compare ~55 key metrics with healthy-adult values from the
+literature (and Schulz's 2017 MTC/TRI regressions at the participant's speed)
+and save the results.
+
+```bash
+python Gait_analysis_all_metrics.py "<...>/gait_event_outputs/<trial>_merged_events.csv"
+python Gait_analysis_all_metrics.py <events.csv> --no-figures --no-save
+python test_gait_analysis_all_metrics.py            # synthetic trial, ~4 min
+```
+
+It reads the Box layout around the events file (`Theia_csv_outputs/`,
+`FP_renamed/`, `Foot bindings/<participant>_foot_mesh_binding.npz`,
+`force_plates_DICE_treadmill.txt`, `participants.csv`) and writes to
+`gait_analysis_outputs/`: `{trial}_all_metrics_steps.csv`,
+`{trial}_all_metrics_summary.csv` (the literature check),
+`all_trials_all_metrics.csv` (one row per trial; re-running a trial replaces
+its row) and a folder per trial with the LDS, DFA, entropy, harmonic-ratio,
+regularity and symmetry tables. The BOOTS AND THE BELT cell prints, per foot,
+how often a swing goes below the belt and the mid-swing clearance under three
+models of the toe cap (Theia's toe angle as in v3, rigid, bent only by the
+belt), which is how a wrong toe angle shows up on real data.
+
+**What changed from version 3 of `Gait_analysis_all_metrics.py`** (in `archive/analysis_v3/`
 with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
 
 - the **load** is weighed per trial in the opening quiet standing and placed on
@@ -779,7 +808,11 @@ with `Spatiotemporal_analysis_v3.py` and `export_for_review.py`):
 - kinetics only on trusted stances, on the belt that carried the foot, with the
   plate baseline removed and the force filtered;
 - the AP / ML margin minima are over single support; the trip risk uses the
-  stance leg's pendulum;
+  stance leg's pendulum, and is integrated between the two peaks of the MFC
+  point's resultant acceleration (lift-off and landing, Schulz 2017 Fig. 2);
+- the boot's toe cap is bent only as far as the belt requires, never by
+  Theia's toe angle (whose swing-phase flexion put the toe cap through the
+  belt and the MFC near zero); the CoP range is measured over the belt;
 - DFA intervals, block-bootstrap intervals on every mean / SD / CV, LDS over
   windows with a stride bootstrap; every trial's series cut to the same length;
 - GEM on dimensionless stride time and length; regularity from the

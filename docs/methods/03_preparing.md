@@ -60,7 +60,7 @@ The minus sign is there because a foot on the belt moves **backwards**. $\hat{\e
 The boots of §3 are posed on Theia's feet in every frame. For every frame and boot, `Boots` keeps the height and index of the lowest sole point, and how far the boot reaches forward, backward, left and right along the walker's axes. The margin of stability (§10) uses those extents, and foot clearance (§11) uses the heights. The belt surface is the one fitted by the event detection and saved in its summary, so both steps measure against the same surface.
 
 ::: {custom-style="Code Box"}
-**In the code** — §5.3: class `Boots` (`height()`, `world()`), which uses `dge.boot_sole()`, `dge.toe_hinge()`, `dge.fit_belt_surface()` and `dge.above_belt()`.
+**In the code** — §5.3: class `Boots` (`height()`, `world()`) and `contact_toe_pose()` (the toe cap, §3.3), which use `dge.boot_sole()`, `dge.toe_hinge()` (for the MTP), `dge.fit_belt_surface()` and `dge.above_belt()`. Settings: `TOE_MAX_BEND_DEG = 60`, `TOE_BEND_STEP_DEG = 0.5`.
 :::
 
 ## 5.4 Forces into the motion-capture frame

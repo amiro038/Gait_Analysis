@@ -118,9 +118,14 @@ MIN_CONTACT_VERTICES = 3       # this many touching = the boot is down
 # X axis through <Side>_Toes_Position). Without it the rigid toe cap swings
 # 30-40 mm through the belt at every push-off. A positive angle is extension
 # with TOE_SIGN = 1 (checked on D05: the toes then lie flat on the floor).
+# Only EXTENSION is applied: the belt can lift a boot's toe cap, nothing
+# pushes it down through the belt. A toe flexion Theia reports in swing (its
+# toe segment is fitted to a foot inside a stiff boot) would otherwise put
+# the toe cap under the belt and count as a contact.
 TOE_HINGE = True
 TOE_SIGN = 1
 TOE_REFERENCE_DEG = 0.0        # toe angle in the static scan (D05: +0.4/-1.4)
+TOE_EXTENSION_ONLY = True
 
 # Trust
 TRUST_WINDOW_S = 0.050         # checked over +/- this around each event
@@ -413,7 +418,10 @@ def toe_hinge(pose, mtp_world, angle, toes4, sole_v):
     if toes4 is not None:
         rel = np.einsum("fji,fjk->fik", R, orthonormalise(toes4[:, :3, :3]))
     else:
-        rel = rot_x(TOE_SIGN * np.radians(angle - TOE_REFERENCE_DEG))
+        bend = TOE_SIGN * (np.asarray(angle, float) - TOE_REFERENCE_DEG)
+        if TOE_EXTENSION_ONLY:                       # + = extension
+            bend = np.clip(bend, 0.0, None)          # NaN stays NaN
+        rel = rot_x(np.radians(bend))
     rel[~np.isfinite(rel).all(axis=(1, 2))] = np.eye(3)     # no angle: straight
     H = np.zeros((len(rel), 4, 4))
     H[:, :3, :3], H[:, :3, 3], H[:, 3, 3] = rel, m - rel @ m, 1.0

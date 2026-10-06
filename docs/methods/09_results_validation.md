@@ -105,13 +105,15 @@ The figures in this document were all drawn from a 7-minute version of it.
 | kinetics | each limb's vertical impulse carries 50.2% of the weight over a stride (50%); braking and propulsion cancel (net −0.0001 BW·s); free moment 1.00 × the one built in; CoM work nets to zero (28.2 J in, 28.2 J out) |
 | results | 373 metric columns, each in the dictionary with its section; DFA and LDS intervals present |
 
+The cell-by-cell script `Gait_analysis_all_metrics.py` (version 4) is checked the same way by `test_gait_analysis_all_metrics.py`, on a 5-minute synthetic trial laid out as the Box folders. Theia's toe angle is corrupted with 25° of toe flexion through every swing, while the boot itself stays rigid. The toe-angle hinge of version 3 then puts swings through the belt, and its mid-swing clearance falls from about 19 mm to about 5 mm. The contact-constrained toe cap ignores the corruption: no swing goes through the belt, and the MFC stays within 2 mm of the built-in clearance. The same test checks the belt speed, load, stride and stance times, step width, the vertical impulse (50% of the weight over a stride), and a trip-risk window in every swing. It also checks that TRI agrees with Schulz's (2017) regression at this speed, and that the outputs are written.
+
 ## 20.4 The metric methods (`gait_metrics_validation.py`, `lds_validation.py`)
 
 | Method | Test | Result |
 |:--|:--|:--|
 | velocity fusion (§5.7) | 1, 2, 5 mm marker noise | fused 0.5–3, 2–8, 5–19 mm/s vs 25, 49, 124 mm/s for markers alone; no bias below 0.5 Hz |
 | margin of stability (§10) | hand-computed case | exact to 0.01 mm |
-| MFC, MoI, TRI (§11) | built swing | exact; a swing without a minimum gives missing |
+| MFC, MoI, TRI (§11) | built swing with analytic speed and acceleration | MFC and MoI exact; TRI window on the analytic acceleration peaks either side of the speed peak, TRI exact; a swing without a minimum gives missing |
 | DFA (§14) | fractional Gaussian noise, H = 0.5, 0.7, 0.9, N = 486 and 756 | unbiased within ±0.02; shuffled → 0.505 |
 | DFA interval (§12.5) | 60 trials, N = 486, α = 0.75 | covers the truth 93%, 0.33 wide |
 | block bootstrap (§12.2) | AR(1), φ = 0.6, N = 400 | covers the true mean 93% (single strides: 66%) |

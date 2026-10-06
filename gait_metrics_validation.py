@@ -141,15 +141,18 @@ def validate_margin_of_stability(edge=0.14, ankle_ml=0.10, v_ml=0.30,
 # A swing built so every piece has a known answer: a clearance with a known
 # mid-swing minimum at the FRONT vertex, a margin of instability held at a
 # constant, and an integration window set by a speed profile whose
-# acceleration peaks and troughs at known places.
+# resultant acceleration peaks at known places (Schulz 2017, Fig. 2: one
+# peak before the speed peak, one after). The path is analytic and runs 5
+# frames past each end of the swing, as a real trial does.
 
 def trip_scenario(mfc=0.018, base=0.060, moi_mm=12.0, length=1.0,
-                  n=100, monotonic=False, g=9.81):
-    u = np.arange(n) / (n - 1)
+                  n=111, monotonic=False, g=9.81):
+    k = np.arange(n)
+    u = (k - 5) / 100.0                     # 0..1 over frames 5..105
+    dudt = 1.0                              # u per second (100 frames = 1 s)
     clear = (base - (base - mfc) * u if monotonic
              else mfc + (base - mfc) * ((u - 0.5) / 0.5) ** 2)
-    speed = 0.5 * (1 - np.cos(2 * np.pi * u))
-    y = np.cumsum(speed) / 100
+    y = 0.5 * (u - np.sin(2 * np.pi * u) / (2 * np.pi)) / dudt
     W = np.zeros((n, 2, 3))
     W[:, 0] = np.column_stack([np.full(n, 0.1), y + 0.1, clear])   # front
     W[:, 1] = np.column_stack([np.full(n, 0.1), y - 0.1, clear + 0.05])
@@ -160,32 +163,45 @@ def trip_scenario(mfc=0.018, base=0.060, moi_mm=12.0, length=1.0,
     z = np.sqrt(length ** 2 - 0.1 ** 2)
     w0 = np.sqrt(g / length)
     t = SimpleNamespace(
-        boots=boots, forward=np.array([0.0, 1.0]),
+        boots=boots, forward=np.array([0.0, 1.0]), n=n, belt_speed=0.0,
         com=np.tile([0.0, 0.0, z], (n, 1)),
         ankle={"L": np.tile([-0.1, 0.0, 0.0], (n, 1))},
         com_vel_belt=np.tile([0.0, (0.30 + moi_mm / 1000) * w0, 0.0], (n, 1)))
-    return ga.swing_clearance(t, "R", "L", np.arange(n)), W, clear
+    rows = np.arange(5, n - 5)
+    # the analytic speed and resultant acceleration of the front vertex
+    vy = 0.5 * (1 - np.cos(2 * np.pi * u))
+    vz = (base - mfc) * 8 * (u - 0.5) * dudt if not monotonic else 0 * u
+    ay = np.pi * np.sin(2 * np.pi * u) * dudt
+    az = np.full(n, (base - mfc) * 8 * dudt ** 2 if not monotonic else 0.0)
+    truth = dict(speed=np.hypot(vy, vz)[rows], acc=np.hypot(ay, az)[rows],
+                 clear=clear[rows])
+    return ga.swing_clearance(t, "R", "L", rows), truth
 
 
 def validate_trip_risk(moi_mm=12.0):
     print("=" * 74 + "\n  MFC, MARGIN OF INSTABILITY, TRIP RISK\n" + "=" * 74)
-    r, W, clear = trip_scenario(moi_mm=moi_mm)
-    p = W[:, 0]
-    sp = np.linalg.norm(np.gradient(p, 0.01, axis=0), axis=1)
-    acc = np.gradient(sp, 0.01)
-    a, b = sorted((int(np.argmax(acc)), int(np.argmin(acc))))
+    r, tr = trip_scenario(moi_mm=moi_mm)
+    clear = tr["clear"]
+    peak = int(np.argmax(tr["speed"]))
+    a = int(np.argmax(tr["acc"][:peak]))
+    b = peak + int(np.argmax(tr["acc"][peak:]))
     tri = np.sum((moi_mm / np.maximum(1000 * clear, 1.0))[a:b + 1]) / 100
     print(f"  MFC {r['mfc_m']:.6f} m (sampled minimum {clear.min():.6f}), "
           f"vertex {r['mfc_vertex']} (front, on the toes: {r['mfc_on_toes']})")
     print(f"  MoI peak {r['moi_peak_mm']:.4f} mm (built {moi_mm})")
+    print(f"  TRI window {r['tri_window_s']:.2f} s (analytic acceleration "
+          f"peaks: {(b - a) / 100:.2f} s, frames {a} and {b} around the speed "
+          f"peak at {peak})")
     print(f"  TRI {r['tri_s']:.6f} s (independent {tri:.6f})")
-    mono, _, _ = trip_scenario(monotonic=True)
+    mono, _ = trip_scenario(monotonic=True)
     print(f"  monotonic clearance: MFC {mono['mfc_m']}, "
           f"{mono['mfc_minima']} minima")
     verdict("trip", abs(r["mfc_m"] - clear.min()) < 1e-12
             and r["mfc_vertex"] == 0 and abs(r["moi_peak_mm"] - moi_mm) < 1e-6
-            and abs(r["tri_s"] - tri) < 1e-12 and np.isnan(mono["mfc_m"]),
-            "MFC, MoI and TRI exact; a swing without a minimum gives NaN")
+            and abs(r["tri_window_s"] - (b - a) / 100) < 0.011
+            and abs(r["tri_s"] - tri) / tri < 0.02 and np.isnan(mono["mfc_m"]),
+            "MFC and MoI exact; TRI window within a frame of the analytic "
+            "acceleration peaks; a swing without a minimum gives NaN")
 
 
 # %%==========================================================================

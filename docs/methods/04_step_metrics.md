@@ -123,7 +123,7 @@ Also reported: the peak braking and peak propulsive forces.
 
 ## 8.4 CoP excursion and free moment
 
-The CoP (low-passed at 15 Hz, `COP_FILTER_HZ`) gives its range along and across the belt within the stance (`cop_ap_range_mm`, `cop_ml_range_mm`). The free moment (§5.4, 15 Hz) gives its largest absolute value (`free_moment_peak_nm`).
+The CoP is a point on the plate, and the boot on it rides the belt backwards about 0.9 m per stance. Its path **over the belt** is the plate CoP plus the belt's travel since heel strike, $\mathbf{p}_{CoP}(t) + v_{belt}\,(t - t_{HS})\,\hat{f}$. That path runs along the foot, as it would over ground. Low-passed at 15 Hz (`COP_FILTER_HZ`), it gives the CoP's range along and across the belt within the stance (`cop_ap_range_mm`, `cop_ml_range_mm`). The free moment (§5.4, 15 Hz) gives its largest absolute value (`free_moment_peak_nm`).
 
 ## 8.5 Normalisation: per body weight and per total weight
 

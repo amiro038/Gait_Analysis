@@ -26,7 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt                                # noqa: E402
 from matplotlib.patches import FancyBboxPatch, Polygon            # noqa: E402
-from scipy.signal import butter, sosfiltfilt                    # noqa: E402
+from scipy.signal import butter, savgol_filter, sosfiltfilt     # noqa: E402
 from scipy.spatial import ConvexHull                           # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,13 +182,14 @@ def fig_boot(d):
     z0 = bent[:, 2].min()
     a.axhline(0, color=INK, lw=1)
     a.scatter(rigid[:, 1] * 1000, (rigid[:, 2] - z0) * 1000, s=4, c=MUTED, alpha=0.35, label="rigid boot")
-    a.scatter(bent[~toe, 1] * 1000, (bent[~toe, 2] - z0) * 1000, s=5, c=RIGHT, label="bent at the MTP")
+    a.scatter(bent[~toe, 1] * 1000, (bent[~toe, 2] - z0) * 1000, s=5, c=RIGHT,
+              label="toe cap bent at the MTP,\njust enough to stay on the belt")
     a.scatter(bent[toe, 1] * 1000, (bent[toe, 2] - z0) * 1000, s=5, c=THIRD)
     a.set_aspect("equal")
     a.set_xlabel("forward (mm)")
     a.set_ylabel("height above belt (mm)")
-    a.set_title("Push-off: toe cap follows the toes")
-    a.legend(loc="upper left", fontsize=6.5, markerscale=2)
+    a.set_title("Push-off: the belt bends the toe cap up")
+    a.legend(loc="upper right", fontsize=6.5, markerscale=2, frameon=False)
     letter(a, "B")
     fig.tight_layout(w_pad=2.5)
     save(fig, 2)
@@ -752,17 +753,33 @@ def fig_mfc(d):
     Wp = t.boots.world("L", rows)
     H = t.boots.height("L", Wp)
     clear = H.min(1)
-    speed = np.linalg.norm(np.gradient(Wp.mean(1), 0.01, axis=0), axis=1)
+    low = H.argmin(1)
+    belt_v = np.r_[t.forward, 0] * t.belt_speed
+    along = Wp[..., :2] @ t.forward
+    rear = along < along.mean(1, keepdims=True)
+    front = np.nanmean(np.where(rear[..., None], np.nan, Wp), axis=1)
+    speed = np.linalg.norm(np.gradient(front, 0.01, axis=0) + belt_v, axis=1)
     fast = speed >= np.quantile(speed, ga.MFC_SPEED_QUANTILE)
     anterior = np.maximum(t.boots.ext["L"]["fwd_max"][rows], t.boots.ext["R"]["fwd_max"][rows])
     length = np.linalg.norm(t.com[rows] - t.ankle["R"][rows], axis=1)
     xcom = t.com[rows, :2] @ t.forward + (t.com_vel_belt[rows, :2] @ t.forward) / np.sqrt(ga.G / length)
     moi = 1000 * np.maximum(xcom - anterior, 0)
     risk = moi / np.maximum(1000 * clear, 1)
-    v = int(st.mfc_vertex)
-    sp = np.linalg.norm(np.gradient(Wp[:, v], 0.01, axis=0), axis=1)
-    acc = np.gradient(sp, 0.01)
-    i0, i1 = sorted((int(np.argmax(acc)), int(np.argmin(acc))))
+    # the point of MFC (lowest sole point of each frame): speed over the belt
+    # and resultant acceleration; the window runs between the acceleration's
+    # two peaks, either side of the speed peak (Schulz 2017, Fig. 2)
+    k_ = np.arange(len(rows))
+    pad = ga.TRI_DERIV_WINDOW // 2
+    around = np.clip(np.arange(rows[0] - pad, rows[-1] + pad + 1), 0, t.n - 1)
+    Wa = ga.fill_gaps(t.boots.world("L", around))[0]
+    inner = slice(pad, pad + len(rows))
+    vel = savgol_filter(Wa, ga.TRI_DERIV_WINDOW, 3, deriv=1, delta=0.01, axis=0)[inner] + belt_v
+    accel = savgol_filter(Wa, ga.TRI_DERIV_WINDOW, 3, deriv=2, delta=0.01, axis=0)[inner]
+    sp = np.linalg.norm(vel[k_, low], axis=1)
+    acc = np.linalg.norm(accel[k_, low], axis=1)
+    peak = int(np.argmax(sp))
+    i0 = int(np.argmax(acc[:peak]))
+    i1 = peak + int(np.argmax(acc[peak:]))
     tt = (rows - rows[0]) / 100
     fig, ax = plt.subplots(3, 1, figsize=(W, 4.2), sharex=True)
     a = ax[0]
@@ -771,7 +788,8 @@ def fig_mfc(d):
     k = int(st.mfc_row - rows[0])
     a.plot(tt[k], 1000 * clear[k], "v", color=RIGHT, ms=8, label=f"MFC {1000 * st.mfc_m:.1f} mm")
     a.set_ylabel("clearance (mm)")
-    a.legend(fontsize=6.5, loc="upper right")
+    a.set_ylim(-14, 1000 * clear.max() * 1.08)
+    a.legend(fontsize=6.5, loc="lower center", ncol=3, frameon=False)
     letter(a, "A")
     a = ax[1]
     a.plot(tt, moi, color=VIOLET)
@@ -782,7 +800,7 @@ def fig_mfc(d):
     a = ax[2]
     a.plot(tt, risk, color=INK)
     a.fill_between(tt[i0:i1 + 1], 0, risk[i0:i1 + 1], color=RIGHT, alpha=0.3, lw=0,
-                   label=f"TRI = {st.tri_s:.2f} s\n(area from peak acceleration to\npeak deceleration of the MFC point)")
+                   label=f"TRI = {st.tri_s:.2f} s\n(area between the MFC point's\nlift-off and landing acceleration peaks)")
     a.set_ylabel("MoI / clearance")
     a.set_xlabel("time from toe-off (s)")
     a.legend(fontsize=6.5, loc="upper right")

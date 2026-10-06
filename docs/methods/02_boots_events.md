@@ -30,7 +30,7 @@ $$\mathbf{v}(t) = \mathbf{T}_{foot}(t)\;\mathbf{v}^{foot}.$$
 2. Divide the footprint into **10 mm × 10 mm cells** (`SOLE_CELL_MM`) and keep the **lowest vertex in each cell**.
 3. Keep only cells whose lowest vertex is within **35 mm of the lowest point of the boot** (`SOLE_MAX_RISE_MM`). This keeps the curved toe cap and heel, and drops the boot's sides.
 
-![Figure 2. A: the scanned boot (grey), its sole points under the foot (orange) and under the toe cap (green). B: at push-off the heel is raised 30°. If the boot were rigid, the toe cap would pass 17 mm through the belt (grey points). Bending the toe cap about the MTP by Theia's toe angle keeps it on the belt (orange and green).](figures/fig02.png){width=6.5in}
+![Figure 2. A: the scanned boot (grey), its sole points under the foot (orange) and under the toe cap (green). B: at push-off the heel is raised 30°. If the boot were rigid, the toe cap would pass 17 mm through the belt (grey points). Bending the toe cap about the MTP, just as far as the belt requires, keeps it on the belt (orange and green).](figures/fig02.png){width=6.5in}
 
 ::: {custom-style="Why Box"}
 **Why only the sole** — a boot mesh has tens of thousands of vertices. Only the underside can touch the belt, and clearance is the height of the lowest point of that underside. Keeping one vertex per 10 mm cell leaves a few hundred points: enough to resolve the sole's shape, few enough to pose them in every frame of a 7-minute trial.
@@ -38,16 +38,16 @@ $$\mathbf{v}(t) = \mathbf{T}_{foot}(t)\;\mathbf{v}^{foot}.$$
 
 ## 3.3 The toe hinge
 
-**What.** The toe cap bends about the metatarsophalangeal (MTP) joint, following Theia's toe angle.
+**What.** The toe cap bends about the metatarsophalangeal (MTP) joint. A boot's toe cap is stiff: it bends when the belt pushes it up at push-off, and springs back once it is off the belt.
 
-With $\mathbf{m}$ the MTP in the foot frame (from `<Side>_Toes_Position`), $\theta_{toe}(t)$ Theia's toe angle, and $\mathbf{R}_x$ a rotation about the foot's medio-lateral axis, each sole point in front of the MTP is posed by
+With $\mathbf{m}$ the MTP in the foot frame (from `<Side>_Toes_Position`), $\theta(t)$ the bend, and $\mathbf{R}_x$ a rotation about the foot's medio-lateral axis, each sole point in front of the MTP is posed by
 
-$$\mathbf{v}(t) = \mathbf{T}_{foot}(t)\,\left[\mathbf{m} + \mathbf{R}_x\left(\theta_{toe}(t) - \theta_{scan}\right)\,(\mathbf{v}^{foot} - \mathbf{m})\right],$$
+$$\mathbf{v}(t) = \mathbf{T}_{foot}(t)\,\left[\mathbf{m} + \mathbf{R}_x\left(\theta(t)\right)\,(\mathbf{v}^{foot} - \mathbf{m})\right].$$
 
-where $\theta_{scan}$ is the toe angle during the scan (`TOE_REFERENCE_DEG`). If the export has the toes' own 4 × 4 pose, that pose is used directly.
+The **analysis** (gait_analysis.py §5.3) takes $\theta(t)$ as the **smallest** bend, from 0 to 60° in 0.5° steps (`TOE_MAX_BEND_DEG`, `TOE_BEND_STEP_DEG`), that keeps every point of the toe cap on or above the belt (§3.4). In the air it is zero; at push-off it is just enough. The **event detection** (detect_gait_events.py) bends the toe cap by Theia's toe angle $\theta_{toe}$, extension only: $\theta(t) = \max\left(\theta_{toe}(t) - \theta_{scan},\ 0\right)$, with $\theta_{scan}$ the toe angle during the scan (`TOE_REFERENCE_DEG`, `TOE_EXTENSION_ONLY`).
 
 ::: {custom-style="Why Box"}
-**Why** — a rigid boot pitched heel-up at push-off drives its toe cap 30–40 mm through the belt (Fig. 2B). That would wreck the contact test in §4.3 (the boot would look as if it touched the wrong belt). It would also wreck the clearance just after toe-off, because the lowest point would be below the belt.
+**Why** — a rigid boot pitched heel-up at push-off drives its toe cap 30–40 mm through the belt (Fig. 2B). That would wreck the contact test in §4.3 (the boot would look as if it touched the wrong belt). It would also wreck the clearance just after toe-off, because the lowest point would be below the belt. **Why not follow Theia's toe angle both ways** — Theia's toe segment is fitted to a foot inside a stiff boot. In swing it can report toe *flexion*, and a hinge that follows it turns the toe cap *down* through the belt. On a synthetic trial, 25° of false flexion moved the mid-swing clearance from about 19 mm to about 5 mm, with some swings below the belt (`test_gait_analysis_all_metrics.py`). A bend driven by contact cannot put the boot through the belt. Any part of the boot that is still below the belt is then a pose error of the foot itself, and it is reported (`mfc_below_belt_pct`).
 :::
 
 ## 3.4 The belt surface
