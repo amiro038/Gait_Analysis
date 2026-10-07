@@ -231,6 +231,9 @@ load_max_offset_m = 0.40      # a load further than this is not believed
 # --- boots and the belt --------------------------------------------------------
 belt_floor_fraction = (0.20, 0.45)   # foot flat, used to fit the belt surface
 toe_max_bend_deg = 60.0              # the toe cap never bends further than this
+sole_flat_in_stance = True           # turn each boot about the ankle so its sole lies flat
+                                     # in foot-flat (heel and forefoot on the belt together)
+sole_flat_max_deg = 6.0              # a larger correction is reported, not applied
 toe_bend_step_deg = 0.5              # resolution of the contact-constrained bend
 toe_use_theia_extension = True       # also lift the toe cap by Theia's toe EXTENSION
                                      # (never flexion), as step 1 does; False = the
@@ -350,6 +353,19 @@ event_summary = json.loads(summary_path.read_text()) if summary_path.exists() el
 if not event_summary:
     print(" ! no event summary from detect_gait_events.py: the plates are taken")
     print("   to be in Theia's frame. Re-run step 1 with the current version")
+
+# --- the two clocks: the force data moved as step 1 moved them ------------------
+# REVISED (after D05, where Theia's events came 14 ms before the plates'):
+# step 1 measures the offset between the force and Theia clocks and moves the
+# force data by it; the same shift is applied here, so the events (in step
+# 1's aligned force time) and the force samples agree. The clocks check in
+# the Forces cell then reads what is LEFT, which should be ~0.
+force_shift_ms = int(event_summary.get('force_shift_ms', 0) or 0)
+if force_shift_ms:
+    shift_n = int(round(force_shift_ms * force_fs / 1000))
+    shift_cols = [c for c in force_data.columns if not c.endswith('_TIME')]
+    force_data[shift_cols] = force_data[shift_cols].shift(shift_n).bfill().ffill()
+    print(f" force data moved {force_shift_ms:+d} ms to Theia's clock (measured in step 1)")
 
 # --- the plates' measured corners (C3D parameters) ---------------------------
 plate_file = next((p for p in (base / "force_plates_DICE_treadmill.txt",
@@ -943,8 +959,8 @@ if sync_com is not None:
           f"(r = {sync_r:.2f}; 0 = in sync)")
     if abs(sync_lag_ms) > 10:
         print(f"  ! the two recordings are about {abs(sync_lag_ms):.0f} ms apart. Every force-plate event is")
-        print("    read at the wrong kinematic instant: fix the offset in step 1 before trusting")
-        print("    anything timed by a force event (step lengths, margins at heel strike)")
+        print("    read at the wrong kinematic instant: re-run step 1 (detect_gait_events.py,")
+        print("    FORCE_SHIFT_MS = 'auto') so the force data are moved to Theia's clock")
 
 
 # =============================================================================
@@ -1239,6 +1255,7 @@ for b in limbs:
 
 # --- the sole, its toe cap, and the hinge ---------------------------------------
 sole_local, sole_is_toe, sole_is_front, toe_hinge_point, toe_lift_sign, boot_length = {}, {}, {}, {}, {}, {}
+sole_fwd_local, sole_tilt_deg = {}, {}
 for b in limbs:
     P = foot_pose[b]
     R, t = P[:, :3, :3], P[:, :3, 3]
@@ -1256,6 +1273,7 @@ for b in limbs:
     fwd_local /= np.linalg.norm(fwd_local)
     along = (sole_local[b] - m) @ fwd_local
     boot_length[b] = float(np.ptp(sole_local[b] @ fwd_local))
+    sole_fwd_local[b] = fwd_local
     sole_is_toe[b] = along > 0
     # front and rear halves of the sole, for Schulz's toe-vs-heel criterion
     along_sole = sole_local[b] @ fwd_local
@@ -1271,6 +1289,53 @@ def rot_x(angles):
     R_[:, 0, 0] = 1.0
     R_[:, 1, 1], R_[:, 1, 2], R_[:, 2, 1], R_[:, 2, 2] = c, -s, s, c
     return R_
+
+# --- the sole flat in foot-flat ---------------------------------------------------------
+# REVISED (after D05), a check and a correction. In foot-flat (20-45% of
+# stance) a boot's heel and forefoot are BOTH on the belt, so the posed sole
+# must lie flat there. If the heel sits above the forefoot (or below), the
+# boot is tilted on Theia's foot: the binding, or Theia's foot angle in
+# walking against the static pose it was built from. A 2 deg toe-down tilt
+# puts the heel ~8 mm up at heel strike and the toe a few mm too low in
+# swing. The tilt is measured as the turn about the ankle (the foot frame's
+# X axis) that brings the heel's lowest point level with the forefoot's
+# (toe cap excluded, it curls up), and undone (sole_flat_in_stance).
+# Synthetic trial, built from the same mesh: 0.0-0.5 deg.
+tilt_grid = np.radians(np.arange(-8.0, 8.0 + 1e-9, 0.1))
+for b in limbs:
+    v_ = sole_local[b]
+    al_ = v_ @ sole_fwd_local[b]
+    al_ = (al_ - al_.min()) / np.ptp(al_)
+    heel_ = al_ < 0.25
+    fore_ = (al_ > 0.55) & ~sole_is_toe[b]
+    rows_ = []
+    for x in np.flatnonzero(steady & (g['support_limb'] == b).to_numpy())[::3]:
+        if np.isfinite(hs[x]) and np.isfinite(to[x]):
+            r0 = int(np.ceil(frame_to_row(hs[x] + belt_floor_fraction[0] * (to[x] - hs[x]))))
+            r1 = int(np.floor(frame_to_row(hs[x] + belt_floor_fraction[1] * (to[x] - hs[x]))))
+            rows_.extend(range(r0, r1 + 1))
+    up_ = foot_pose[b][np.array(rows_, int), 2, :3]                # world up, seen from the foot
+    up_ = up_[np.isfinite(up_).all(axis=1)]
+    sole_tilt_deg[b] = np.nan
+    if len(up_) < 50 or not heel_.any() or not fore_.any():
+        continue
+    gaps_ = []
+    for a_ in tilt_grid:
+        vr_ = v_ @ rot_x(np.array([toe_lift_sign[b] * a_]))[0].T
+        z_ = up_ @ vr_.T                                           # height of each vertex, per frame
+        gaps_.append(np.median(z_[:, heel_].min(axis=1) - z_[:, fore_].min(axis=1)))
+    gaps_ = np.array(gaps_)
+    gap0 = float(np.interp(0.0, tilt_grid, gaps_))
+    # the turn that levels them (the gap falls as the toe is turned up)
+    order_ = np.argsort(gaps_)
+    tilt_ = float(np.degrees(np.interp(0.0, gaps_[order_], tilt_grid[order_])))
+    sole_tilt_deg[b] = tilt_
+    applied_ = sole_flat_in_stance and abs(tilt_) <= sole_flat_max_deg
+    print(f"  {side_name[b]} boot in foot-flat: heel {1000 * gap0:+.1f} mm above the forefoot (0 = flat); "
+          f"levelled by turning the toe {'up' if tilt_ > 0 else 'down'} {abs(tilt_):.1f} deg"
+          + ("" if applied_ else "  [NOT applied]"))
+    if applied_:
+        sole_local[b] = v_ @ rot_x(np.array([toe_lift_sign[b] * np.radians(tilt_)]))[0].T
 
 # --- the belt surface, from the rigid soles in foot flat --------------------------
 belt_pts = {b: [] for b in limbs}
@@ -3329,9 +3394,10 @@ for k_, (v_, unit_) in key_metrics.items():
         verdict_ = (f'{v_ / expected_:.2f} x expected' if np.isfinite(expected_) and expected_ > 0
                     else 'no range')
     elif v_ < lo_ - 1e-12:
-        verdict_ = 'BELOW'
+        # within a tenth of the range's width outside: on the edge, not out
+        verdict_ = 'edge, below' if v_ >= lo_ - 0.1 * (hi_ - lo_) else 'BELOW'
     elif v_ > hi_ + 1e-12:
-        verdict_ = 'ABOVE'
+        verdict_ = 'edge, above' if v_ <= hi_ + 0.1 * (hi_ - lo_) else 'ABOVE'
     else:
         verdict_ = 'within'
     lit_rows.append({'metric': k_, 'value': v_, 'unit': unit_, 'healthy_low': lo_, 'healthy_high': hi_,

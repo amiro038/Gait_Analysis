@@ -57,10 +57,10 @@ The minus sign is there because a foot on the belt moves **backwards**. $\hat{\e
 
 ## 5.3 The boots over the belt
 
-The boots of §3 are posed on Theia's feet in every frame. For every frame and boot, `Boots` keeps the height and index of the lowest sole point, and how far the boot reaches forward, backward, left and right along the walker's axes. The margin of stability (§10) uses those extents, and foot clearance (§11) uses the heights. The belt surface is refitted here (`foot_flat_surface()`) to the rigid boots' lowest point in foot-flat only (`BELT_FLAT` of each steady stance), with the same form as §3.4. The event detection fits every frame's lowest point, including push-off and landing. On D05 that gave 2.3° against the plates' 0.8°, which over the ~0.35 m a foot travels to mid-swing changes the clearance by ~8 mm.
+The boots of §3 are posed on Theia's feet in every frame. For every frame and boot, `Boots` keeps the height and index of the lowest sole point, and how far the boot reaches forward, backward, left and right along the walker's axes. The margin of stability (§10) uses those extents, and foot clearance (§11) uses the heights. Each sole is first **levelled** (`level_sole()`). In foot-flat (`BELT_FLAT` of each steady stance) a boot's heel and forefoot are both on the belt, so the posed sole must lie flat. The sole is turned about the ankle by the angle that brings the heel's lowest point level with the forefoot's (toe cap excluded: it curls up), up to 6° (`SOLE_FLAT_IN_STANCE`, `SOLE_FLAT_MAX_DEG`). A tilt there means the boot sits tilted on Theia's foot. The cause is the binding, or Theia's foot angle in walking against the static pose the binding was built from. On D05 the boot touched the belt about 60 ms after the force-plate heel strike, with its heel 8 mm up at that instant, which is what a ~2° toe-down tilt does. The synthetic trial, built from the same mesh, gives 0.0–0.7°. The belt surface is refitted here (`foot_flat_surface()`) to the rigid boots' lowest point in foot-flat only (`BELT_FLAT` of each steady stance), with the same form as §3.4. The event detection fits every frame's lowest point, including push-off and landing. On D05 that gave 2.3° against the plates' 0.8°, which over the ~0.35 m a foot travels to mid-swing changes the clearance by ~8 mm.
 
 ::: {custom-style="Code Box"}
-**In the code** — §5.3: class `Boots` (`height()`, `world()`), `foot_flat_surface()` and `contact_toe_pose()` (the toe cap, §3.3), which use `dge.boot_sole()`, `dge.toe_hinge()` (for the MTP), `dge.fit_belt_surface()` and `dge.above_belt()`. Settings: `TOE_MAX_BEND_DEG = 60`, `TOE_BEND_STEP_DEG = 0.5`.
+**In the code** — §5.3: class `Boots` (`height()`, `world()`), `level_sole()`, `foot_flat_surface()` and `contact_toe_pose()` (the toe cap, §3.3), which use `dge.boot_sole()`, `dge.toe_hinge()` (for the MTP), `dge.fit_belt_surface()` and `dge.above_belt()`. Settings: `TOE_MAX_BEND_DEG = 60`, `TOE_BEND_STEP_DEG = 0.5`.
 :::
 
 ## 5.4 Forces into the motion-capture frame
@@ -69,6 +69,7 @@ The boots of §3 are posed on Theia's feet in every frame. For every frame and b
 
 **Steps** (`read_forces()`):
 
+0. **Clock.** The force data are moved by the offset the event detection measured and saved (`force_shift_ms`, §4.0), so the force samples agree with the events and with Theia.
 1. **Baseline.** Vertical: the drift-tracking baseline of §4.1. Horizontal: the median over the unloaded samples.
 2. **Plate → lab → Theia.** Rotate by the plate's fitted rotation $\mathbf{R}_p$ (§4.2), then rotate the horizontal part of $\mathbf{R}_p\mathbf{F}$ by the lab → Theia rotation $\mathbf{R}(\varphi)$ (§4.2). The vertical part is unchanged, because both frames share the vertical.
 3. **Sign.** The export does not document whether it gives the force on the plate or on the body. The sign is chosen so that the vertical force **holds the walker up** (positive when loaded). §5.7 then checks the horizontal axes against the markers.

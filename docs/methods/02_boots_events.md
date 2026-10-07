@@ -89,6 +89,14 @@ Every heel strike (HS) and toe-off (TO) is needed, for both feet, through the wh
 2. **Kinematics for the rest.** Take every other event from the Zeni method, calibrated against the trusted force events of the same trial (§4.4).
 3. **Last resort.** Where Zeni finds nothing (a tracking dropout), use a clean-looking contact that the mesh could not check, then interpolation (§4.5).
 
+## 4.0 The two clocks
+
+**What.** The force file and the Theia export are recorded by different systems and are taken to start together. Before anything else, the offset between them is measured. The plates give the system CoM's vertical acceleration as the summed vertical force, up to a scale. Theia gives it as the second derivative of `Whole_body_COG` (Savitzky–Golay, 11 frames, cubic). Both are band-passed to 0.5–8 Hz without phase shift. The lag $\tau$ that maximises their correlation, within ±150 ms and refined by a parabola through the peak, is the offset. If $|\tau| \ge 3$ ms (`CLOCK_MIN_SHIFT_MS`), the force data are moved by $\tau$ (`FORCE_SHIFT_MS = "auto"`), and the shift is saved in the event summary. Both analysis scripts apply the same shift when they read the forces, then re-measure what is left.
+
+::: {custom-style="Why Box"}
+**Why** — on D05, Theia's CoM acceleration lined up with the plates' 14 ms *earlier* (r = 0.98). At 1.32 m/s, 14 ms is 18 mm of belt travel. Every force-plate event was therefore read at the wrong kinematic instant, and the CoP appeared 18 mm ahead of the boot. Newton makes the check exact: it is the same acceleration, seen twice. On a synthetic trial whose force file was shifted by 30 ms, the offset was measured as 31 ms and removed, leaving 1 ms.
+:::
+
 ## 4.1 Belt contacts from the vertical force
 
 **Steps** (`dge.belt_baseline()`, `dge.find_contacts()`, `dge.raw_edge()`):

@@ -152,6 +152,8 @@ TRI_DERIV_WINDOW = 7           # §11 Savitzky-Golay frames (order 3), MFC point
 TOE_MAX_BEND_DEG = 60.0        # §5.3 the toe cap never bends further than this
 TOE_BEND_STEP_DEG = 0.5        # §5.3 resolution of the contact-constrained bend
 TOE_USE_THEIA_EXTENSION = True # §5.3 also lift the toe cap by Theia's toe extension
+SOLE_FLAT_IN_STANCE = True     # §5.3 level each sole in foot-flat (turn about the ankle)
+SOLE_FLAT_MAX_DEG = 6.0        # §5.3 a larger turn is reported, not applied
 
 # --- §12 confidence intervals -------------------------------------------------
 N_BOOT = 1000                  # block-bootstrap resamples
@@ -515,6 +517,42 @@ def contact_toe_pose(pose, sole, long_axis, surface, b, extension=None):
     return pose @ H, np.degrees(bend)
 
 
+def level_sole(t, b, pose, sole, long_axis, every=3):
+    """The turn (deg, + = toe up) about the ankle that brings the sole's heel
+    level with its forefoot (toe cap excluded) in foot-flat, where both are
+    on the belt; and the sole points turned by it (if SOLE_FLAT_IN_STANCE).
+    A tilt there is the boot sitting tilted on Theia's foot (D05)."""
+    v = sole["v"]
+    al = v @ long_axis
+    al = (al - al.min()) / np.ptp(al)
+    heel, fore = al < 0.25, (al > 0.55) & ~sole["toe"]
+    s = t.steps[t.steps["steady"] & (t.steps["limb"] == b)]
+    rows = []
+    for st in s.iloc[::every].itertuples():
+        if np.isfinite(st.hs) and np.isfinite(st.to):
+            rows += range(int(np.ceil(st.hs + BELT_FLAT[0] * (st.to - st.hs))),
+                          int(np.floor(st.hs + BELT_FLAT[1] * (st.to - st.hs))) + 1)
+    up = pose[np.array(rows, int), 2, :3]
+    up = up[np.isfinite(up).all(1)]
+    if len(up) < 50 or not heel.any() or not fore.any():
+        return np.nan, v
+    R = pose[:, :3, :3]
+    ok = np.isfinite(pose).all(axis=(1, 2))
+    tip = v[np.argmax(al)]
+    sign = 1.0 if np.median(R[ok][:, 2, :], 0) @ np.cross([1.0, 0, 0], tip) > 0 else -1.0
+    grid = np.radians(np.arange(-8.0, 8.0 + 1e-9, 0.1))
+    gaps = []
+    for a in grid:
+        z = up @ (v @ dge.rot_x(np.array([sign * a]))[0].T).T
+        gaps.append(np.median(z[:, heel].min(1) - z[:, fore].min(1)))
+    gaps = np.array(gaps)
+    o = np.argsort(gaps)
+    tilt = float(np.degrees(np.interp(0.0, gaps[o], grid[o])))
+    if SOLE_FLAT_IN_STANCE and abs(tilt) <= SOLE_FLAT_MAX_DEG:
+        v = v @ dge.rot_x(np.array([sign * np.radians(tilt)]))[0].T
+    return tilt, v
+
+
 def foot_flat_surface(t, pose, soles, every=3):
     """Belt height under a point = floor[boot] + slope * (distance along
     travel), least squares on the rigid boots' lowest sole point in foot-flat
@@ -565,6 +603,11 @@ class Boots:
                 np.full(len(pose[b]), dge.TOE_REFERENCE_DEG), None, sole_v)
             self.sole[b] = dict(v=sole_v, toe=toe, toe_pose=None, mtp=mtp)
         self.pose = pose
+        # the sole levelled in foot-flat
+        self.sole_tilt_deg = {}
+        for b in LIMBS:
+            self.sole_tilt_deg[b], self.sole[b]["v"] = level_sole(
+                trial, b, pose[b], self.sole[b], self.long_axis[b])
         # the belt surface (one slope, one offset per boot), fitted to the
         # rigid boots' lowest point in FOOT-FLAT. The event detection's fit
         # (every frame's lowest point, push-off and landing included) is kept
@@ -678,13 +721,17 @@ def align_gravity(t, say):
         t.force_tilt_deg = tilt
 
 
-def read_forces(t, path, plates, A, say):
+def read_forces(t, path, plates, A, say, shift_ms=0):
     head = pd.read_csv(path, nrows=0).columns
     want = [f"{dge.BELT[b]}_{q}_{a}" for b in LIMBS
             for q, axes in (("Force", "XYZ"), ("Moment", "XYZ"), ("COP", "XY"))
             for a in axes]
     rails = [c for c in head if "handrail_Force" in c]
     data = pd.read_csv(path, usecols=[c for c in want + rails if c in head])
+    if shift_ms:
+        # moved to Theia's clock, exactly as the event detection moved them
+        data = data.shift(int(round(shift_ms * FS_FORCE / 1000))).bfill().ffill()
+        say(f"  force data moved {shift_ms:+d} ms to Theia's clock (step 1)")
     t.grf, t.grf_raw, t.cop, t.free_moment, t.baseline = {}, {}, {}, {}, {}
     sos = butter(4, FORCE_FILTER_HZ, fs=FS_FORCE, output="sos")
     for b in LIMBS:
@@ -1031,7 +1078,9 @@ def load_trial(stem, folders, participant, verbose=True):
     say(f"  boots: {n_sole['L']} / {n_sole['R']} sole points; "
         f"belt {t.boots.surface['floor']['L'] * 1000:.1f} / "
         f"{t.boots.surface['floor']['R'] * 1000:.1f} mm, "
-        f"{np.degrees(np.arctan(t.boots.surface['slope'])):+.2f} deg")
+        f"{np.degrees(np.arctan(t.boots.surface['slope'])):+.2f} deg; soles "
+        f"levelled in foot-flat by {t.boots.sole_tilt_deg['L']:+.1f} / "
+        f"{t.boots.sole_tilt_deg['R']:+.1f} deg (+ = toe up)")
 
     # §5.4 forces
     plates = {b: dge.fit_plate(p)
@@ -1041,7 +1090,7 @@ def load_trial(stem, folders, participant, verbose=True):
         say("  ! no event summary: the plates are taken to be in Theia's "
             "frame")
     read_forces(t, dge.find_file(folders["force"], stem, ".csv"), plates, A,
-                say)
+                say, int(summary.get("force_shift_ms", 0) or 0))
     align_gravity(t, say)
 
     # §5.5 - §5.7 the load, the system CoM, its velocity

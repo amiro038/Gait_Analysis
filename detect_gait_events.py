@@ -52,7 +52,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, savgol_filter, sosfiltfilt
 
 HERE = Path(__file__).resolve().parent
 
@@ -78,6 +78,16 @@ TRIALS = None                  # None = every .csv in FORCE_FOLDER, or a list
 
 GRF_RATE = 1000
 KINEMATIC_RATE = 100
+
+# The force file and the Theia export are taken to start together. They may
+# not (D05: Theia's events came 14 ms before the plates'), and then every
+# force event is read at the wrong kinematic instant. "auto": the offset is
+# measured per trial, as the lag that best lines up the CoM's vertical
+# acceleration from the plates (sum of Fz) and from Theia (Whole_body_COG),
+# and the force data are moved by it. A number: that many ms (+ = the force
+# data are moved LATER). 0: left as recorded.
+FORCE_SHIFT_MS = "auto"
+CLOCK_MIN_SHIFT_MS = 3         # a measured offset smaller than this is left alone
 
 # Force channels, and the frame the CoP is in. "plate": each belt's own
 # frame, origin at the plate centre (the DICE export: COP = (-My/Fz, Mx/Fz)
@@ -194,6 +204,45 @@ def read_forces(path):
     return fz, cop
 
 
+def clock_lag_ms(fz_total, com_z, n_rows):
+    """The lag (ms, + = Theia's signal comes later) that best lines up the
+    vertical CoM acceleration from the plates (fz_total, any scale) with
+    Theia's (second derivative of com_z), 0.5-8 Hz, both filtered without
+    phase shift; and the correlation there. (nan, nan) if it cannot tell."""
+    n = min(n_rows, len(fz_total) // STEP)
+    z = com_z[:n].astype(float)
+    ok = np.isfinite(z)
+    if ok.sum() < 20 * KINEMATIC_RATE:
+        return np.nan, np.nan
+    z = np.interp(np.arange(n), np.flatnonzero(ok), z[ok])
+    az = savgol_filter(z, 11, 3, deriv=2, delta=1.0 / KINEMATIC_RATE)
+    f = sosfiltfilt(butter(4, 40.0, fs=GRF_RATE, output="sos"), fz_total)
+    af = f[np.arange(n) * STEP]
+    band = butter(2, [0.5, 8.0], btype="band", fs=KINEMATIC_RATE, output="sos")
+    x, y = sosfiltfilt(band, af), sosfiltfilt(band, az)
+    ks = np.arange(-15, 16)
+    c = np.array([np.corrcoef(x[max(0, -k):n - max(0, k)],
+                              y[max(0, k):n - max(0, -k)])[0, 1] for k in ks])
+    i = int(np.argmax(c))
+    frac = 0.0
+    if 0 < i < len(ks) - 1:
+        den = c[i - 1] - 2 * c[i] + c[i + 1]
+        frac = 0.5 * (c[i - 1] - c[i + 1]) / den if den else 0.0
+    return 1000.0 * (ks[i] + frac) / KINEMATIC_RATE, float(c[i])
+
+
+def shift_samples(x, k):
+    """x moved k samples LATER (k < 0: earlier), ends held."""
+    if k == 0:
+        return x
+    out = np.empty_like(x)
+    if k > 0:
+        out[k:], out[:k] = x[:-k], x[0]
+    else:
+        out[:k], out[k:] = x[-k:], x[-1]
+    return out
+
+
 def read_plates(path):
     """{limb: {FORCE_PLATE_*: value}} from the C3D plate parameters."""
     blocks, name = {}, None
@@ -230,6 +279,7 @@ def read_theia(path, pose_names):
         extra = [(f"{SIDE[b]}_Toes_Joint_Angle", "X") for b in LIMBS]
         extra += [(f"{SIDE[b]}_Toes_Global_4x4", str(i)) for b in LIMBS
                   for i in range(16)]
+        extra += [("Whole_body_COG", a) for a in "XYZ"]   # the clock check
         extra = [w for w in extra if w in where]
         want += extra
         cols = [where[w] for w in want]
@@ -258,6 +308,9 @@ def read_theia(path, pose_names):
         P[~np.isfinite(P[:, :3, :]).all(axis=(1, 2))] = np.nan
         pose[b] = P
     column = {w: data[:, j] for j, w in enumerate(want)}
+    if all(("Whole_body_COG", a) in column for a in "XYZ"):
+        out["Whole_body_COG"] = np.column_stack(
+            [column[("Whole_body_COG", a)] for a in "XYZ"])
     toes = {}
     for b in LIMBS:
         angle = column.get((f"{SIDE[b]}_Toes_Joint_Angle", "X"))
@@ -1048,6 +1101,24 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
             "assumed to start together")
     valid = {b: np.isfinite(pose[b][:, :3, :]).all(axis=(1, 2)) for b in LIMBS}
 
+    # --- the two clocks ---------------------------------------------------
+    lag, lag_r = np.nan, np.nan
+    if "Whole_body_COG" in points:
+        lag, lag_r = clock_lag_ms(fz["L"] + fz["R"],
+                                  points["Whole_body_COG"][:, 2], n_rows)
+    if FORCE_SHIFT_MS == "auto":
+        shift = (int(round(lag * GRF_RATE / 1000))
+                 if np.isfinite(lag) and abs(lag) >= CLOCK_MIN_SHIFT_MS else 0)
+    else:
+        shift = int(round(float(FORCE_SHIFT_MS) * GRF_RATE / 1000))
+    if np.isfinite(lag):
+        say(f"  clocks: Theia's CoM acceleration lines up with the plates' "
+            f"{lag:+.0f} ms later (r = {lag_r:.2f})"
+            + (f"; force data moved {shift:+d} ms" if shift else ""))
+    if shift:
+        fz = {b: shift_samples(fz[b], shift) for b in LIMBS}
+        cop = {b: shift_samples(cop[b], shift) for b in LIMBS}
+
     # --- plates, CoP into the lab frame ----------------------------------
     plate_report, belts_lab = {}, {}
     for b in LIMBS:
@@ -1204,6 +1275,9 @@ def process_trial(force_path, boots, pose_names, plates, verbose=True):
                            slope_deg=float(np.degrees(np.arctan(
                                surface["slope"])))),
                        walking_direction=forward.tolist(),
+                       clock_lag_ms=None if not np.isfinite(lag) else lag,
+                       clock_r=None if not np.isfinite(lag_r) else lag_r,
+                       force_shift_ms=shift * 1000 // GRF_RATE,
                        zeni_vs_grf=zeni_report), fh, indent=2)
 
     counts = {}
